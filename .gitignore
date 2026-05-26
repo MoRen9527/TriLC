@@ -1,0 +1,19 @@
+# Local code intelligence
+.codegraph/
+.cursor/
+
+# Dependencies, vendor snapshots, and generated output
+node_modules/
+vendor/
+dist/
+build/
+coverage/
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
