@@ -4,6 +4,9 @@
   "private": true,
   "description": "TriMetaverse Local Controller",
   "type": "module",
+  "bin": {
+    "trilc": "./dist/cli.js"
+  },
   "engines": {
     "node": ">=20.0.0"
   },
