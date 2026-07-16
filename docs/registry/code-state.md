@@ -2,7 +2,9 @@
 
 ## Repository Map
 
-- `src/server/`：HTTP API server（TriMC 兼容）— **CTO-008-M 新增**
+- `src/server/`：HTTP API server（TriMC 兼容）— **CTO-008-M 新增**。`app.ts` 提供 ConnectionManager（3 次失败降级/2 次成功恢复状态机）+ 增强心跳（POST `/internal/v1/heartbeat`）+ 恢复回放（degraded→connected 自动触发 `_performReplay()`）+ `/healthz` `/internal/v1/agent` 端点。
+- `src/event-queue/`：**NEW CTO-008-M M.1/M.3**。离网事件队列：`store.ts`（SQLite WAL 持久化，prepared statements, batch transactions）、`queue.ts`（`createEventQueue` 工厂：enqueue / getPendingForReplay / applyReplayResponse / expireOldEvents / getQueueSize）、`types.ts`（QueuedEvent / ReplayRequest / ReplayResponse 类型契约）。11 unit tests + 6 integration tests PASS。
+- `src/localbus/`：**NEW CTO-008-M M.3**。`bus.ts` 提供 typed EventEmitter singleton（`localBus`）+ `publish()` helper。Phase 1 内存总线 → Phase 2 UDS/Named Pipe。事件类型：task:queued/running/succeeded/failed、node:connected/degraded/local、agent:event。
 - `src/runtime/`：本地 detached runtime
 - `src/local-node/`：节点生命周期和心跳
 - `src/planner/`：规划与重规划
@@ -15,13 +17,14 @@
 ## Current Code Health
 
 - 已有较清晰的本地域控制器骨架。
-- **2026-07-16 CTO-008-M**：新增 HTTP 服务器层 (`src/server/app.ts`)，实现与 TriMC 兼容的 API 面：
-  - `GET /healthz` → `{ ok: true, service: 'trilc', trimc: 'connected' | 'degraded' }`
-  - `POST /internal/v1/agent` — SSE + JSON 双模式，使用 `@trimetaverse/agent-core` 的 `agentLoop()`
-  - **ConnectionManager**：3 次连续失败降级、2 次连续成功恢复的状态机（CTO-008-M 规范）
-  - **TriMC 代理回退**：connected 状态下优先代理到 TriMC（30s 超时），失败时自动回退本地 agentLoop()
-  - 每 30s 周期性健康检查 TriMC `/healthz`
-  - 不加载 pipeline（Soul Loader / Memory Injector / Context Builder / Tool Gater），仅 raw mode
+- **2026-07-17 CTO-008-M**：通信协议全线代码落地 + 测试通过（M.1-M.6 完成，M.7 收口中）：
+  - M.1: `src/event-queue/` SQLite 事件队列 — 11 tests PASS
+  - M.2: TriMC replay 端点（TriMC app.ts）— 6 集成测试覆盖
+  - M.3: `src/localbus/` 内存 EventEmitter 总线
+  - M.4: 增强心跳（TriMC + TriLC ConnectionManager）
+  - M.5: 冲突仲裁（TriMC `src/comm/arbitration.ts`）— 11 tests PASS
+  - M.6: 端到端集成测试（enqueue→replay→arbitrate→apply）— 6 tests PASS
+  - 全量：27 tests / 0 fail（TriLC）；11 tests / 0 fail（TriMC 仲裁模块）
 - 2026-07-16：CTO-008-P 冒烟测试通过 — healthz、代理到 TriMC（失败→fallback→本地 agentLoop）、clean shutdown 均验证 OK
 - 依赖 `@trimetaverse/agent-core` (file:../TriMC/packages/agent-core) + `trimodel`
 - 2026-05-26 已补齐独立 git 仓、根级 `.gitignore` 与本地 CodeGraph 标配。

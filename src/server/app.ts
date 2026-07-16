@@ -14,12 +14,29 @@ import { agentLoop } from '@trimetaverse/agent-core';
 import type { AgentEvent, AgentLoopOptions } from '@trimetaverse/agent-core';
 import type { AgentTier, PermissionMode, PermissionRule } from '@trimetaverse/agent-core';
 import type { Message } from 'trimodel';
+import { createEventQueue } from '../event-queue/index.js';
+import type { ReplayRequest, ReplayResponse } from '../event-queue/types.js';
+import { publish } from '../localbus/bus.js';
 
 // ── ConnectionManager ──
 // Tracks TriMC reachability for fast fallback decisions.
 // CTO-008-M spec: 3 consecutive failures → DEGRADED → 2 consecutive successes → CONNECTED
+// Uses POST /internal/v1/heartbeat with node metadata instead of bare GET /healthz.
+// On recovery (DEGRADED→CONNECTED), triggers event replay via POST /internal/v1/events/replay.
 
 type ConnectionState = 'connected' | 'degraded' | 'local';
+
+// Replay event item type alias from shared types
+type ReplayEventItem = ReplayRequest['events'][number];
+
+interface ConnectionManagerOptions {
+  nodeId: string;
+  version: string;
+  intervalMs?: number;
+  queueSize?: () => number;
+  getPendingForReplay?: (connectionId: string, limit?: number) => ReplayEventItem[];
+  applyReplayResponse?: (connectionId: string, res: ReplayResponse, events: ReplayEventItem[]) => void;
+}
 
 class ConnectionManager {
   private state: ConnectionState = 'connected';
@@ -29,10 +46,24 @@ class ConnectionManager {
   private readonly recoverThreshold = 2;
   private healthCheckTimer: NodeJS.Timeout | null = null;
   private readonly trimcBaseUrl: string;
-  private readonly healthCheckIntervalMs = 30_000;
+  private readonly healthCheckIntervalMs: number;
+  private readonly nodeId: string;
+  private readonly version: string;
+  private startTime: number;
+  private _queueSize: () => number;
+  private _getPendingForReplay: (connectionId: string, limit?: number) => ReplayEventItem[];
+  private _applyReplayResponse: (connectionId: string, res: ReplayResponse, events: ReplayEventItem[]) => void;
+  private recoveryCallback: (() => void) | null = null;
 
-  constructor(trimcBaseUrl: string) {
+  constructor(trimcBaseUrl: string, opts: ConnectionManagerOptions) {
     this.trimcBaseUrl = trimcBaseUrl;
+    this.nodeId = opts.nodeId;
+    this.version = opts.version;
+    this.healthCheckIntervalMs = opts.intervalMs ?? 10_000;
+    this._queueSize = opts.queueSize ?? (() => 0);
+    this._getPendingForReplay = opts.getPendingForReplay ?? (() => []);
+    this._applyReplayResponse = opts.applyReplayResponse ?? (() => {});
+    this.startTime = Date.now();
   }
 
   get currentState(): ConnectionState {
@@ -40,6 +71,7 @@ class ConnectionManager {
   }
 
   recordSuccess(): void {
+    const wasDegraded = this.state === 'degraded';
     this.consecutiveFailures = 0;
     if (this.state === 'degraded') {
       this.consecutiveSuccesses++;
@@ -47,6 +79,12 @@ class ConnectionManager {
         this.state = 'connected';
         this.consecutiveSuccesses = 0;
         console.log('[trilc:conn] recovered → connected');
+        publish({ type: 'node:connected' });
+        // Trigger event replay for all pending events accumulated during degraded period
+        this._performReplay().catch((err) => {
+          console.error('[trilc:conn] replay failed:', err instanceof Error ? err.message : String(err));
+        });
+        if (this.recoveryCallback) this.recoveryCallback();
       }
     }
   }
@@ -59,16 +97,23 @@ class ConnectionManager {
         this.state = 'degraded';
         this.consecutiveFailures = 0;
         console.log('[trilc:conn] degraded → will use local fallback');
+        publish({ type: 'node:degraded' });
       }
     } else if (this.state === 'degraded') {
       // Already degraded, stay here
     }
   }
 
-  // Force a health check against TriMC /healthz
+  // Send enhanced heartbeat to TriMC POST /internal/v1/heartbeat
   async checkHealth(): Promise<boolean> {
     try {
-      const ok = await pingUrl(`${this.trimcBaseUrl}/healthz`);
+      const ok = await postHeartbeat(this.trimcBaseUrl, {
+        nodeId: this.nodeId,
+        state: this.state,
+        queueSize: this._queueSize(),
+        uptimeSeconds: Math.floor((Date.now() - this.startTime) / 1000),
+        agentCoreVersion: this.version,
+      });
       if (ok) {
         this.recordSuccess();
         return true;
@@ -97,22 +142,72 @@ class ConnectionManager {
       this.healthCheckTimer = null;
     }
   }
+
+  // Register callback for post-recovery actions (e.g., reset connectionId)
+  onRecovered(cb: () => void): void {
+    this.recoveryCallback = cb;
+  }
+
+  // Replay pending events to TriMC after recovery from degraded state
+  private async _performReplay(): Promise<void> {
+    const connectionId = ''; // Will be resolved from closure via setConnectionId
+    // Use internal connectionId tracker set in createTriLCApp
+    const cid = (this as unknown as { __connectionId: string }).__connectionId ?? '';
+    const events = this._getPendingForReplay(cid);
+    if (events.length === 0) {
+      console.log('[trilc:conn] replay: no pending events');
+      return;
+    }
+    console.log(`[trilc:conn] replay: replaying ${events.length} events`);
+    try {
+      const response = await postReplay(this.trimcBaseUrl, {
+        nodeId: this.nodeId,
+        connectionId: cid,
+        events,
+      });
+      this._applyReplayResponse(cid, response, events);
+      console.log(`[trilc:conn] replay: accepted=${response.accepted} conflicts=${response.conflicts.length}`);
+    } catch (err) {
+      console.error('[trilc:conn] replay request failed:', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // Allow setting connectionId externally (used by createTriLCApp)
+  _setConnectionId(id: string): void {
+    (this as unknown as { __connectionId: string }).__connectionId = id;
+  }
 }
 
-function pingUrl(url: string, timeoutMs = 5000): Promise<boolean> {
+function postHeartbeat(baseUrl: string, hb: {
+  nodeId: string;
+  state: string;
+  queueSize: number;
+  uptimeSeconds: number;
+  agentCoreVersion: string;
+}, timeoutMs = 5000): Promise<boolean> {
   return new Promise((resolve) => {
-    const urlObj = new URL(url);
+    const urlObj = new URL('/internal/v1/heartbeat', baseUrl);
     const reqFn = urlObj.protocol === 'https:' ? httpsRequest : httpRequest;
+    const body = JSON.stringify(hb);
     const req = reqFn(
-      { method: 'GET', hostname: urlObj.hostname, port: urlObj.port, path: urlObj.pathname, timeout: timeoutMs },
+      {
+        method: 'POST',
+        hostname: urlObj.hostname,
+        port: urlObj.port,
+        path: urlObj.pathname,
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body).toString(),
+        },
+        timeout: timeoutMs,
+      },
       (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));
         res.on('end', () => {
-          const body = Buffer.concat(chunks).toString();
           try {
-            const ok = JSON.parse(body).ok === true;
-            resolve(ok);
+            const data = JSON.parse(Buffer.concat(chunks).toString());
+            resolve(data.ok === true);
           } catch {
             resolve(false);
           }
@@ -124,6 +219,52 @@ function pingUrl(url: string, timeoutMs = 5000): Promise<boolean> {
       req.destroy();
       resolve(false);
     });
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── Post replay events to TriMC ──
+// CTO-008-M §3.3.2. Sends queued offline events to TriMC for merge/arbitration.
+async function postReplay(
+  baseUrl: string,
+  payload: { nodeId: string; connectionId: string; events: ReplayEventItem[] },
+  timeoutMs = 10_000,
+): Promise<ReplayResponse> {
+  const urlObj = new URL('/internal/v1/events/replay', baseUrl);
+  const reqFn = urlObj.protocol === 'https:' ? httpsRequest : httpRequest;
+  const body = JSON.stringify(payload);
+  return new Promise((resolve, reject) => {
+    const req = reqFn(
+      {
+        method: 'POST',
+        hostname: urlObj.hostname,
+        port: urlObj.port,
+        path: urlObj.pathname,
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body).toString(),
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(Buffer.concat(chunks).toString()));
+          } catch {
+            reject(new Error('invalid replay response'));
+          }
+        });
+      },
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('replay timeout'));
+    });
+    req.write(body);
     req.end();
   });
 }
@@ -133,7 +274,30 @@ function pingUrl(url: string, timeoutMs = 5000): Promise<boolean> {
 
 export function createTriLCApp(env: TriLCEnv) {
   let server: Server | null = null;
-  const connMgr = new ConnectionManager(env.trimcBaseUrl);
+  const eventQueue = createEventQueue({
+    dbPath: `${env.dataDir}/event-queue.db`,
+  });
+  let connectionId = '';
+  const resetConnectionId = () => {
+    connectionId = `${env.nodeId}-${Date.now().toString(36)}`;
+  };
+  resetConnectionId();
+
+  const connMgr = new ConnectionManager(env.trimcBaseUrl, {
+    nodeId: env.nodeId,
+    version: env.version,
+    queueSize: () => eventQueue.getQueueSize(),
+    getPendingForReplay: (cid, limit) => eventQueue.getPendingForReplay(cid, limit),
+    applyReplayResponse: (cid, res, events) => eventQueue.applyReplayResponse(cid, res, events),
+  });
+
+  // Wire connectionId into ConnectionManager for replay
+  connMgr._setConnectionId(connectionId);
+  connMgr.onRecovered(() => {
+    // On recovery, reset connectionId so replay events are scoped to new session
+    resetConnectionId();
+    connMgr._setConnectionId(connectionId);
+  });
 
   return {
     async start(): Promise<void> {
@@ -200,6 +364,9 @@ export function createTriLCApp(env: TriLCEnv) {
                       'content-type': 'application/json',
                       'content-length': Buffer.byteLength(raw).toString(),
                       'accept': req.headers.accept ?? 'application/json',
+                      'x-trilc-node-id': env.nodeId,
+                      'x-trilc-version': env.version,
+                      'x-trilc-connection-id': connectionId,
                     },
                     timeout: 30_000,
                   },
