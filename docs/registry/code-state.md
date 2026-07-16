@@ -2,16 +2,28 @@
 
 ## Repository Map
 
+- `src/server/`：HTTP API server（TriMC 兼容）— **CTO-008-M 新增**
 - `src/runtime/`：本地 detached runtime
 - `src/local-node/`：节点生命周期和心跳
 - `src/planner/`：规划与重规划
 - `src/toolbus/`：工具总线
+- `src/task-runtime/`：任务运行时
 - `src/context-adapter/`：本地上下文与能力适配
+- `src/contracts/`：类型契约
 - `vendor/`：外部基线快照
 
 ## Current Code Health
 
 - 已有较清晰的本地域控制器骨架。
+- **2026-07-16 CTO-008-M**：新增 HTTP 服务器层 (`src/server/app.ts`)，实现与 TriMC 兼容的 API 面：
+  - `GET /healthz` → `{ ok: true, service: 'trilc', trimc: 'connected' | 'degraded' }`
+  - `POST /internal/v1/agent` — SSE + JSON 双模式，使用 `@trimetaverse/agent-core` 的 `agentLoop()`
+  - **ConnectionManager**：3 次连续失败降级、2 次连续成功恢复的状态机（CTO-008-M 规范）
+  - **TriMC 代理回退**：connected 状态下优先代理到 TriMC（30s 超时），失败时自动回退本地 agentLoop()
+  - 每 30s 周期性健康检查 TriMC `/healthz`
+  - 不加载 pipeline（Soul Loader / Memory Injector / Context Builder / Tool Gater），仅 raw mode
+- 2026-07-16：CTO-008-P 冒烟测试通过 — healthz、代理到 TriMC（失败→fallback→本地 agentLoop）、clean shutdown 均验证 OK
+- 依赖 `@trimetaverse/agent-core` (file:../TriMC/packages/agent-core) + `trimodel`
 - 2026-05-26 已补齐独立 git 仓、根级 `.gitignore` 与本地 CodeGraph 标配。
 - 尚未建立 registry 级代码健康评分和 git 健康摘要。
 
