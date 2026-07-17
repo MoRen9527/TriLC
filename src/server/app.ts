@@ -26,6 +26,9 @@ import { publish } from '../localbus/bus.js';
 import { agentEventsToAnthropicSSE, formatSSELine } from './anthropic-stream.js';
 import { agentEventsToOpenAISSE, formatOpenAISSE, OPENAI_SSE_DONE } from './openai-stream.js';
 import { registerShellExecTool, getDefaultSupervisor, cancelAllShellProcesses } from '../tools/shell-exec.js';
+import { createSessionStore } from '../session-store/index.js';
+import { runSafetyCheck } from '../session-store/safety-check.js';
+import type { SessionRecord, SessionMessageRecord, SessionStatus } from '../session-store/types.js';
 
 // ── ConnectionManager ──
 // Tracks TriMC reachability for fast fallback decisions.
@@ -453,6 +456,7 @@ export function createTriLCApp(env: TriLCEnv) {
   const eventQueue = createEventQueue({
     dbPath: `${env.dataDir}/event-queue.db`,
   });
+  const sessionStore = createSessionStore(`${env.dataDir}/sessions.db`);
   let connectionId = '';
   const resetConnectionId = () => {
     connectionId = `${env.nodeId}-${Date.now().toString(36)}`;
@@ -680,6 +684,48 @@ export function createTriLCApp(env: TriLCEnv) {
               error: { type: 'api_error', message: msg },
             }));
           }
+          // ── Session auto-save (Anthropic JSON mode) ──
+          // Persist the full conversation for recovery after abnormal interruption.
+          try {
+            const sessionId = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+            sessionStore.createSession({
+              id: sessionId,
+              model,
+              systemPrompt: parsed.system,
+              cwd: env.cwd,
+            });
+            const allMsgs: Array<{
+              role: 'user' | 'assistant' | 'system' | 'tool';
+              content: string | null;
+              toolCalls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
+              reasoningContent?: string | null;
+            }> = [];
+            for (const msg of internalMessages) {
+              allMsgs.push({
+                role: msg.role as 'user' | 'assistant' | 'system' | 'tool',
+                content: typeof msg.content === 'string' ? msg.content : null,
+                toolCalls: msg.tool_calls?.map((tc) => ({
+                  id: tc.id,
+                  type: 'function' as const,
+                  function: { name: tc.function.name, arguments: tc.function.arguments },
+                })),
+                reasoningContent: (msg as unknown as Record<string, unknown>).reasoning_content as string | undefined,
+              });
+            }
+            // Add final assistant message
+            allMsgs.push({
+              role: 'assistant',
+              content: finalContent || null,
+              toolCalls: toolCalls.length > 0
+                ? toolCalls.map((tc) => ({ id: tc.id, type: 'function' as const, function: tc.function }))
+                : undefined,
+            });
+            sessionStore.saveMessages(sessionId, allMsgs);
+            sessionStore.updateSessionStatus(sessionId, 'completed');
+          } catch (saveErr) {
+            console.warn('[trilc:session] failed to save session:', (saveErr as Error).message);
+          }
+
           return;
         }
 
@@ -999,6 +1045,46 @@ export function createTriLCApp(env: TriLCEnv) {
                 total_tokens: (usageSummary?.tokens?.prompt_tokens ?? 0) + (usageSummary?.tokens?.completion_tokens ?? 0),
               },
             }));
+
+            // ── Session auto-save (OpenAI JSON mode) ──
+            try {
+              const sessionId = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+              sessionStore.createSession({
+                id: sessionId,
+                model,
+                systemPrompt,
+                cwd: env.cwd,
+              });
+              const allMsgs: Array<{
+                role: 'user' | 'assistant' | 'system' | 'tool';
+                content: string | null;
+                toolCalls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
+                reasoningContent?: string | null;
+              }> = [];
+              for (const msg of internalMessages) {
+                allMsgs.push({
+                  role: msg.role as 'user' | 'assistant' | 'system' | 'tool',
+                  content: typeof msg.content === 'string' ? msg.content : null,
+                  toolCalls: msg.tool_calls?.map((tc) => ({
+                    id: tc.id,
+                    type: 'function' as const,
+                    function: { name: tc.function.name, arguments: tc.function.arguments },
+                  })),
+                  reasoningContent: (msg as unknown as Record<string, unknown>).reasoning_content as string | undefined,
+                });
+              }
+              allMsgs.push({
+                role: 'assistant',
+                content: finalContent || null,
+                toolCalls: toolCalls.length > 0
+                  ? toolCalls.map((tc) => ({ id: tc.id, type: 'function' as const, function: tc.function }))
+                  : undefined,
+              });
+              sessionStore.saveMessages(sessionId, allMsgs);
+              sessionStore.updateSessionStatus(sessionId, 'completed');
+            } catch (saveErr) {
+              console.warn('[trilc:session] failed to save session:', (saveErr as Error).message);
+            }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             res.writeHead(500, { 'content-type': 'application/json' });
@@ -1006,6 +1092,112 @@ export function createTriLCApp(env: TriLCEnv) {
               error: { type: 'api_error', message: msg },
             }));
           }
+          return;
+        }
+
+        // ── POST /internal/v1/sessions/recover ──
+        // Recovers an interrupted session with optional work-tree safety check.
+        // Body: { sessionId?: string } — if omitted, recovers the most recent interrupted session.
+        // Response: RecoveryResult with session, messages, and safety report.
+        if (req.url === '/internal/v1/sessions/recover' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: { sessionId?: string; includeSafetyCheck?: boolean } = {};
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            // empty body is OK — recover most recent
+          }
+
+          const targetId = body.sessionId;
+          let session: SessionRecord | null = null;
+          let messages: SessionMessageRecord[] | null = null;
+          const warnings: string[] = [];
+
+          if (targetId) {
+            session = sessionStore.getSession(targetId);
+            if (session) {
+              messages = sessionStore.getMessages(targetId);
+            }
+          } else {
+            // Find most recent interrupted/active session
+            const interrupted = sessionStore.findInterruptedSessions();
+            if (interrupted.length > 0) {
+              session = interrupted[0];
+              messages = sessionStore.getMessages(session.id);
+            }
+          }
+
+          if (!session) {
+            res.writeHead(404, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: false,
+              session: null,
+              messages: null,
+              safetyReport: null,
+              warnings: ['No recoverable session found'],
+            }));
+            return;
+          }
+
+          // Check for empty assistant messages in the session
+          if (messages) {
+            const emptyAssistants = messages.filter(
+              (m) => m.role === 'assistant' && !m.content && !m.toolCalls,
+            );
+            if (emptyAssistants.length > 0) {
+              warnings.push(
+                `Found ${emptyAssistants.length} empty assistant message(s) (no content, no tool_calls). ` +
+                'These may cause 400 errors on DeepSeek reasoning models. Consider filtering before retry.',
+              );
+            }
+          }
+
+          // Run work-tree safety check
+          const safetyReport = body.includeSafetyCheck !== false
+            ? runSafetyCheck(session.cwd || env.cwd)
+            : { cwd: env.cwd, hasUncommittedChanges: false, changedFiles: [], typeCheckPassed: null, riskLevel: 'low' as const };
+
+          if (safetyReport.riskLevel === 'high') {
+            warnings.push('Work-tree has type errors — resolve before continuing agent work');
+          } else if (safetyReport.riskLevel === 'medium') {
+            warnings.push(`Work-tree has ${safetyReport.changedFiles.length} uncommitted changes — review before continuing`);
+          }
+
+          // Mark session as interrupted so it can be recovered again
+          sessionStore.updateSessionStatus(session.id, 'interrupted');
+
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true,
+            session,
+            messages,
+            safetyReport,
+            warnings,
+          }));
+          return;
+        }
+
+        // ── GET /internal/v1/sessions ──
+        // Lists sessions with optional status filter.
+        // Query: ?status=active|completed|interrupted|expired&limit=20
+        if (req.url?.startsWith('/internal/v1/sessions') && req.method === 'GET') {
+          const urlObj = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
+          const status = urlObj.searchParams.get('status') as SessionStatus | null;
+          const limit = parseInt(urlObj.searchParams.get('limit') ?? '20', 10);
+
+          const sessions = sessionStore.listSessions({
+            status: status ?? undefined,
+            limit,
+          });
+
+          const summaries = sessions.map((s) => sessionStore.getSessionSummary(s.id));
+
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, count: summaries.length, sessions: summaries }));
           return;
         }
 
