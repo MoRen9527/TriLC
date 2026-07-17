@@ -22,6 +22,7 @@ import { createEventQueue } from '../event-queue/index.js';
 import type { ReplayRequest, ReplayResponse } from '../event-queue/types.js';
 import { publish } from '../localbus/bus.js';
 import { agentEventsToAnthropicSSE, formatSSELine } from './anthropic-stream.js';
+import { registerShellExecTool, getDefaultSupervisor, cancelAllShellProcesses } from '../tools/shell-exec.js';
 
 // ── ConnectionManager ──
 // Tracks TriMC reachability for fast fallback decisions.
@@ -475,6 +476,9 @@ export function createTriLCApp(env: TriLCEnv) {
     async start(): Promise<void> {
       connMgr.startHealthCheckLoop();
 
+      // P4.2: Register shell_exec tool backed by ProcessSupervisor
+      registerShellExecTool({ supervisor: getDefaultSupervisor() });
+
       server = createServer(async (req, res) => {
         // ── /healthz ──
         if (req.url === '/healthz') {
@@ -863,6 +867,8 @@ export function createTriLCApp(env: TriLCEnv) {
       // Handle both SIGTERM and SIGINT for clean daemon shutdown.
       const gracefulStop = async (signal: string) => {
         console.log(`[trilc] received ${signal}, shutting down...`);
+        console.log('[trilc] cancelling all managed shell processes...');
+        cancelAllShellProcesses();
         if (server) {
           await new Promise<void>((res) => server!.close(() => res()));
           server = null;
@@ -884,6 +890,7 @@ export function createTriLCApp(env: TriLCEnv) {
 
     async stop(): Promise<void> {
       connMgr.stopHealthCheckLoop();
+      cancelAllShellProcesses();
       if (server) {
         await new Promise<void>((resolve, reject) => {
           server!.close((err) => (err ? reject(err) : resolve()));
