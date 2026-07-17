@@ -1,6 +1,8 @@
 // ── TriLC Local HTTP Server ──
 // Exposes the same API surface as TriMC:
 //   GET  /healthz              → { ok: true, service: 'trilc' }
+//   GET  /v1/models            → Anthropic-compatible model list
+//   POST /v1/messages          → Anthropic Messages API (SSE + JSON)
 //   POST /internal/v1/agent    → SSE + JSON modes (agentLoop from @trimetaverse/agent-core)
 //
 // TriLC does NOT load pipeline (Soul Loader / Memory Injector / Context Builder / Tool Gater).
@@ -10,19 +12,27 @@ import { createServer, type Server, type ServerResponse } from 'node:http';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import type { TriLCEnv } from '../config/env.js';
-import { agentLoop } from '@trimetaverse/agent-core';
+import { agentLoop, register as registerTool } from '@trimetaverse/agent-core';
 import type { AgentEvent, AgentLoopOptions } from '@trimetaverse/agent-core';
 import type { AgentTier, PermissionMode, PermissionRule } from '@trimetaverse/agent-core';
-import type { Message } from 'trimodel';
+import type { Message, ToolDefinition, UsageSummary } from 'trimodel';
+import { createModelClient } from 'trimodel';
 import { createEventQueue } from '../event-queue/index.js';
 import type { ReplayRequest, ReplayResponse } from '../event-queue/types.js';
 import { publish } from '../localbus/bus.js';
+import { agentEventsToAnthropicSSE, formatSSELine } from './anthropic-stream.js';
 
 // ── ConnectionManager ──
 // Tracks TriMC reachability for fast fallback decisions.
 // CTO-008-M spec: 3 consecutive failures → DEGRADED → 2 consecutive successes → CONNECTED
 // Uses POST /internal/v1/heartbeat with node metadata instead of bare GET /healthz.
 // On recovery (DEGRADED→CONNECTED), triggers event replay via POST /internal/v1/events/replay.
+//
+// Heartbeat Wake (absorbed from openclaw heartbeat-wake pattern):
+// - requestHeartbeatNow(): on-demand trigger with coalescing (250ms window)
+// - Priority coalescing: retry < interval < default < action
+// - Retry backoff: 1s cooldown on failure prevents collapse
+// - enable/disable toggle for graceful shutdown
 
 type ConnectionState = 'connected' | 'degraded' | 'local';
 
@@ -37,6 +47,31 @@ interface ConnectionManagerOptions {
   getPendingForReplay?: (connectionId: string, limit?: number) => ReplayEventItem[];
   applyReplayResponse?: (connectionId: string, res: ReplayResponse, events: ReplayEventItem[]) => void;
 }
+
+// ── Heartbeat Wake Reason Priority (absorbed from openclaw) ──
+const WAKE_PRIORITY = {
+  RETRY: 0,
+  INTERVAL: 1,
+  DEFAULT: 2,
+  ACTION: 3,
+} as const;
+
+type WakeReasonKind = 'retry' | 'interval' | 'default' | 'action';
+
+interface PendingWake {
+  reason: WakeReasonKind;
+  priority: number;
+  requestedAt: number;
+}
+
+function resolveWakePriority(reason?: string): number {
+  if (reason === 'retry') return WAKE_PRIORITY.RETRY;
+  if (reason === 'interval') return WAKE_PRIORITY.INTERVAL;
+  if (reason === 'action') return WAKE_PRIORITY.ACTION;
+  return WAKE_PRIORITY.DEFAULT;
+}
+
+// ── ConnectionManager ──
 
 class ConnectionManager {
   private state: ConnectionState = 'connected';
@@ -54,6 +89,17 @@ class ConnectionManager {
   private _getPendingForReplay: (connectionId: string, limit?: number) => ReplayEventItem[];
   private _applyReplayResponse: (connectionId: string, res: ReplayResponse, events: ReplayEventItem[]) => void;
   private recoveryCallback: (() => void) | null = null;
+
+  // ── Heartbeat Wake State (absorbed from openclaw heartbeat-wake) ──
+  private heartbeatsEnabled = true;
+  private pendingWake: PendingWake | null = null;
+  private wakeTimer: NodeJS.Timeout | null = null;
+  private wakeTimerDueAt: number | null = null;
+  private wakeTimerKind: 'normal' | 'retry' | null = null;
+  private wakeRunning = false;
+  private wakeScheduled = false;
+  private static readonly COALESCE_MS = 250;
+  private static readonly RETRY_COOLDOWN_MS = 1_000;
 
   constructor(trimcBaseUrl: string, opts: ConnectionManagerOptions) {
     this.trimcBaseUrl = trimcBaseUrl;
@@ -130,16 +176,141 @@ class ConnectionManager {
   startHealthCheckLoop(): void {
     if (this.healthCheckTimer) return;
     this.healthCheckTimer = setInterval(() => {
-      this.checkHealth().catch(() => {});
+      if (this.heartbeatsEnabled) {
+        this.checkHealth().catch(() => {});
+      }
     }, this.healthCheckIntervalMs);
     // Immediate first check
-    this.checkHealth().catch(() => {});
+    if (this.heartbeatsEnabled) {
+      this.checkHealth().catch(() => {});
+    }
   }
 
   stopHealthCheckLoop(): void {
     if (this.healthCheckTimer) {
       clearInterval(this.healthCheckTimer);
       this.healthCheckTimer = null;
+    }
+    // Clean up wake timer
+    if (this.wakeTimer) {
+      clearTimeout(this.wakeTimer);
+      this.wakeTimer = null;
+      this.wakeTimerDueAt = null;
+      this.wakeTimerKind = null;
+    }
+    this.pendingWake = null;
+    this.wakeScheduled = false;
+    this.wakeRunning = false;
+  }
+
+  // ── Heartbeat Wake (absorbed from openclaw heartbeat-wake) ──
+
+  /** Enable or disable heartbeat checks (periodic + on-demand). */
+  setHeartbeatsEnabled(enabled: boolean): void {
+    this.heartbeatsEnabled = enabled;
+    if (!enabled) {
+      // Clear pending wake state
+      if (this.wakeTimer) {
+        clearTimeout(this.wakeTimer);
+        this.wakeTimer = null;
+        this.wakeTimerDueAt = null;
+        this.wakeTimerKind = null;
+      }
+      this.pendingWake = null;
+      this.wakeScheduled = false;
+    }
+  }
+
+  /** Check if heartbeats are enabled. */
+  areHeartbeatsEnabled(): boolean {
+    return this.heartbeatsEnabled;
+  }
+
+  /**
+   * Request an immediate heartbeat check with coalescing.
+   * Multiple rapid calls within COALESCE_MS (250ms) are merged.
+   * Higher priority reasons preempt lower ones.
+   *
+   * @param reason - Wake reason: 'action' (highest), 'default', 'interval', 'retry' (lowest)
+   * @param coalesceMs - Coalesce window override (default: 250ms)
+   */
+  requestHeartbeatNow(opts?: { reason?: string; coalesceMs?: number }): void {
+    if (!this.heartbeatsEnabled) return;
+
+    const reason = opts?.reason ?? 'action';
+    const priority = resolveWakePriority(reason);
+    const wake: PendingWake = { reason: reason as WakeReasonKind, priority, requestedAt: Date.now() };
+
+    // Merge: keep higher priority, or newer at same priority
+    if (!this.pendingWake || priority > this.pendingWake.priority ||
+        (priority === this.pendingWake.priority && wake.requestedAt >= this.pendingWake.requestedAt)) {
+      this.pendingWake = wake;
+    }
+
+    this._scheduleWake(opts?.coalesceMs ?? ConnectionManager.COALESCE_MS, 'normal');
+  }
+
+  /** Check if a wake is pending (timer scheduled or queued). */
+  hasPendingWake(): boolean {
+    return this.pendingWake !== null || this.wakeTimer !== null || this.wakeScheduled;
+  }
+
+  // ── Internal wake scheduling ──
+
+  private _scheduleWake(coalesceMs: number, kind: 'normal' | 'retry'): void {
+    const delay = Number.isFinite(coalesceMs) ? Math.max(0, coalesceMs) : ConnectionManager.COALESCE_MS;
+    const dueAt = Date.now() + delay;
+
+    if (this.wakeTimer) {
+      // Retry cooldown is a hard minimum — prevents collapse
+      if (this.wakeTimerKind === 'retry') return;
+      // Keep existing timer if it fires sooner or at same time
+      if (typeof this.wakeTimerDueAt === 'number' && this.wakeTimerDueAt <= dueAt) return;
+      // New request fires sooner — preempt
+      clearTimeout(this.wakeTimer);
+      this.wakeTimer = null;
+      this.wakeTimerDueAt = null;
+      this.wakeTimerKind = null;
+    }
+
+    this.wakeTimerDueAt = dueAt;
+    this.wakeTimerKind = kind;
+    this.wakeTimer = setTimeout(() => {
+      this.wakeTimer = null;
+      this.wakeTimerDueAt = null;
+      this.wakeTimerKind = null;
+      this.wakeScheduled = false;
+      this._executeWake().catch(() => {});
+    }, delay);
+    this.wakeTimer.unref?.();
+  }
+
+  private async _executeWake(): Promise<void> {
+    const wake = this.pendingWake;
+    this.pendingWake = null;
+
+    if (this.wakeRunning) {
+      // Already running — reschedule
+      if (wake) {
+        this.pendingWake = wake;
+        this._scheduleWake(ConnectionManager.COALESCE_MS, 'normal');
+      }
+      this.wakeScheduled = true;
+      return;
+    }
+
+    this.wakeRunning = true;
+    try {
+      await this.checkHealth();
+    } catch {
+      // checkHealth handles its own error logging
+    } finally {
+      this.wakeRunning = false;
+      // If more wakes arrived during execution, schedule another round
+      if (this.pendingWake || this.wakeScheduled) {
+        this.wakeScheduled = false;
+        this._scheduleWake(ConnectionManager.RETRY_COOLDOWN_MS, 'retry');
+      }
     }
   }
 
@@ -316,6 +487,159 @@ export function createTriLCApp(env: TriLCEnv) {
           return;
         }
 
+        // ── GET /v1/models ──
+        // Anthropic-compatible model list. Returns models available through TriModel.
+        if (req.url === '/v1/models' && req.method === 'GET') {
+          const models = getAvailableModels();
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            data: models.map((m) => ({
+              id: m.id,
+              type: 'model',
+              display_name: m.displayName,
+              created_at: m.createdAt,
+            })),
+          }));
+          return;
+        }
+
+        // ── POST /v1/messages ──
+        // Anthropic Messages API compatible endpoint.
+        // Accepts: model, messages, system, max_tokens, stream, tools
+        // Returns: SSE stream (stream: true) or JSON response
+        if (req.url === '/v1/messages' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+
+          let parsed: AnthropicRequest;
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON' } }));
+            return;
+          }
+
+          const model = parsed.model ?? 'deepseek-v4-pro';
+          const maxTurns = parsed.max_tokens ? Math.min(Math.ceil(parsed.max_tokens / 100), 25) : 25;
+
+          // Convert Anthropic messages to internal Message format
+          const internalMessages: Message[] = convertAnthropicMessages(parsed.messages ?? []);
+
+          // Register tools from request (if any)
+          const toolDefs = convertAnthropicTools(parsed.tools ?? []);
+          const toolNames: string[] = [];
+          for (const tool of toolDefs) {
+            registerTool(tool, async (_args: Record<string, unknown>) => {
+              // Tool execution is done by TriPilot client; here we return a placeholder
+              // indicating that the tool should be executed client-side.
+              return JSON.stringify({ _trilc_note: 'tool execution delegated to TriPilot client' });
+            });
+            toolNames.push(tool.function.name);
+          }
+
+          const loopOptions: AgentLoopOptions = {
+            model,
+            systemPrompt: parsed.system ?? '',
+            messages: internalMessages,
+            maxTurns,
+            tier: 'main',
+            cwd: env.cwd,
+          };
+
+          const wantsStream = parsed.stream !== false;
+
+          if (wantsStream) {
+            // ── Anthropic SSE streaming ──
+            res.writeHead(200, {
+              'content-type': 'text/event-stream',
+              'cache-control': 'no-cache',
+              'connection': 'keep-alive',
+              'x-accel-buffering': 'no',
+            });
+
+            try {
+              await agentEventsToAnthropicSSE(agentLoop(loopOptions), {
+                model,
+                onSSE: (eventType, data) => {
+                  res.write(formatSSELine(eventType, data));
+                },
+              });
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              res.write(formatSSELine('error', {
+                type: 'error',
+                error: { type: 'api_error', message: msg },
+              }));
+            }
+            res.end();
+            return;
+          }
+
+          // ── JSON mode (non-streaming) ──
+          const allEvents: AgentEvent[] = [];
+          let finalContent = '';
+          const toolCalls: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> = [];
+          let usageSummary: UsageSummary | null = null;
+
+          try {
+            for await (const event of agentLoop(loopOptions)) {
+              allEvents.push(event);
+              if (event.type === 'content_delta') {
+                finalContent += event.delta;
+              } else if (event.type === 'assistant_message') {
+                if (event.content) finalContent += event.content;
+                if (event.tool_calls) {
+                  for (const tc of event.tool_calls) {
+                    toolCalls.push({
+                      id: tc.id,
+                      type: 'function' as const,
+                      function: { name: tc.function.name, arguments: tc.function.arguments },
+                    });
+                  }
+                }
+              } else if (event.type === 'loop_end' && event.usageSummary) {
+                usageSummary = event.usageSummary;
+              }
+            }
+
+            const content = toolCalls.length > 0
+              ? [{ type: 'text' as const, text: finalContent }, ...toolCalls.map((tc) => ({
+                  type: 'tool_use' as const,
+                  id: tc.id,
+                  name: tc.function.name,
+                  input: safeJsonParse(tc.function.arguments),
+                }))]
+              : [{ type: 'text' as const, text: finalContent }];
+
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+              id: `msg_${Date.now().toString(36)}`,
+              type: 'message',
+              role: 'assistant',
+              content,
+              model,
+              stop_reason: toolCalls.length > 0 ? 'tool_use' : 'end_turn',
+              stop_sequence: null,
+              usage: {
+                input_tokens: usageSummary?.tokens?.prompt_tokens ?? 0,
+                output_tokens: usageSummary?.tokens?.completion_tokens ?? 0,
+              },
+            }));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+              type: 'error',
+              error: { type: 'api_error', message: msg },
+            }));
+          }
+          return;
+        }
+
         // ── POST /internal/v1/agent ──
         if (req.url?.startsWith('/internal/v1/agent') && req.method === 'POST') {
           const chunks: Buffer[] = [];
@@ -466,6 +790,20 @@ export function createTriLCApp(env: TriLCEnv) {
           return;
         }
 
+        // ── POST /shutdown ──
+        // Graceful shutdown endpoint for Windows-compatible daemon stop.
+        // On Windows, SIGTERM is a hard kill; this provides a clean alternative.
+        if (req.url === '/shutdown' && req.method === 'POST') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, message: 'shutting down' }));
+          // Defer shutdown to let response flush
+          setImmediate(() => {
+            console.log('[trilc] graceful shutdown via /shutdown');
+            process.exit(0);
+          });
+          return;
+        }
+
         // ── 404 ──
         res.writeHead(404, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'not_found' }));
@@ -503,4 +841,158 @@ export function createTriLCApp(env: TriLCEnv) {
       }
     },
   };
+}
+
+// ── Anthropic API helpers ──
+
+interface AnthropicRequest {
+  model?: string;
+  messages?: AnthropicMessage[];
+  system?: string;
+  max_tokens?: number;
+  stream?: boolean;
+  tools?: AnthropicTool[];
+}
+
+interface AnthropicMessage {
+  role: 'user' | 'assistant';
+  content: string | AnthropicContentBlock[];
+}
+
+interface AnthropicContentBlock {
+  type: 'text' | 'tool_use' | 'tool_result';
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: Record<string, unknown>;
+  tool_use_id?: string;
+  content?: string | AnthropicContentBlock[];
+  is_error?: boolean;
+}
+
+interface AnthropicTool {
+  name: string;
+  description?: string;
+  input_schema?: Record<string, unknown>;
+}
+
+interface ModelInfo {
+  id: string;
+  displayName: string;
+  createdAt: string;
+}
+
+let _modelClient: ReturnType<typeof createModelClient> | null = null;
+let _modelCache: { models: ModelInfo[]; expiresAt: number } | null = null;
+const MODEL_CACHE_TTL_MS = 60_000; // 1 minute
+
+function getAvailableModels(): ModelInfo[] {
+  // Return cached models if still valid
+  if (_modelCache && _modelCache.expiresAt > Date.now()) {
+    return _modelCache.models;
+  }
+
+  try {
+    if (!_modelClient) {
+      _modelClient = createModelClient();
+    }
+    const modelIds = _modelClient.listModels();
+    const models: ModelInfo[] = modelIds.map((id) => ({
+      id,
+      displayName: id,
+      createdAt: '2025-01-01',
+    }));
+    _modelCache = { models, expiresAt: Date.now() + MODEL_CACHE_TTL_MS };
+    return models;
+  } catch {
+    // Fallback: return last cached or default models on error
+    if (_modelCache) return _modelCache.models;
+    return [
+      { id: 'deepseek-v4-pro', displayName: 'DeepSeek V4 Pro', createdAt: '2025-01-01' },
+      { id: 'deepseek-chat', displayName: 'DeepSeek Chat', createdAt: '2024-01-01' },
+      { id: 'deepseek-reasoner', displayName: 'DeepSeek Reasoner', createdAt: '2025-01-01' },
+    ];
+  }
+}
+
+/**
+ * Convert Anthropic Messages API format to internal Message[] format.
+ * Handles:
+ * - Simple text content: { role: "user", content: "hello" }
+ * - Content blocks: [{ type: "text", text: "hello" }]
+ * - Tool results: [{ type: "tool_result", tool_use_id: "...", content: "..." }]
+ */
+function convertAnthropicMessages(anthropicMessages: AnthropicMessage[]): Message[] {
+  const result: Message[] = [];
+
+  for (const msg of anthropicMessages) {
+    if (typeof msg.content === 'string') {
+      // Simple text message
+      result.push({
+        role: msg.role,
+        content: msg.content,
+      });
+    } else if (Array.isArray(msg.content)) {
+      // Content blocks — may contain text AND tool results
+      const textBlocks: string[] = [];
+      const toolResults: Array<{ tool_call_id: string; content: string }> = [];
+
+      for (const block of msg.content) {
+        if (block.type === 'text' && block.text) {
+          textBlocks.push(block.text);
+        } else if (block.type === 'tool_result') {
+          const resultContent = typeof block.content === 'string'
+            ? block.content
+            : (Array.isArray(block.content)
+              ? block.content.map((c) => c.text ?? '').join('\n')
+              : '');
+          toolResults.push({
+            tool_call_id: block.tool_use_id ?? '',
+            content: resultContent,
+          });
+        }
+      }
+
+      // Emit text as user/assistant message
+      if (textBlocks.length > 0) {
+        result.push({
+          role: msg.role,
+          content: textBlocks.join('\n'),
+        });
+      }
+
+      // Emit tool results as tool messages
+      for (const tr of toolResults) {
+        result.push({
+          role: 'tool',
+          content: tr.content,
+          tool_call_id: tr.tool_call_id,
+        });
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Convert Anthropic tool definitions to internal ToolDefinition format.
+ */
+function convertAnthropicTools(tools: AnthropicTool[]): ToolDefinition[] {
+  return tools.map((t) => ({
+    type: 'function' as const,
+    function: {
+      name: t.name,
+      description: t.description ?? '',
+      parameters: t.input_schema ?? { type: 'object', properties: {} },
+    },
+  }));
+}
+
+function safeJsonParse(s: string): Record<string, unknown> {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return { _raw: s };
+  }
 }

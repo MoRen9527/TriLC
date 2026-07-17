@@ -153,7 +153,7 @@ async function cmdStart(port: number): Promise<void> {
   await new Promise((r) => setTimeout(r, 500));
 }
 
-async function cmdStop(): Promise<void> {
+async function cmdStop(port: number = DEFAULT_PORT): Promise<void> {
   const pid = await readPid();
   if (!pid) {
     console.log('[trilc] no daemon running (no PID file)');
@@ -166,14 +166,43 @@ async function cmdStop(): Promise<void> {
     return;
   }
 
+  // Try graceful HTTP shutdown first (Windows-compatible)
+  const shutdownOk = await gracefulShutdown(port);
+  if (shutdownOk) {
+    console.log(`[trilc] daemon stopped gracefully (pid=${pid})`);
+    await removePidFile();
+    return;
+  }
+
+  // Fallback: SIGTERM (Linux) / TerminateProcess (Windows)
   try {
     process.kill(pid, 'SIGTERM');
-    console.log(`[trilc] daemon stopped (pid=${pid})`);
+    console.log(`[trilc] daemon stopped via signal (pid=${pid})`);
   } catch (err) {
     console.error(`[trilc] failed to stop daemon (pid=${pid}):`, (err as Error).message);
   }
 
   await removePidFile();
+}
+
+async function gracefulShutdown(port: number): Promise<boolean> {
+  try {
+    const url = `http://127.0.0.1:${port}/shutdown`;
+    await new Promise<void>((resolve, reject) => {
+      import('node:http').then((http) => {
+        const req = http.request(url, { method: 'POST', timeout: 3000 }, (res) => {
+          res.resume();
+          res.on('end', resolve);
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+        req.end();
+      });
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function cmdStatus(port: number): Promise<void> {
@@ -209,7 +238,7 @@ const { command, port } = parseArgs(process.argv.slice(2));
       await cmdStart(port);
       break;
     case 'stop':
-      await cmdStop();
+      await cmdStop(port);
       break;
     case 'status':
       await cmdStatus(port);
