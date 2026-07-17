@@ -8,6 +8,7 @@ import {
   listTools,
   type AgentLoopOptions,
   type AgentEvent,
+  validateMessage,
 } from '@trimetaverse/agent-core';
 import type { TriLCEnv } from '../config/env.js';
 import type { Message } from 'trimodel';
@@ -38,9 +39,27 @@ export class LocalNode {
       cwd: opts.cwd ?? this.env.cwd,
     };
 
+    let hadMeaningfulOutput = false;
+
     try {
       for await (const event of agentLoop(loopOpts)) {
+        // ── Message guard: track if we got real content or tool calls ──
+        if (event.type === 'assistant_message') {
+          const guardResult = validateMessage({
+            role: 'assistant',
+            content: event.content,
+            tool_calls: event.tool_calls,
+          });
+          if (guardResult.allowed) {
+            hadMeaningfulOutput = true;
+          }
+        }
         yield event;
+      }
+
+      // ── Post-loop guard: if nothing meaningful was emitted, log warning ──
+      if (!hadMeaningfulOutput) {
+        console.warn(`[trilc/local-node] agent run completed with no valid output (possible reasoning-only response)`);
       }
     } finally {
       this.state = 'idle';

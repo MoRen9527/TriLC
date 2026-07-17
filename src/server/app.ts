@@ -15,6 +15,7 @@ import type { TriLCEnv } from '../config/env.js';
 import { agentLoop, register as registerTool } from '@trimetaverse/agent-core';
 import type { AgentEvent, AgentLoopOptions } from '@trimetaverse/agent-core';
 import type { AgentTier, PermissionMode, PermissionRule } from '@trimetaverse/agent-core';
+import { validateMessage, type GuardResult } from '@trimetaverse/agent-core';
 import type { Message, ToolDefinition, UsageSummary } from 'trimodel';
 import { createModelClient } from 'trimodel';
 import { createEventQueue } from '../event-queue/index.js';
@@ -561,14 +562,30 @@ export function createTriLCApp(env: TriLCEnv) {
               'x-accel-buffering': 'no',
             });
 
-            try {
-              await agentEventsToAnthropicSSE(agentLoop(loopOptions), {
-                model,
-                onSSE: (eventType, data) => {
-                  res.write(formatSSELine(eventType, data));
-                },
-              });
-            } catch (err) {
+          let streamedContent = false;
+          let streamedToolCalls = false;
+
+          try {
+            await agentEventsToAnthropicSSE(agentLoop(loopOptions), {
+              model,
+              onSSE: (eventType, data) => {
+                if (eventType === 'content_block_delta' || eventType === 'message_delta') {
+                  streamedContent = true;
+                } else if (eventType === 'content_block_start') {
+                  streamedToolCalls = true;
+                }
+                res.write(formatSSELine(eventType, data));
+              },
+            });
+
+            // ── Post-stream guard: warn if nothing meaningful was emitted ──
+            if (!streamedContent && !streamedToolCalls) {
+              res.write(formatSSELine('message_stop', {
+                type: 'message_stop',
+                warning: 'No content or tool calls were emitted (possible reasoning-only response)',
+              }));
+            }
+          } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               res.write(formatSSELine('error', {
                 type: 'error',
@@ -604,6 +621,25 @@ export function createTriLCApp(env: TriLCEnv) {
               } else if (event.type === 'loop_end' && event.usageSummary) {
                 usageSummary = event.usageSummary;
               }
+            }
+
+            // ── Message guard: reject empty assistant responses ──
+            // Prevents "空头" — DeepSeek reasoning_content-only messages
+            // that have neither content nor tool_calls.
+            const guardResult: GuardResult = validateMessage({
+              role: 'assistant',
+              content: finalContent || null,
+              tool_calls: toolCalls.length > 0
+                ? toolCalls.map((tc) => ({ id: tc.id, type: 'function' as const, function: tc.function }))
+                : undefined,
+            });
+            if (!guardResult.allowed) {
+              res.writeHead(422, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({
+                type: 'error',
+                error: { type: 'empty_response', message: `Message rejected: ${guardResult.reason}` },
+              }));
+              return;
             }
 
             const content = toolCalls.length > 0
