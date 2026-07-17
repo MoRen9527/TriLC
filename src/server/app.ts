@@ -2,7 +2,9 @@
 // Exposes the same API surface as TriMC:
 //   GET  /healthz              → { ok: true, service: 'trilc' }
 //   GET  /v1/models            → Anthropic-compatible model list
+//   GET  /models               → OpenAI-compatible model list
 //   POST /v1/messages          → Anthropic Messages API (SSE + JSON)
+//   POST /chat/completions     → OpenAI Chat Completions API (SSE + JSON)
 //   POST /internal/v1/agent    → SSE + JSON modes (agentLoop from @trimetaverse/agent-core)
 //
 // TriLC does NOT load pipeline (Soul Loader / Memory Injector / Context Builder / Tool Gater).
@@ -22,6 +24,7 @@ import { createEventQueue } from '../event-queue/index.js';
 import type { ReplayRequest, ReplayResponse } from '../event-queue/types.js';
 import { publish } from '../localbus/bus.js';
 import { agentEventsToAnthropicSSE, formatSSELine } from './anthropic-stream.js';
+import { agentEventsToOpenAISSE, formatOpenAISSE, OPENAI_SSE_DONE } from './openai-stream.js';
 import { registerShellExecTool, getDefaultSupervisor, cancelAllShellProcesses } from '../tools/shell-exec.js';
 
 // ── ConnectionManager ──
@@ -830,6 +833,182 @@ export function createTriLCApp(env: TriLCEnv) {
           return;
         }
 
+        // ── GET /models (OpenAI-compatible) ──
+        // Returns model list in OpenAI format for opencode / Vercel AI SDK.
+        if (req.url === '/models' && req.method === 'GET') {
+          const models = getAvailableModels();
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            object: 'list',
+            data: models.map((m) => ({
+              id: m.id,
+              object: 'model',
+              created: Math.floor(new Date(m.createdAt).getTime() / 1000),
+              owned_by: 'trilc',
+            })),
+          }));
+          return;
+        }
+
+        // ── POST /chat/completions (OpenAI-compatible) ──
+        // OpenAI Chat Completions API compatible endpoint.
+        // Converts OpenAI format → internal → agentLoop → OpenAI SSE/JSON output.
+        // Used by opencode custom provider (Vercel AI SDK @ai-sdk/openai-compatible).
+        if (req.url === '/chat/completions' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+
+          let parsed: OpenAIRequest;
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Invalid JSON' } }));
+            return;
+          }
+
+          const model = parsed.model ?? 'deepseek-v4-pro';
+          const maxTurns = parsed.max_tokens ? Math.min(Math.ceil(parsed.max_tokens / 100), 25) : 25;
+
+          // Convert OpenAI messages to internal format
+          const { systemPrompt, internalMessages } = convertOpenAIMessages(parsed.messages ?? []);
+
+          // Register tools from request (if any)
+          const toolDefs = convertOpenAITools(parsed.tools ?? []);
+          const toolNames: string[] = [];
+          for (const tool of toolDefs) {
+            registerTool(tool, async (_args: Record<string, unknown>) => {
+              return JSON.stringify({ _trilc_note: 'tool execution delegated to client' });
+            });
+            toolNames.push(tool.function.name);
+          }
+
+          const loopOptions: AgentLoopOptions = {
+            model,
+            systemPrompt,
+            messages: internalMessages,
+            maxTurns,
+            tier: 'main',
+            cwd: env.cwd,
+          };
+
+          const wantsStream = parsed.stream !== false;
+
+          if (wantsStream) {
+            // ── OpenAI SSE streaming ──
+            res.writeHead(200, {
+              'content-type': 'text/event-stream',
+              'cache-control': 'no-cache',
+              'connection': 'keep-alive',
+              'x-accel-buffering': 'no',
+            });
+
+            try {
+              await agentEventsToOpenAISSE(agentLoop(loopOptions), {
+                model,
+                onSSE: (data) => {
+                  res.write(formatOpenAISSE(data));
+                },
+              });
+              res.write(OPENAI_SSE_DONE);
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              res.write(formatOpenAISSE({
+                error: { type: 'api_error', message: msg },
+              }));
+              res.write(OPENAI_SSE_DONE);
+            }
+            res.end();
+            return;
+          }
+
+          // ── JSON mode (non-streaming) ──
+          let finalContent = '';
+          const toolCalls: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> = [];
+          let usageSummary: UsageSummary | null = null;
+
+          try {
+            for await (const event of agentLoop(loopOptions)) {
+              if (event.type === 'content_delta') {
+                finalContent += event.delta;
+              } else if (event.type === 'assistant_message') {
+                if (event.content) finalContent += event.content;
+                if (event.tool_calls) {
+                  for (const tc of event.tool_calls) {
+                    toolCalls.push({
+                      id: tc.id,
+                      type: 'function' as const,
+                      function: { name: tc.function.name, arguments: tc.function.arguments },
+                    });
+                  }
+                }
+              } else if (event.type === 'loop_end' && event.usageSummary) {
+                usageSummary = event.usageSummary;
+              }
+            }
+
+            // Message guard: reject empty responses
+            const guardResult: GuardResult = validateMessage({
+              role: 'assistant',
+              content: finalContent || null,
+              tool_calls: toolCalls.length > 0
+                ? toolCalls.map((tc) => ({ id: tc.id, type: 'function' as const, function: tc.function }))
+                : undefined,
+            });
+            if (!guardResult.allowed) {
+              res.writeHead(422, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({
+                error: { type: 'empty_response', message: `Message rejected: ${guardResult.reason}` },
+              }));
+              return;
+            }
+
+            const choice: Record<string, unknown> = {
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: finalContent || null,
+              },
+              finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
+            };
+
+            if (toolCalls.length > 0) {
+              (choice.message as Record<string, unknown>).tool_calls = toolCalls.map((tc) => ({
+                id: tc.id,
+                type: 'function',
+                function: {
+                  name: tc.function.name,
+                  arguments: tc.function.arguments,
+                },
+              }));
+            }
+
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+              id: `chatcmpl-${Date.now().toString(36)}`,
+              object: 'chat.completion',
+              created: Math.floor(Date.now() / 1000),
+              model,
+              choices: [choice],
+              usage: {
+                prompt_tokens: usageSummary?.tokens?.prompt_tokens ?? 0,
+                completion_tokens: usageSummary?.tokens?.completion_tokens ?? 0,
+                total_tokens: (usageSummary?.tokens?.prompt_tokens ?? 0) + (usageSummary?.tokens?.completion_tokens ?? 0),
+              },
+            }));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+              error: { type: 'api_error', message: msg },
+            }));
+          }
+          return;
+        }
+
         // ── POST /shutdown ──
         // Graceful shutdown endpoint for Windows-compatible daemon stop.
         // On Windows, SIGTERM is a hard kill; this provides a clean alternative.
@@ -932,6 +1111,39 @@ interface AnthropicTool {
   name: string;
   description?: string;
   input_schema?: Record<string, unknown>;
+}
+
+// ── OpenAI Chat Completions types ──
+// Used by the /chat/completions endpoint for opencode / Vercel AI SDK compatibility.
+
+interface OpenAIRequest {
+  model?: string;
+  messages?: OpenAIMessage[];
+  stream?: boolean;
+  max_tokens?: number;
+  tools?: OpenAIToolDef[];
+}
+
+interface OpenAIMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content?: string | null;
+  tool_calls?: OpenAIToolCall[];
+  tool_call_id?: string;
+}
+
+interface OpenAIToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
+}
+
+interface OpenAIToolDef {
+  type: 'function';
+  function: {
+    name: string;
+    description?: string;
+    parameters?: Record<string, unknown>;
+  };
 }
 
 interface ModelInfo {
@@ -1043,6 +1255,56 @@ function convertAnthropicTools(tools: AnthropicTool[]): ToolDefinition[] {
       name: t.name,
       description: t.description ?? '',
       parameters: t.input_schema ?? { type: 'object', properties: {} },
+    },
+  }));
+}
+
+/**
+ * Convert OpenAI Chat Completions messages to internal Message[] format.
+ * Extracts system messages into a separate systemPrompt string.
+ */
+function convertOpenAIMessages(openaiMessages: OpenAIMessage[]): { systemPrompt: string; internalMessages: Message[] } {
+  let systemPrompt = '';
+  const internalMessages: Message[] = [];
+
+  for (const msg of openaiMessages) {
+    if (msg.role === 'system') {
+      systemPrompt += (systemPrompt ? '\n' : '') + (msg.content ?? '');
+    } else if (msg.role === 'user') {
+      internalMessages.push({ role: 'user', content: msg.content ?? '' });
+    } else if (msg.role === 'assistant') {
+      const toolCalls = msg.tool_calls?.map((tc) => ({
+        id: tc.id,
+        type: 'function' as const,
+        function: { name: tc.function.name, arguments: tc.function.arguments },
+      }));
+      internalMessages.push({
+        role: 'assistant',
+        content: msg.content ?? '',
+        tool_calls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
+      });
+    } else if (msg.role === 'tool') {
+      internalMessages.push({
+        role: 'tool',
+        content: msg.content ?? '',
+        tool_call_id: msg.tool_call_id ?? '',
+      });
+    }
+  }
+
+  return { systemPrompt, internalMessages };
+}
+
+/**
+ * Convert OpenAI tool definitions to internal ToolDefinition format.
+ */
+function convertOpenAITools(tools: OpenAIToolDef[]): ToolDefinition[] {
+  return tools.map((t) => ({
+    type: 'function' as const,
+    function: {
+      name: t.function.name,
+      description: t.function.description ?? '',
+      parameters: t.function.parameters ?? { type: 'object', properties: {} },
     },
   }));
 }
