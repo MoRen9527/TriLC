@@ -821,6 +821,21 @@ export function createTriLCApp(env: TriLCEnv) {
       }
 
       console.log(`[trilc] listening on :${env.port}`);
+
+      // ── Signal handling (Linux detached runtime) ──
+      // On Linux, the CLI sends SIGTERM as fallback after graceful /shutdown.
+      // Handle both SIGTERM and SIGINT for clean daemon shutdown.
+      const gracefulStop = async (signal: string) => {
+        console.log(`[trilc] received ${signal}, shutting down...`);
+        if (server) {
+          await new Promise<void>((res) => server!.close(() => res()));
+          server = null;
+        }
+        connMgr.stopHealthCheckLoop();
+        process.exit(0);
+      };
+      process.on('SIGTERM', () => gracefulStop('SIGTERM'));
+      process.on('SIGINT', () => gracefulStop('SIGINT'));
     },
 
     get port(): number {
