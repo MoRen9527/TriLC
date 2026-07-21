@@ -29,6 +29,7 @@ import { registerShellExecTool, getDefaultSupervisor, cancelAllShellProcesses } 
 import { createSessionStore } from '../session-store/index.js';
 import { runSafetyCheck } from '../session-store/safety-check.js';
 import type { SessionRecord, SessionMessageRecord, SessionStatus } from '../session-store/types.js';
+import { initKeyCache, stopKeyCache } from '../config/key-cache.js';
 
 // ── ConnectionManager ──
 // Tracks TriMC reachability for fast fallback decisions.
@@ -451,12 +452,27 @@ async function postReplay(
 // ── Proxy agent request to TriMC ──
 // Used as inline logic in the request handler; kept here for potential standalone usage.
 
+// ── Task stream state ──
+// In-memory registry of submitted tasks awaiting SSE stream consumption.
+// Tasks are created on POST /tasks/submit and executed when SSE client connects.
+interface TaskStreamEntry {
+  sessionId: string;
+  message: string;
+  conversationId: string;
+  systemPrompt: string;
+  context: { files: string[]; workspaceRoot: string };
+  createdAt: number;
+  status: 'pending' | 'running' | 'done' | 'error' | 'cancelled';
+  progress?: { step: number; totalSteps: number; description: string };
+}
+
 export function createTriLCApp(env: TriLCEnv) {
   let server: Server | null = null;
   const eventQueue = createEventQueue({
     dbPath: `${env.dataDir}/event-queue.db`,
   });
   const sessionStore = createSessionStore(`${env.dataDir}/sessions.db`);
+  const taskStreams = new Map<string, TaskStreamEntry>();
   let connectionId = '';
   const resetConnectionId = () => {
     connectionId = `${env.nodeId}-${Date.now().toString(36)}`;
@@ -486,6 +502,14 @@ export function createTriLCApp(env: TriLCEnv) {
       // P4.2: Register shell_exec tool backed by ProcessSupervisor
       registerShellExecTool({ supervisor: getDefaultSupervisor() });
 
+      // Step 2: Set TriModel API URL for HTTP-priority model fetching
+      setTrimodelApiUrl(env.trimodelApiUrl);
+
+      // Step 2b: Initialize key cache (async, non-blocking — server starts regardless)
+      initKeyCache(env.trimodelApiUrl, env.dataDir, process.env.TRIMODEL_API_TOKEN).catch((err) => {
+        console.warn('[trilc] key cache init failed:', err instanceof Error ? err.message : String(err));
+      });
+
       server = createServer(async (req, res) => {
         // ── /healthz ──
         if (req.url === '/healthz') {
@@ -502,7 +526,7 @@ export function createTriLCApp(env: TriLCEnv) {
         // ── GET /v1/models ──
         // Anthropic-compatible model list. Returns models available through TriModel.
         if (req.url === '/v1/models' && req.method === 'GET') {
-          const models = getAvailableModels();
+          const models = await getAvailableModels();
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify({
             data: models.map((m) => ({
@@ -536,6 +560,8 @@ export function createTriLCApp(env: TriLCEnv) {
           }
 
           const model = parsed.model ?? 'deepseek-v4-pro';
+          // Step 4: End-to-end verification — log received model parameter
+          console.log(`[trilc] /v1/messages model=${model}`);
           const maxTurns = parsed.max_tokens ? Math.min(Math.ceil(parsed.max_tokens / 100), 25) : 25;
 
           // Convert Anthropic messages to internal Message format
@@ -555,13 +581,12 @@ export function createTriLCApp(env: TriLCEnv) {
 
           const loopOptions: AgentLoopOptions = {
             model,
-            systemPrompt: parsed.system ?? '',
+            systemPrompt: parsed.system || undefined,
             messages: internalMessages,
             maxTurns,
             tier: 'main',
             cwd: env.cwd,
           };
-
           const wantsStream = parsed.stream !== false;
 
           if (wantsStream) {
@@ -691,7 +716,7 @@ export function createTriLCApp(env: TriLCEnv) {
             sessionStore.createSession({
               id: sessionId,
               model,
-              systemPrompt: parsed.system,
+              systemPrompt: parsed.system || undefined,
               cwd: env.cwd,
             });
             const allMsgs: Array<{
@@ -882,7 +907,7 @@ export function createTriLCApp(env: TriLCEnv) {
         // ── GET /models (OpenAI-compatible) ──
         // Returns model list in OpenAI format for opencode / Vercel AI SDK.
         if (req.url === '/models' && req.method === 'GET') {
-          const models = getAvailableModels();
+          const models = await getAvailableModels();
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify({
             object: 'list',
@@ -1181,23 +1206,314 @@ export function createTriLCApp(env: TriLCEnv) {
           return;
         }
 
-        // ── GET /internal/v1/sessions ──
-        // Lists sessions with optional status filter.
-        // Query: ?status=active|completed|interrupted|expired&limit=20
-        if (req.url?.startsWith('/internal/v1/sessions') && req.method === 'GET') {
-          const urlObj = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
-          const status = urlObj.searchParams.get('status') as SessionStatus | null;
-          const limit = parseInt(urlObj.searchParams.get('limit') ?? '20', 10);
 
-          const sessions = sessionStore.listSessions({
-            status: status ?? undefined,
-            limit,
+        // ── POST /internal/v1/tasks/submit ──
+        // W30 S2: Submit user intent → returns sessionId + SSE stream endpoint.
+        // Body: { message, conversationId, systemPrompt?, context? }
+        // Response 201: { sessionId, streamEndpoint, status }
+        if (req.url === '/internal/v1/tasks/submit' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+
+          let body: {
+            message?: string;
+            conversationId?: string;
+            systemPrompt?: string;
+            context?: { files?: string[]; workspaceRoot?: string };
+          } = {};
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+            return;
+          }
+
+          if (!body.message || !body.message.trim()) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'bad_request', message: 'message is required' }));
+            return;
+          }
+
+          const sessionId = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+          const entry: TaskStreamEntry = {
+            sessionId,
+            message: body.message.trim(),
+            conversationId: body.conversationId ?? `conv_${Date.now().toString(36)}`,
+            systemPrompt: body.systemPrompt ?? 'You are a coding assistant. Complete the given task using available tools.',
+            context: {
+              files: body.context?.files ?? [],
+              workspaceRoot: body.context?.workspaceRoot ?? env.cwd,
+            },
+            createdAt: Date.now(),
+            status: 'pending',
+          };
+          taskStreams.set(sessionId, entry);
+
+          // Persist session for recovery
+          try {
+            sessionStore.createSession({
+              id: sessionId,
+              model: 'auto',
+              systemPrompt: entry.systemPrompt,
+              cwd: entry.context.workspaceRoot,
+            });
+          } catch (saveErr) {
+            console.warn('[trilc:task] failed to persist session:', (saveErr as Error).message);
+          }
+
+          res.writeHead(201, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            sessionId,
+            streamEndpoint: `/internal/v1/sessions/${sessionId}/stream`,
+            status: 'running',
+          }));
+          return;
+        }
+
+        // ── SSE GET /internal/v1/sessions/{id}/stream ──
+        // W30 S2: Real-time SSE stream of LLM output + tool call status.
+        // Event types: delta, tool_use, tool_result, task_progress, task_done, task_error
+        if (req.url?.startsWith('/internal/v1/sessions/') && req.url.endsWith('/stream') && req.method === 'GET') {
+          const sessionId = req.url.split('/')[4]; // /internal/v1/sessions/{id}/stream
+          const entry = taskStreams.get(sessionId);
+
+          if (!entry) {
+            res.writeHead(404, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'not_found', message: `No task found for session ${sessionId}` }));
+            return;
+          }
+
+          // SSE headers
+          res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            'connection': 'keep-alive',
+            'x-accel-buffering': 'no',
           });
 
-          const summaries = sessions.map((s) => sessionStore.getSessionSummary(s.id));
+          const writeSSE = (eventType: string, data: object) => {
+            res.write(`event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`);
+          };
+
+          // Mark running
+          entry.status = 'running';
+
+          // Build agentLoop options from task entry
+          const cwd = entry.context.workspaceRoot || env.cwd;
+          const messages: Message[] = [{ role: 'user', content: entry.message }];
+          const systemPrompt = entry.systemPrompt || 'You are a coding assistant. Complete the given task using available tools.';
+
+          try {
+            // Track tool states for progress reporting
+            let toolCount = 0;
+            let deltaContent = '';
+
+            for await (const event of agentLoop({
+              model: 'auto',
+              systemPrompt,
+              messages,
+              maxTurns: 25,
+              tier: 'main',
+              cwd,
+            })) {
+              // Map agent events to W30 SSE event types
+              switch (event.type) {
+                case 'content_delta': {
+                  deltaContent += (event as any).delta ?? '';
+                  writeSSE('delta', { content: (event as any).delta ?? '' });
+                  break;
+                }
+                case 'tool_call': {
+                  toolCount++;
+                  const tc = event as any;
+                  writeSSE('tool_use', {
+                    toolName: tc.name ?? tc.tool_name ?? 'unknown',
+                    input: tc.input ?? tc.arguments ?? {},
+                  });
+                  // Update progress
+                  entry.progress = {
+                    step: toolCount,
+                    totalSteps: toolCount + 1, // estimate
+                    description: `Calling tool: ${tc.name ?? 'unknown'}`,
+                  };
+                  writeSSE('task_progress', entry.progress);
+                  break;
+                }
+                case 'tool_result': {
+                  const tr = event as any;
+                  writeSSE('tool_result', {
+                    toolName: tr.name ?? tr.tool_name ?? 'unknown',
+                    output: typeof tr.result === 'string' ? tr.result : JSON.stringify(tr.result ?? ''),
+                    durationMs: tr.durationMs ?? 0,
+                  });
+                  break;
+                }
+                case 'assistant_message': {
+                  const am = event as any;
+                  if (am.content && !deltaContent) {
+                    writeSSE('delta', { content: am.content });
+                  }
+                  break;
+                }
+                case 'loop_end': {
+                  // Will be handled after the loop
+                  break;
+                }
+                case 'error': {
+                  const err = event as any;
+                  writeSSE('task_error', {
+                    status: 'failed',
+                    error: err.message ?? String(err),
+                  });
+                  entry.status = 'error';
+                  break;
+                }
+                default: {
+                  // Forward unknown events as generic
+                  break;
+                }
+              }
+            }
+
+            // Task completed successfully
+            entry.status = 'done';
+            writeSSE('task_done', {
+              status: 'success',
+              summary: deltaContent
+                ? deltaContent.slice(0, 200) + (deltaContent.length > 200 ? '...' : '')
+                : 'Task completed',
+            });
+
+            // Persist session as completed
+            try {
+              sessionStore.saveMessages(sessionId, [
+                { role: 'user', content: entry.message },
+                { role: 'assistant', content: deltaContent || 'Task completed' },
+              ]);
+              sessionStore.updateSessionStatus(sessionId, 'completed');
+            } catch (saveErr) {
+              console.warn('[trilc:sse] failed to save session:', (saveErr as Error).message);
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            entry.status = 'error';
+            writeSSE('task_error', { status: 'failed', error: msg });
+
+            try {
+              sessionStore.updateSessionStatus(sessionId, 'interrupted');
+            } catch {
+              // ignore
+            }
+          }
+
+          // Cleanup
+          res.end();
+          return;
+        }
+
+        // ── POST /internal/v1/sessions/{id}/cancel ──
+        // W30 S4: Cancel a running task. Marks session as cancelled and aborts SSE stream.
+        if (req.url?.startsWith('/internal/v1/sessions/') && req.url.endsWith('/cancel') && req.method === 'POST') {
+          const sessionId = req.url.split('/')[4]; // /internal/v1/sessions/{id}/cancel
+
+          // Check in-memory task streams
+          const entry = taskStreams.get(sessionId);
+          if (entry && (entry.status === 'pending' || entry.status === 'running')) {
+            entry.status = 'cancelled';
+          }
+
+          // Update persistent session store
+          try {
+            const session = sessionStore.getSession(sessionId);
+            if (session) {
+              sessionStore.updateSessionStatus(sessionId, 'interrupted');
+            } else {
+              res.writeHead(404, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'not_found', message: `Session ${sessionId} not found` }));
+              return;
+            }
+          } catch {
+            res.writeHead(404, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'not_found', message: `Session ${sessionId} not found` }));
+            return;
+          }
 
           res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, count: summaries.length, sessions: summaries }));
+          res.end(JSON.stringify({ ok: true, sessionId, status: 'cancelled' }));
+          return;
+        }
+
+        // ── GET /internal/v1/sessions ──
+        // Lists sessions with optional status filter.
+        // Query: ?status=running|completed|failed|cancelled&limit=20
+        // W30 S4: Merges in-memory taskStreams (for running tasks) with persistent sessionStore.
+        if (req.url?.startsWith('/internal/v1/sessions') && req.method === 'GET') {
+          const urlObj = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
+          const statusFilter = urlObj.searchParams.get('status');
+          const limit = parseInt(urlObj.searchParams.get('limit') ?? '20', 10);
+
+          const result: Array<{
+            id: string;
+            title?: string;
+            status: string;
+            progress?: { step: number; totalSteps: number; description: string };
+            createdAt: string;
+            updatedAt: string;
+            completedAt: string | null;
+          }> = [];
+
+          // Include in-memory task streams (current/active tasks)
+          if (!statusFilter || statusFilter === 'running') {
+            for (const [id, entry] of taskStreams) {
+              if (statusFilter && entry.status !== statusFilter) continue;
+              result.push({
+                id: entry.sessionId,
+                title: entry.message.slice(0, 80),
+                status: entry.status,
+                progress: entry.progress,
+                createdAt: new Date(entry.createdAt).toISOString(),
+                updatedAt: new Date(entry.createdAt).toISOString(),
+                completedAt: null,
+              });
+            }
+          }
+
+          // Include persistent sessions from sessionStore
+          const storeFilter: SessionStatus | undefined =
+            statusFilter === 'running' ? 'active' :
+            statusFilter === 'failed' ? 'interrupted' :
+            statusFilter === 'cancelled' ? undefined :
+            statusFilter as SessionStatus | undefined;
+
+          if (storeFilter || !statusFilter) {
+            const sessions = sessionStore.listSessions({ status: storeFilter, limit });
+            for (const s of sessions) {
+              // Skip sessions already in taskStreams (avoid duplicates)
+              if (taskStreams.has(s.id)) continue;
+              const summary = sessionStore.getSessionSummary(s.id);
+              let displayStatus: string = s.status;
+              if (s.status === 'active' || s.status === 'interrupted') displayStatus = 'running';
+              result.push({
+                id: s.id,
+                title: summary?.lastUserMessage?.slice(0, 80) ?? undefined,
+                status: displayStatus,
+                createdAt: s.createdAt,
+                updatedAt: s.updatedAt,
+                completedAt: s.closedAt,
+              });
+            }
+          }
+
+          // Sort by updatedAt descending, limit
+          result.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+          const limited = result.slice(0, limit);
+
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, count: limited.length, sessions: limited }));
           return;
         }
 
@@ -1261,6 +1577,7 @@ export function createTriLCApp(env: TriLCEnv) {
 
     async stop(): Promise<void> {
       connMgr.stopHealthCheckLoop();
+      stopKeyCache();
       cancelAllShellProcesses();
       if (server) {
         await new Promise<void>((resolve, reject) => {
@@ -1348,12 +1665,46 @@ let _modelClient: ReturnType<typeof createModelClient> | null = null;
 let _modelCache: { models: ModelInfo[]; expiresAt: number } | null = null;
 const MODEL_CACHE_TTL_MS = 60_000; // 1 minute
 
-function getAvailableModels(): ModelInfo[] {
+// TriModel configuration-plane API URL for HTTP-priority model fetching
+let _trimodelApiUrl = 'http://127.0.0.1:3333';
+
+export function setTrimodelApiUrl(url: string): void {
+  _trimodelApiUrl = url;
+}
+
+async function fetchModelsFromApi(): Promise<ModelInfo[]> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const res = await fetch(`${_trimodelApiUrl}/v1/models`, { signal: controller.signal });
+    if (!res.ok) throw new Error(`TriModel API ${res.status}`);
+    const json = await res.json() as { data: Array<{ id: string; display_name?: string; created?: number }> };
+    return (json.data ?? []).map((m) => ({
+      id: m.id,
+      displayName: m.display_name ?? m.id,
+      createdAt: String(m.created ? new Date(m.created * 1000).toISOString().slice(0, 10) : '2025-01-01'),
+    }));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function getAvailableModels(): Promise<ModelInfo[]> {
   // Return cached models if still valid
   if (_modelCache && _modelCache.expiresAt > Date.now()) {
     return _modelCache.models;
   }
 
+  // Phase 1: Try HTTP from TriModel API first
+  try {
+    const models = await fetchModelsFromApi();
+    _modelCache = { models, expiresAt: Date.now() + MODEL_CACHE_TTL_MS };
+    return models;
+  } catch (apiErr) {
+    console.warn(`[trilc] TriModel API unreachable (${apiErr instanceof Error ? apiErr.message : String(apiErr)}), falling back to library`);
+  }
+
+  // Fallback: direct library import (TriModel npm package)
   try {
     if (!_modelClient) {
       _modelClient = createModelClient();
@@ -1367,7 +1718,7 @@ function getAvailableModels(): ModelInfo[] {
     _modelCache = { models, expiresAt: Date.now() + MODEL_CACHE_TTL_MS };
     return models;
   } catch {
-    // Fallback: return last cached or default models on error
+    // Last resort: return last cached or hardcoded models
     if (_modelCache) return _modelCache.models;
     return [
       { id: 'deepseek-v4-pro', displayName: 'DeepSeek V4 Pro', createdAt: '2025-01-01' },
