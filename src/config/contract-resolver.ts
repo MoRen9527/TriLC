@@ -17,7 +17,8 @@ export interface AgentContract {
     agent_body: string;
     agent_frontmatter: string;
     memory: string;
-    colleagues_social: string;
+    colleagues: string;
+    social: string;
   };
   decisionRights: {
     approve: string[];
@@ -177,7 +178,8 @@ class AgentContractResolver {
     const agentBody = this.readFileSafe(resolve(contractDir, parsed.paths.agent_body || ''));
     const agentFrontmatter = this.readFileSafe(resolve(contractDir, parsed.paths.agent_frontmatter || ''));
     const memory = this.readFileSafe(resolve(contractDir, parsed.paths.memory || ''));
-    const colleaguesSocial = this.readFileSafe(resolve(contractDir, parsed.paths.colleagues_social || ''));
+    const colleagues = this.readFileSafe(resolve(contractDir, parsed.paths.colleagues || ''));
+    const social = this.readFileSafe(resolve(contractDir, parsed.paths.social || ''));
 
     // 组装 system prompt: soul + agent body
     const systemPrompt = [soul, agentBody]
