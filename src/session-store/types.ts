@@ -1,8 +1,13 @@
 // ── TriLC Session Store Types ──
 // Defines session persistence model for agent conversation recovery.
 // Shared-core candidate: TriMC should adopt same schema for cross-runtime session portability.
+//
+// Schema v2 (2026-07-22): cloud sync fields added per arch-trilc-daemon §6.
 
 export type SessionStatus = 'active' | 'completed' | 'interrupted' | 'expired';
+
+/** Cloud sync status for session replication to TriMC. */
+export type SyncStatus = 'local' | 'pending' | 'syncing' | 'synced' | 'error';
 
 export interface SessionRecord {
   id: string;                    // "sess_{timestamp36}_{random4}"
@@ -14,6 +19,11 @@ export interface SessionRecord {
   createdAt: string;             // ISO 8601
   updatedAt: string;
   closedAt: string | null;
+  // v2: cloud sync fields
+  title?: string;                // session title (first user message truncated)
+  syncStatus?: SyncStatus;       // default 'local'
+  lastSyncedAt?: string | null;  // ISO 8601
+  cloudSessionId?: string | null;// TriMC cloud session ID
 }
 
 export interface SessionMessageRecord {

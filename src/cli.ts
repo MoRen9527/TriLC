@@ -17,6 +17,9 @@ const DEFAULT_PORT = 8711;
 const PID_DIR = resolve(homedir(), '.trimetaverse');
 const PID_FILE = resolve(PID_DIR, 'trilc.pid');
 const HEALTHZ_TIMEOUT_MS = 3000;
+const DEFAULT_SERVICE_NAME = 'TriLC';
+const REGRUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+const REGRUN_VALUE = 'TriLC';
 
 // ── Help ──
 function printHelp(): void {
@@ -25,28 +28,42 @@ function printHelp(): void {
 Usage: trilc <command> [options]
 
 Commands:
-  start   Start daemon in background       trilc start [--port 8711]
-  stop    Stop background daemon           trilc stop
-  status  Show daemon status               trilc status [--port 8711]
-  run     Run daemon in foreground         trilc run [--port 8711]
+  start              Start daemon in background       trilc start [--port 8711]
+  stop               Stop background daemon           trilc stop
+  status             Show daemon status               trilc status [--port 8711]
+  run                Run daemon in foreground         trilc run [--port 8711]
+  install-service    Register as Windows Service       trilc install-service [--name TriLC] [--displayName "..."]
+  uninstall-service  Unregister Windows Service        trilc uninstall-service [--name TriLC]
+  install-regrun     Register to Registry Run (no-admin) trilc install-regrun
+  uninstall-regrun   Remove from Registry Run           trilc uninstall-regrun
 
 Options:
-  --port <n>   Port for HTTP server (default: ${DEFAULT_PORT})`);
+  --port <n>          Port for HTTP server (default: ${DEFAULT_PORT})
+  --name <s>          Windows Service name (default: ${DEFAULT_SERVICE_NAME})
+  --displayName <s>   Windows Service display name`);
 }
 
 // ── Argument parsing ──
-function parseArgs(args: string[]): { command: string; port: number } {
+function parseArgs(args: string[]): { command: string; port: number; serviceName: string; displayName: string } {
   const command = args[0] ?? 'help';
   let port = DEFAULT_PORT;
+  let serviceName = DEFAULT_SERVICE_NAME;
+  let displayName = 'TriMetaverse Local Controller';
 
   for (let i = 1; i < args.length; i++) {
     if (args[i] === '--port' && args[i + 1]) {
       port = parseInt(args[i + 1], 10);
       i++;
+    } else if (args[i] === '--name' && args[i + 1]) {
+      serviceName = args[i + 1];
+      i++;
+    } else if (args[i] === '--displayName' && args[i + 1]) {
+      displayName = args[i + 1];
+      i++;
     }
   }
 
-  return { command, port };
+  return { command, port, serviceName, displayName };
 }
 
 // ── PID file management ──
@@ -229,8 +246,203 @@ async function cmdRun(port: number): Promise<void> {
   await import('./index.js');
 }
 
+// ── Windows Service commands (admin required) ──
+
+async function checkAdminPrivilege(): Promise<boolean> {
+  if (platform() !== 'win32') return false;
+  try {
+    const { exec } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execAsync = promisify(exec);
+    // net session requires admin; will fail with access denied for non-admin
+    await execAsync('net session');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function checkServiceExists(name: string): Promise<boolean> {
+  try {
+    const { exec } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execAsync = promisify(exec);
+    await execAsync(`sc query ${name}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function checkRegRunExists(): Promise<boolean> {
+  if (platform() !== 'win32') return false;
+  try {
+    const { exec } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execAsync = promisify(exec);
+    await execAsync(`reg query "${REGRUN_KEY}" /v ${REGRUN_VALUE}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function cmdInstallService(name: string, displayName: string): Promise<void> {
+  if (platform() !== 'win32') {
+    console.error('ERROR: Windows Service registration is only available on Windows.');
+    process.exit(1);
+  }
+
+  const isAdmin = await checkAdminPrivilege();
+  if (!isAdmin) {
+    console.error('ERROR: 需要管理员权限才能注册 Windows Service。');
+    console.error('请以管理员身份运行终端，或使用 install-regrun（无需管理员）');
+    process.exit(1);
+  }
+
+  // Check mutual exclusion: if RegRun already registered
+  if (await checkRegRunExists()) {
+    console.error('ERROR: 检测到 TriLC 已通过 Registry Run 注册。');
+    console.error('请先运行 trilc uninstall-regrun 移除后再安装 Windows Service。');
+    process.exit(1);
+  }
+
+  // Check if service already exists
+  if (await checkServiceExists(name)) {
+    console.log(`[trilc] Windows Service "${name}" 已存在，尝试更新...`);
+    try {
+      const { exec } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const execAsync = promisify(exec);
+      await execAsync(`sc stop ${name}`);
+    } catch { /* may already be stopped */ }
+  }
+
+  const nodePath = process.execPath;
+  const cliPath = resolve(__dirname, 'cli.js');
+  const binPath = `"${nodePath}" "${cliPath}" run`;
+
+  const { exec } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execAsync = promisify(exec);
+
+  try {
+    // 1. Create service
+    await execAsync(`sc create ${name} binPath= ${binPath} start= delayed-auto`);
+    console.log(`  ✓ Service "${name}" created`);
+
+    // 2. Set description
+    await execAsync(`sc description ${name} "${displayName} — AI-powered local agent daemon"`);
+    console.log(`  ✓ Description set`);
+
+    // 3. Set failure recovery (auto-restart on crash)
+    await execAsync(`sc failure ${name} reset= 86400 actions= restart/60000/restart/60000/restart/60000`);
+    console.log(`  ✓ Failure recovery configured (auto-restart 3×)`);
+
+    // 4. Start service
+    await execAsync(`sc start ${name}`);
+    console.log(`  ✓ Service started`);
+
+    console.log(`\n✅ TriLC Windows Service "${name}" 已安装并启动。`);
+    console.log(`   开机时将自动启动（delayed-auto）。`);
+  } catch (err) {
+    console.error(`ERROR: Service 注册失败: ${(err as Error).message}`);
+    process.exit(1);
+  }
+}
+
+async function cmdUninstallService(name: string): Promise<void> {
+  if (platform() !== 'win32') {
+    console.log('[trilc] Windows Service uninstall not applicable on this platform.');
+    return;
+  }
+
+  const exists = await checkServiceExists(name);
+  if (!exists) {
+    console.log(`[trilc] Windows Service "${name}" 未找到。`);
+    return;
+  }
+
+  const { exec } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execAsync = promisify(exec);
+
+  try {
+    await execAsync(`sc stop ${name}`);
+  } catch { /* may already be stopped */ }
+
+  try {
+    await execAsync(`sc delete ${name}`);
+    console.log(`✅ TriLC Windows Service "${name}" 已卸载。`);
+  } catch (err) {
+    console.error(`ERROR: Service 删除失败: ${(err as Error).message}`);
+    process.exit(1);
+  }
+
+  await removePidFile();
+}
+
+// ── Registry Run commands (no admin required) ──
+
+async function cmdInstallRegRun(): Promise<void> {
+  if (platform() !== 'win32') {
+    console.error('ERROR: Registry Run registration is only available on Windows.');
+    process.exit(1);
+  }
+
+  // Check mutual exclusion: if Service already registered
+  if (await checkServiceExists(DEFAULT_SERVICE_NAME)) {
+    console.error('ERROR: 检测到 TriLC 已注册为 Windows Service。');
+    console.error('请先运行 trilc uninstall-service 移除后再使用 Registry Run。');
+    process.exit(1);
+  }
+
+  if (await checkRegRunExists()) {
+    console.log('[trilc] TriLC 已在 Registry Run 中注册。');
+    return;
+  }
+
+  const nodePath = process.execPath;
+  const cliPath = resolve(__dirname, 'cli.js');
+
+  const { exec } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execAsync = promisify(exec);
+
+  try {
+    const cmd = `reg add "${REGRUN_KEY}" /v ${REGRUN_VALUE} /t REG_SZ /d "\\"${nodePath}\\" \\"${cliPath}\\" run" /f`;
+    await execAsync(cmd);
+    console.log('✅ TriLC 已注册到 Registry Run（登录时自动启动）。');
+  } catch (err) {
+    console.error(`ERROR: Registry Run 注册失败: ${(err as Error).message}`);
+    process.exit(1);
+  }
+}
+
+async function cmdUninstallRegRun(): Promise<void> {
+  if (platform() !== 'win32') return;
+
+  const exists = await checkRegRunExists();
+  if (!exists) {
+    console.log('[trilc] TriLC 未在 Registry Run 中注册。');
+    return;
+  }
+
+  const { exec } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execAsync = promisify(exec);
+
+  try {
+    await execAsync(`reg delete "${REGRUN_KEY}" /v ${REGRUN_VALUE} /f`);
+    console.log('✅ TriLC 已从 Registry Run 移除。');
+  } catch (err) {
+    console.error(`ERROR: Registry Run 移除失败: ${(err as Error).message}`);
+    process.exit(1);
+  }
+}
+
 // ── Entry ──
-const { command, port } = parseArgs(process.argv.slice(2));
+const { command, port, serviceName, displayName } = parseArgs(process.argv.slice(2));
 
 (async () => {
   switch (command) {
@@ -245,6 +457,18 @@ const { command, port } = parseArgs(process.argv.slice(2));
       break;
     case 'run':
       await cmdRun(port);
+      break;
+    case 'install-service':
+      await cmdInstallService(serviceName, displayName);
+      break;
+    case 'uninstall-service':
+      await cmdUninstallService(serviceName);
+      break;
+    case 'install-regrun':
+      await cmdInstallRegRun();
+      break;
+    case 'uninstall-regrun':
+      await cmdUninstallRegRun();
       break;
     case 'help':
     case '--help':

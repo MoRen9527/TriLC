@@ -4,8 +4,8 @@
 // 用途: TriLC 启动时加载所有 agent 定义，运行时根据 agent_id 注入对应身份
 
 import { readFileSync, existsSync, watch } from 'fs';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { resolve } from 'path';
+import { parse as parseYaml } from 'yaml';
 
 // ── Types ──
 
@@ -43,78 +43,6 @@ interface ContractYaml {
   runtime_baseline?: Record<string, unknown>;
 }
 
-// ── YAML 解析（minimal，无外部依赖） ──
-
-function parseYamlMinimal(text: string): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  const lines = text.split('\n');
-  let currentKey = '';
-  let currentIndent = 0;
-  let currentList: string[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.trim() || line.trim().startsWith('#')) continue;
-
-    const indent = line.search(/\S/);
-    const trimmed = line.trim();
-
-    if (trimmed.startsWith('- ')) {
-      currentList.push(trimmed.substring(2).trim());
-      continue;
-    }
-
-    // flush list if present
-    if (currentList.length > 0 && currentKey) {
-      setNestedValue(result, currentKey, [...currentList]);
-      currentList = [];
-    }
-
-    const colonIdx = trimmed.indexOf(':');
-    if (colonIdx === -1) continue;
-
-    const key = trimmed.substring(0, colonIdx).trim();
-    const value = trimmed.substring(colonIdx + 1).trim();
-
-    if (indent <= currentIndent || !currentKey) {
-      currentKey = key;
-      currentIndent = indent;
-
-      if (value === '' || value === '{}') {
-        // nested object, handled by sub-keys
-      } else if (value.startsWith('"') && value.endsWith('"')) {
-        result[key] = value.slice(1, -1);
-      } else {
-        result[key] = value;
-      }
-    }
-  }
-
-  // flush remaining list
-  if (currentList.length > 0 && currentKey) {
-    setNestedValue(result, currentKey, [...currentList]);
-  }
-
-  return result;
-}
-
-function setNestedValue(obj: Record<string, unknown>, path: string, value: unknown): void {
-  const parts = path.split('.');
-  let current = obj;
-  for (let i = 0; i < parts.length - 1; i++) {
-    if (!current[parts[i]]) current[parts[i]] = {};
-    current = current[parts[i]] as Record<string, unknown>;
-  }
-  current[parts[parts.length - 1]] = value;
-}
-
-function getNestedValue(obj: Record<string, unknown>, path: string): unknown {
-  return path.split('.').reduce((acc: unknown, key: string) => {
-    if (acc && typeof acc === 'object') return (acc as Record<string, unknown>)[key];
-    return undefined;
-  }, obj);
-}
-
 // ── Resolver ──
 
 class AgentContractResolver {
@@ -123,7 +51,7 @@ class AgentContractResolver {
   private watcher: ReturnType<typeof watch> | null = null;
 
   constructor(sourceRoot: string) {
-    this.sourceRoot = sourceRoot;
+    this.sourceRoot = resolve(sourceRoot);
   }
 
   /** 从 source-agents 目录加载所有 .contract.yaml */
@@ -162,9 +90,8 @@ class AgentContractResolver {
   /** 加载单个 contract */
   private loadOne(contractPath: string): AgentContract | null {
     const yamlText = readFileSync(contractPath, 'utf-8');
-    const parsed = parseYamlMinimal(yamlText) as unknown as ContractYaml;
+    const parsed = parseYaml(yamlText) as unknown as ContractYaml;
 
-    const contractDir = dirname(contractPath);
     const agentId = parsed.contract?.agent_id;
     const family = (parsed.contract?.family as 'Role' | 'Registry') || 'Role';
 
@@ -174,12 +101,12 @@ class AgentContractResolver {
     }
 
     // 读取五件套
-    const soul = this.readFileSafe(resolve(contractDir, parsed.paths.soul || ''));
-    const agentBody = this.readFileSafe(resolve(contractDir, parsed.paths.agent_body || ''));
-    const agentFrontmatter = this.readFileSafe(resolve(contractDir, parsed.paths.agent_frontmatter || ''));
-    const memory = this.readFileSafe(resolve(contractDir, parsed.paths.memory || ''));
-    const colleagues = this.readFileSafe(resolve(contractDir, parsed.paths.colleagues || ''));
-    const social = this.readFileSafe(resolve(contractDir, parsed.paths.social || ''));
+    const soul = this.readFileSafe(resolve(this.sourceRoot, parsed.paths.soul || ''));
+    const agentBody = this.readFileSafe(resolve(this.sourceRoot, parsed.paths.agent_body || ''));
+    const agentFrontmatter = this.readFileSafe(resolve(this.sourceRoot, parsed.paths.agent_frontmatter || ''));
+    const memory = this.readFileSafe(resolve(this.sourceRoot, parsed.paths.memory || ''));
+    const colleagues = this.readFileSafe(resolve(this.sourceRoot, parsed.paths.colleagues || ''));
+    const social = this.readFileSafe(resolve(this.sourceRoot, parsed.paths.social || ''));
 
     // 组装 system prompt: soul + agent body
     const systemPrompt = [soul, agentBody]
@@ -218,7 +145,7 @@ class AgentContractResolver {
   private parseFrontmatter(text: string): Record<string, unknown> {
     if (!text) return {};
     try {
-      return parseYamlMinimal(text);
+      return parseYaml(text) as Record<string, unknown>;
     } catch {
       return {};
     }

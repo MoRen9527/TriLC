@@ -19,7 +19,8 @@
   },
   "dependencies": {
     "@trimetaverse/agent-core": "file:../TriMC/packages/agent-core",
-    "trimodel": "file:../TriModel"
+    "trimodel": "file:../TriModel",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

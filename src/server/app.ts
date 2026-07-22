@@ -22,7 +22,7 @@ import type { Message, ToolDefinition, UsageSummary } from 'trimodel';
 import { createModelClient } from 'trimodel';
 import { createEventQueue } from '../event-queue/index.js';
 import type { ReplayRequest, ReplayResponse } from '../event-queue/types.js';
-import { publish } from '../localbus/bus.js';
+import { publish, localBus } from '../localbus/bus.js';
 import { agentEventsToAnthropicSSE, formatSSELine } from './anthropic-stream.js';
 import { agentEventsToOpenAISSE, formatOpenAISSE, OPENAI_SSE_DONE } from './openai-stream.js';
 import { registerShellExecTool, getDefaultSupervisor, cancelAllShellProcesses } from '../tools/shell-exec.js';
@@ -30,6 +30,8 @@ import { createSessionStore } from '../session-store/index.js';
 import { runSafetyCheck } from '../session-store/safety-check.js';
 import type { SessionRecord, SessionMessageRecord, SessionStatus } from '../session-store/types.js';
 import { initKeyCache, stopKeyCache } from '../config/key-cache.js';
+import { TaskMirrorPusher } from '../mirror/pusher.js';
+import type { MirrorTaskSnapshot } from '../mirror/types.js';
 
 // ── ConnectionManager ──
 // Tracks TriMC reachability for fast fallback decisions.
@@ -466,6 +468,28 @@ interface TaskStreamEntry {
   progress?: { step: number; totalSteps: number; description: string };
 }
 
+// ── S7: Mirror helpers ──
+// Map TaskStreamEntry status to mirror task status.
+function mapStreamStatus(s: TaskStreamEntry['status']): MirrorTaskSnapshot['status'] {
+  switch (s) {
+    case 'pending':   return 'pending';
+    case 'running':   return 'running';
+    case 'done':      return 'success';
+    case 'error':     return 'failed';
+    case 'cancelled': return 'cancelled';
+  }
+}
+
+function buildSummary(entry: TaskStreamEntry): string {
+  if (entry.progress) {
+    return `${entry.progress.description} (${entry.progress.step}/${entry.progress.totalSteps})`;
+  }
+  if (entry.status === 'done') return 'Task completed';
+  if (entry.status === 'error') return 'Task failed';
+  if (entry.status === 'cancelled') return 'Cancelled by user';
+  return entry.message.slice(0, 200);
+}
+
 export function createTriLCApp(env: TriLCEnv) {
   let server: Server | null = null;
   const eventQueue = createEventQueue({
@@ -493,6 +517,54 @@ export function createTriLCApp(env: TriLCEnv) {
     // On recovery, reset connectionId so replay events are scoped to new session
     resetConnectionId();
     connMgr._setConnectionId(connectionId);
+    // S7: Full push on recovery
+    mirrorPusher.onReconnected();
+  });
+
+  // ── S7: TaskMirrorPusher ──
+  // Event-driven task state push to TriMC mirror endpoint.
+  // Builds snapshots from taskStreams (in-memory) + sessionStore (persisted).
+  const getActiveSnapshots = (): MirrorTaskSnapshot[] => {
+    const snapshots: MirrorTaskSnapshot[] = [];
+
+    // ① 从 taskStreams（内存中的活跃/近期任务）
+    for (const [id, entry] of taskStreams) {
+      snapshots.push({
+        taskId: id,
+        title: entry.message.slice(0, 80),
+        status: mapStreamStatus(entry.status),
+        summary: buildSummary(entry),
+        updatedAt: new Date(entry.createdAt).toISOString(),
+      });
+    }
+
+    // ② 从 sessionStore（持久化的 active/interrupted 会话，不在 taskStreams 中）
+    const activeSessions = sessionStore.listSessions({ status: 'active', limit: 50 })
+      .concat(sessionStore.listSessions({ status: 'interrupted', limit: 50 }));
+
+    for (const s of activeSessions) {
+      if (taskStreams.has(s.id)) continue; // 避免重复
+      snapshots.push({
+        taskId: s.id,
+        title: s.title ?? 'Untitled',
+        status: s.status === 'interrupted' ? 'failed' : 'running',
+        summary: `${s.messageCount} messages`,
+        updatedAt: s.updatedAt,
+      });
+    }
+
+    return snapshots;
+  };
+
+  const mirrorPusher = new TaskMirrorPusher(
+    env.trimcBaseUrl,
+    env.nodeId,
+    getActiveSnapshots,
+  );
+
+  // S7: Wire degraded → pause mirror push
+  localBus.on('event', (event) => {
+    if (event.type === 'node:degraded') mirrorPusher.onDegraded();
   });
 
   return {
@@ -509,6 +581,11 @@ export function createTriLCApp(env: TriLCEnv) {
       initKeyCache(env.trimodelApiUrl, env.dataDir, process.env.TRIMODEL_API_TOKEN).catch((err) => {
         console.warn('[trilc] key cache init failed:', err instanceof Error ? err.message : String(err));
       });
+
+      // Phase 2: Initialize contract resolver (load agents from TriCompany)
+      const { getContractResolver } = await import('../config/contract-resolver.js');
+      const agentCount = await getContractResolver(env.tricompanySourcePath).loadAll();
+      console.log(`[trilc] contract resolver: ${agentCount} agents loaded`);
 
       server = createServer(async (req, res) => {
         // ── /healthz ──
@@ -536,6 +613,53 @@ export function createTriLCApp(env: TriLCEnv) {
               created_at: m.createdAt,
             })),
           }));
+          return;
+        }
+
+        // ── GET /internal/v1/agents ──
+        // Returns all agents loaded from TriCompany .contract.yaml
+        if (req.url === '/internal/v1/agents' && req.method === 'GET') {
+          try {
+            const resolver = getContractResolver();
+            const agentIds = resolver.listAgents();
+            const agents = agentIds.map((id) => {
+              const rights = resolver.getDecisionRights(id);
+              const tools = resolver.getToolControl(id);
+              return {
+                id,
+                displayName: id,
+                hasSystemPrompt: !!resolver.getSystemPrompt(id),
+                decisionRights: rights,
+                tools,
+              };
+            });
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ agents, count: agents.length }));
+          } catch {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'contract resolver not initialized', agents: [], count: 0 }));
+          }
+          return;
+        }
+
+        // ── GET /internal/v1/agents/{id}/system-prompt ──
+        const agentPromptMatch = req.url?.match(/^\/internal\/v1\/agents\/([^/]+)\/system-prompt$/);
+        if (agentPromptMatch && req.method === 'GET') {
+          try {
+            const agentId = decodeURIComponent(agentPromptMatch[1]);
+            const systemPrompt = getContractResolver().getSystemPrompt(agentId);
+            if (!systemPrompt) {
+              res.writeHead(404, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: `agent not found: ${agentId}` }));
+              return;
+            }
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, agentId, systemPrompt }));
+          } catch (error) {
+            const message = error instanceof URIError ? 'invalid agent id' : 'contract resolver not initialized';
+            res.writeHead(error instanceof URIError ? 400 : 500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: message }));
+          }
           return;
         }
 
@@ -1253,6 +1377,9 @@ export function createTriLCApp(env: TriLCEnv) {
           };
           taskStreams.set(sessionId, entry);
 
+          // S7: Publish task:queued for mirror pusher
+          publish({ type: 'task:queued', taskId: sessionId });
+
           // Persist session for recovery
           try {
             sessionStore.createSession({
@@ -1301,6 +1428,8 @@ export function createTriLCApp(env: TriLCEnv) {
 
           // Mark running
           entry.status = 'running';
+          // S7: Publish task:running for mirror pusher
+          publish({ type: 'task:running', taskId: sessionId });
 
           // Build agentLoop options from task entry
           const cwd = entry.context.workspaceRoot || env.cwd;
@@ -1370,6 +1499,8 @@ export function createTriLCApp(env: TriLCEnv) {
                     error: err.message ?? String(err),
                   });
                   entry.status = 'error';
+                  // S7: Publish task:failed for mirror pusher
+                  publish({ type: 'task:failed', taskId: sessionId, error: err.message ?? String(err) });
                   break;
                 }
                 default: {
@@ -1381,6 +1512,8 @@ export function createTriLCApp(env: TriLCEnv) {
 
             // Task completed successfully
             entry.status = 'done';
+            // S7: Publish task:succeeded for mirror pusher
+            publish({ type: 'task:succeeded', taskId: sessionId, result: { summary: deltaContent.slice(0, 200) } });
             writeSSE('task_done', {
               status: 'success',
               summary: deltaContent
@@ -1401,6 +1534,8 @@ export function createTriLCApp(env: TriLCEnv) {
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             entry.status = 'error';
+            // S7: Publish task:failed for mirror pusher
+            publish({ type: 'task:failed', taskId: sessionId, error: msg });
             writeSSE('task_error', { status: 'failed', error: msg });
 
             try {
@@ -1424,6 +1559,8 @@ export function createTriLCApp(env: TriLCEnv) {
           const entry = taskStreams.get(sessionId);
           if (entry && (entry.status === 'pending' || entry.status === 'running')) {
             entry.status = 'cancelled';
+            // S7: Publish task:cancelled for mirror pusher
+            publish({ type: 'task:cancelled', taskId: sessionId });
           }
 
           // Update persistent session store
@@ -1549,6 +1686,9 @@ export function createTriLCApp(env: TriLCEnv) {
 
       console.log(`[trilc] listening on :${env.port}`);
 
+      // S7: Start mirror pusher (event-driven + 30s heartbeat)
+      mirrorPusher.start();
+
       // ── Signal handling (Linux detached runtime) ──
       // On Linux, the CLI sends SIGTERM as fallback after graceful /shutdown.
       // Handle both SIGTERM and SIGINT for clean daemon shutdown.
@@ -1556,6 +1696,7 @@ export function createTriLCApp(env: TriLCEnv) {
         console.log(`[trilc] received ${signal}, shutting down...`);
         console.log('[trilc] cancelling all managed shell processes...');
         cancelAllShellProcesses();
+        mirrorPusher.stop();
         if (server) {
           await new Promise<void>((res) => server!.close(() => res()));
           server = null;
@@ -1576,6 +1717,7 @@ export function createTriLCApp(env: TriLCEnv) {
     },
 
     async stop(): Promise<void> {
+      mirrorPusher.stop();
       connMgr.stopHealthCheckLoop();
       stopKeyCache();
       cancelAllShellProcesses();

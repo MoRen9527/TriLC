@@ -10,6 +10,7 @@ export type LocalBusEvent =
   | { type: 'task:running'; taskId: string }
   | { type: 'task:succeeded'; taskId: string; result: unknown }
   | { type: 'task:failed'; taskId: string; error: string }
+  | { type: 'task:cancelled'; taskId: string }           // ← S7 新增
   | { type: 'node:connected' }
   | { type: 'node:degraded' }
   | { type: 'node:local' }

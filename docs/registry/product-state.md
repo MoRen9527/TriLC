@@ -31,6 +31,7 @@
 
 - 与 `TriMC`：本地→云端成果迁移通道 + 云端通知回传 + TriLC 崩溃时 TriMC fallback（TWF-001）。
 - 与 `TriPilot` + `TriCode` + `vscodium`：共同形成"本地工作台"协同链路——TriPilot 用户入口 → TriLC 本地主控 → TriCode 工具 glue → opencode/Claude Code。
+- **与 `TriModel`（2026-07-22 确认）**：TriLC 作为 TriModel 配置平面的消费者，通过 HTTP API（`GET /v1/models` + `GET /v1/config/keys`）拉取模型列表和 Provider Key。模型发现采用 HTTP 优先 → library fallback → 硬编码兜底的三层降级策略。Key 通过 `key-cache.ts` 以 S3 安全级别（600 权限 + 127.0.0.1 回环）持久化缓存，15 分钟定时刷新。
 - 与 `TriMobile`、`TriAvatar`：未来入口和体验侧耦合（非首轮阻塞）。
 - 与 `TriMetaverse` 中央 BusinessStrategy 保持一致。
 

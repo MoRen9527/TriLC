@@ -12,6 +12,8 @@
 - `src/task-runtime/`：任务运行时
 - `src/context-adapter/`：本地上下文与能力适配
 - `src/contracts/`：类型契约
+- `src/session-store/`：**2026-07-22 arch-trilc-daemon D4-D5 新增**。`store.ts`（SQLite WAL，schema v2 migration：`sync_status`/`last_synced_at`/`cloud_session_id`/`title` + `updateSyncStatus`/`markPendingSync`/`getPendingSyncSessions`/`getSessionByCloudId`）+ `types.ts`（SyncStatus 状态机：`local→pending→syncing→synced|error`）。37/37 单元测试 PASS。
+- `src/cli.ts`：CLI 入口 + daemon 生命周期管理 — **2026-07-22 arch-trilc-daemon D1 新增**：`install-service`/`uninstall-service`（Windows Service via `sc.exe`）+ `install-regrun`/`uninstall-regrun`（Registry Run）+ 权限检测 + 平台检测 + 互斥检测 + 卸载清理逻辑。
 - `vendor/`：外部基线快照
 
 ## Current Code Health
@@ -26,6 +28,7 @@
   - M.6: 端到端集成测试（enqueue→replay→arbitrate→apply）— 6 tests PASS
   - 全量：27 tests / 0 fail（TriLC）；11 tests / 0 fail（TriMC 仲裁模块）
 - 2026-07-16：CTO-008-P 冒烟测试通过 — healthz、代理到 TriMC（失败→fallback→本地 agentLoop）、clean shutdown 均验证 OK
+- **2026-07-22：arch-trilc-daemon 交付（CTO 门禁 APPROVE）** — CLI daemon 注册（`install-service`/`uninstall-service`/`install-regrun`/`uninstall-regrun`，8/8 代码审查验证项通过）+ session-store schema v2 migration（`sync_status`/`last_synced_at`/`cloud_session_id`/`title`，37/37 新增单元测试 PASS）+ 已有回归 28/28 PASS。SyncStatus 默认值统一为 `'local'`。待后续树：arch-trilc-tray（Tray 实现）、arch-trilc-sync（sync-engine+端点）、arch-trilc-msi-e2e（MSI+集成验证）。
 - 依赖 `@trimetaverse/agent-core` (file:../TriMC/packages/agent-core) + `trimodel`
 - 2026-05-26 已补齐独立 git 仓、根级 `.gitignore` 与本地 CodeGraph 标配。
 - 尚未建立 registry 级代码健康评分和 git 健康摘要。
@@ -53,6 +56,37 @@
 - 若不持续区分 `TriLC` 的本地 runtime / planner / tool bus 职责与 PC 端软件层的工作台职责，后续很容易混淆本地执行面和桌面入口面。
 - 若不持续更新 planner 和 node lifecycle 的成熟度，后续人格型 agent 会高估执行能力。
 
+## Phase 1 配置平面改造（W30，cpo-trimodel-deployment）
+
+### Key 缓存模块（`src/config/key-cache.ts`）
+
+- **★ Phase 1 新增**：从 TriModel 配置平面 API 拉取 Provider Key
+- 持久化到磁盘（S3 安全：600 权限），Phase 2 预留 KeyStorage 抽象用于 S2 加密
+- 刷新策略：15 分钟定时刷新 + 启动时 0-60s 随机 stagger（防惊群）
+- TTL：24 小时，过期后若无缓存则 chat 降级不可用
+- 离线容错：fetch 失败时使用磁盘缓存；无缓存时 chat disabled
+- API：`initKeyCache()`, `getKeyCache()`, `stopKeyCache()`
+- 密钥日志脱敏：`sanitizeKey()` → 仅显示前 5 字符 + `****`
+
+### HTTP 优先模型发现（`src/server/app.ts` `getAvailableModels()`）
+
+- **★ Phase 1 改造**：从同步 import library 改为 `async` HTTP 优先
+- 优先级：TriModel API (`GET /v1/models`) → library fallback (`createModelClient().listModels()`) → 硬编码兜底
+- TriModel API 不可用时自动降级，不阻断 TriPilot 启动
+- 1 分钟内存缓存（`MODEL_CACHE_TTL_MS = 60_000`）
+
+### Mirror 模块（`src/mirror/`）
+
+- **★ Phase 1 新增**：`pusher.ts`（推送引擎）+ `types.ts`（类型契约）
+- 用于 TriLC → TriMC 云端会话数据镜像推送
+
+### env var 变更
+
+| 变量 | 说明 |
+|------|------|
+| `TRIMODEL_API_URL` | TriModel 配置平面 API 地址（默认 `http://127.0.0.1:3333`） |
+| `TRIMODEL_API_TOKEN` | TriModel API 认证 token |
+
 ## Sources
 
 - `../../src/runtime/`
@@ -60,3 +94,6 @@
 - `../../src/planner/`
 - `../../src/toolbus/`
 - `../../src/context-adapter/`
+- `../../src/config/key-cache.ts`
+- `../../src/mirror/`
+- `../../src/server/app.ts`

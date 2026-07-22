@@ -3,7 +3,7 @@
 // Uses Node 22 built-in node:sqlite (same pattern as event-queue store).
 //
 // Schema:
-//   sessions: metadata + status tracking
+//   sessions: metadata + status tracking + cloud sync fields (v2)
 //   session_messages: ordered message history with full field preservation
 //
 // Key behaviors:
@@ -11,6 +11,7 @@
 //   - Interrupted sessions detected via status='active' without close event
 //   - Empty assistant message detection tracked in hasEmptyAssistant flag
 //   - Reasoning content preserved for DeepSeek reasoning model compatibility
+//   - Schema version tracked via PRAGMA user_version (v1 → v2 on first open)
 
 import { DatabaseSync } from 'node:sqlite';
 import { existsSync, mkdirSync } from 'node:fs';
@@ -19,8 +20,11 @@ import type {
   SessionRecord,
   SessionMessageRecord,
   SessionStatus,
+  SyncStatus,
   SessionSummary,
 } from './types.js';
+
+const CURRENT_SCHEMA_VERSION = 2;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -53,6 +57,18 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
 CREATE INDEX IF NOT EXISTS idx_msgs_session ON session_messages(session_id, seq);
 `;
 
+// CTO-009-4: cloud sync schema migration — Phase 1 TriLC→TriMC single-direction push.
+// Uses ALTER TABLE ADD COLUMN (no table rebuild) — safe on existing data.
+const MIGRATIONS: Record<number, string> = {
+  2: `
+    ALTER TABLE sessions ADD COLUMN title TEXT;
+    ALTER TABLE sessions ADD COLUMN sync_status TEXT DEFAULT 'local';
+    ALTER TABLE sessions ADD COLUMN last_synced_at TEXT;
+    ALTER TABLE sessions ADD COLUMN cloud_session_id TEXT;
+    CREATE INDEX IF NOT EXISTS idx_sessions_sync ON sessions(sync_status, updated_at);
+  `,
+};
+
 export function createSessionStore(dbPath: string) {
   const dir = dirname(dbPath);
   if (!existsSync(dir)) {
@@ -64,18 +80,41 @@ export function createSessionStore(dbPath: string) {
   db.exec('PRAGMA foreign_keys=ON;');
   db.exec(DDL);
 
+  // ── Schema migration ──
+  const currentVersion = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
+  if (currentVersion < CURRENT_SCHEMA_VERSION) {
+    for (let v = currentVersion + 1; v <= CURRENT_SCHEMA_VERSION; v++) {
+      if (MIGRATIONS[v]) {
+        db.exec(MIGRATIONS[v]);
+      }
+    }
+    db.prepare(`PRAGMA user_version=${CURRENT_SCHEMA_VERSION}`).run();
+    console.log(`[session-store] migrated schema v${currentVersion} → v${CURRENT_SCHEMA_VERSION}`);
+  }
+
   // ── Prepared statements ──
 
   const insertSessionStmt = db.prepare(`
     INSERT OR REPLACE INTO sessions
-      (id, status, model, system_prompt, cwd, message_count, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      (id, status, model, system_prompt, cwd, message_count, created_at, updated_at, title)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)
   `);
 
   const updateSessionStmt = db.prepare(`
     UPDATE sessions SET
       status = ?, message_count = ?, updated_at = datetime('now'), closed_at = ?
     WHERE id = ?
+  `);
+
+  const updateSyncStatusStmt = db.prepare(`
+    UPDATE sessions SET
+      sync_status = ?, last_synced_at = ?, cloud_session_id = ?
+    WHERE id = ?
+  `);
+
+  const setPendingSyncStmt = db.prepare(`
+    UPDATE sessions SET sync_status = 'pending'
+    WHERE id = ? AND sync_status IN ('local', 'synced')
   `);
 
   const insertMessageStmt = db.prepare(`
@@ -91,6 +130,7 @@ export function createSessionStore(dbPath: string) {
     model: string;
     systemPrompt?: string;
     cwd?: string;
+    title?: string;
   }): SessionRecord {
     insertSessionStmt.run(
       params.id,
@@ -99,6 +139,7 @@ export function createSessionStore(dbPath: string) {
       params.systemPrompt ?? '',
       params.cwd ?? '',
       0,
+      params.title ?? null,
     );
     return getSession(params.id)!;
   }
@@ -246,6 +287,39 @@ export function createSessionStore(dbPath: string) {
     return Number(result.changes);
   }
 
+  // ── Cloud sync (v2) ──
+
+  function updateSyncStatus(
+    id: string,
+    syncStatus: SyncStatus,
+    cloudSessionId?: string | null,
+  ): void {
+    const lastSyncedAt = syncStatus === 'synced' ? new Date().toISOString() : null;
+    updateSyncStatusStmt.run(syncStatus, lastSyncedAt, cloudSessionId ?? null, id);
+  }
+
+  function markPendingSync(id: string): void {
+    setPendingSyncStmt.run(id);
+  }
+
+  function getPendingSyncSessions(limit = 50): SessionRecord[] {
+    const rows = db
+      .prepare(
+        `SELECT * FROM sessions WHERE sync_status = 'pending'
+         ORDER BY updated_at DESC LIMIT ?`,
+      )
+      .all(limit) as unknown as Record<string, unknown>[];
+    return rows.map(rowToSession);
+  }
+
+  function getSessionByCloudId(cloudSessionId: string): SessionRecord | null {
+    const row = db
+      .prepare('SELECT * FROM sessions WHERE cloud_session_id = ?')
+      .get(cloudSessionId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return rowToSession(row);
+  }
+
   function close(): void {
     db.close();
   }
@@ -261,6 +335,10 @@ export function createSessionStore(dbPath: string) {
     findInterruptedSessions,
     getSessionSummary,
     expireOldSessions,
+    updateSyncStatus,
+    markPendingSync,
+    getPendingSyncSessions,
+    getSessionByCloudId,
     close,
   };
 }
@@ -278,6 +356,11 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
     closedAt: (row.closed_at as string) ?? null,
+    // v2: cloud sync fields
+    title: (row.title as string) ?? undefined,
+    syncStatus: (row.sync_status as SyncStatus) ?? 'local',
+    lastSyncedAt: (row.last_synced_at as string) ?? null,
+    cloudSessionId: (row.cloud_session_id as string) ?? null,
   };
 }
 
