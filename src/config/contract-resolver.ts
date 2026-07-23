@@ -114,7 +114,11 @@ class AgentContractResolver {
       .join('\n\n');
 
     // 解析 frontmatter 的工具配置
-    const toolControl = this.parseFrontmatter(agentFrontmatter);
+    const explicitToolControl = this.parseFrontmatter(agentFrontmatter);
+    const bodyToolControl = this.parseFrontmatter(agentBody);
+    const toolControl = Object.keys(explicitToolControl).length > 0
+      ? explicitToolControl
+      : bodyToolControl;
 
     // decision_rights
     const decisionRights = {
@@ -144,8 +148,21 @@ class AgentContractResolver {
 
   private parseFrontmatter(text: string): Record<string, unknown> {
     if (!text) return {};
+    const trimmed = text.trim();
+    if (!trimmed) return {};
+    let yamlText = trimmed;
+    if (trimmed.startsWith('---')) {
+      const lines = trimmed.split(/\r?\n/);
+      const closingIndex = lines.findIndex((line, index) => index > 0 && line.trim() === '---');
+      if (closingIndex < 0) return {};
+      yamlText = lines.slice(1, closingIndex).join('\n').trim();
+      if (!yamlText) return {};
+    }
     try {
-      return parseYaml(text) as Record<string, unknown>;
+      const parsed = parseYaml(yamlText) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : {};
     } catch {
       return {};
     }

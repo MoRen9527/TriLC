@@ -1,14 +1,16 @@
 // ── TriLC Key Cache ──
 // Fetches provider keys from TriModel configuration-plane API,
-// persists them to disk (S3: 600 permissions in Phase 1),
+// persists them to disk (S3: 600 permissions in Phase 1; S2: AES-256-GCM in Phase 2),
 // and refreshes every 15 minutes with stagger to avoid thundering herd.
 //
-// Phase 1: S3 security level (600 permissions on file).
-// Code structure reserves KeyStorage abstraction for Phase 2 S2 (AES-256-GCM).
+// Phase 2: S2 security level (AES-256-GCM + PBKDF2 machine fingerprint).
+// Migration: auto-detects S3 plaintext on read → encrypts in-place.
+// Rollback: TRIMODEL_KEY_STORAGE_MODE=s3 → plaintext mode.
 
 import { join } from 'node:path';
-import { mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync, copyFileSync } from 'node:fs';
 import { hostname } from 'node:os';
+import { encrypt, decrypt, isEncryptedFormat, canDeriveKey } from './key-encryptor.js';
 
 // ── Types ──
 
@@ -64,6 +66,73 @@ class FileKeyStorage implements KeyStorage {
   }
 }
 
+// ── S2 Encrypted Storage (Phase 2) ──
+
+class EncryptedKeyStorage implements KeyStorage {
+  constructor(private readonly filePath: string) {}
+
+  read(): KeyCache | null {
+    try {
+      if (!existsSync(this.filePath)) return null;
+      const raw = readFileSync(this.filePath);
+
+      if (!isEncryptedFormat(raw)) {
+        // Legacy S3 plaintext — trigger auto-migration
+        const plaintext = raw.toString('utf-8');
+        const parsed = JSON.parse(plaintext) as KeyCache;
+        if (parsed.keys && parsed.fetchedAt && parsed.expiresAt) {
+          // Auto-migrate: encrypt in-place on read
+          this.write(parsed);
+          console.log('[trilc:keys] migrated key cache from S3 (plaintext) to S2 (AES-256-GCM)');
+        }
+        return parsed;
+      }
+
+      // S2 encrypted format — decrypt
+      const plaintext = decrypt(raw);
+      const parsed = JSON.parse(plaintext) as KeyCache;
+      if (!parsed.keys || !parsed.fetchedAt || !parsed.expiresAt) return null;
+      return parsed;
+    } catch (err) {
+      console.error('[trilc:keys] failed to read/decrypt key cache:',
+        err instanceof Error ? err.message : String(err));
+      return null;
+    }
+  }
+
+  write(cache: KeyCache): void {
+    try {
+      // Before encrypting, backup the legacy plaintext file if it exists
+      if (existsSync(this.filePath)) {
+        const existing = readFileSync(this.filePath);
+        if (!isEncryptedFormat(existing)) {
+          // Legacy S3 file — create backup before overwriting
+          const backupPath = this.filePath + '.s3-backup-' + Date.now();
+          try {
+            copyFileSync(this.filePath, backupPath);
+            console.log(`[trilc:keys] legacy S3 key cache backed up to ${backupPath}`);
+          } catch {
+            console.warn('[trilc:keys] failed to backup legacy key cache');
+          }
+        }
+      }
+
+      // Ensure parent directory exists with 700
+      const dir = this.filePath.substring(0, this.filePath.lastIndexOf('\\'));
+      if (dir && !existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+        chmodSync(dir, 0o700);
+      }
+      const plaintext = JSON.stringify(cache, null, 2);
+      const encrypted = encrypt(plaintext);
+      writeFileSync(this.filePath, encrypted, { mode: 0o600 });
+    } catch (err) {
+      console.error('[trilc:keys] failed to write encrypted key cache:',
+        err instanceof Error ? err.message : String(err));
+    }
+  }
+}
+
 // ── Constants ──
 
 const KEY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;    // 24 hours
@@ -76,6 +145,19 @@ const STAGGER_MAX_MS = 60_000;                     // 0-60s random stagger at st
 let _keyCache: KeyCache | null = null;
 let _refreshTimer: ReturnType<typeof setTimeout> | null = null;
 let _storage: KeyStorage | null = null;
+
+// ── Callback for external consumers (TK-011) ──
+
+type KeyCacheUpdatedCallback = (cache: KeyCache) => void;
+let _onKeyCacheUpdated: KeyCacheUpdatedCallback | null = null;
+
+/**
+ * Register a callback to be invoked when the key cache is refreshed.
+ * Used by TriLC consumer layer to re-initialize ModelClient with fresh keys.
+ */
+export function onKeyCacheUpdated(callback: KeyCacheUpdatedCallback): void {
+  _onKeyCacheUpdated = callback;
+}
 
 // ── Key sanitisation for logs ──
 
@@ -132,13 +214,36 @@ async function fetchKeysFromApi(apiUrl: string, apiToken?: string): Promise<{ ke
 
 export function getKeyCache(): KeyCache | null {
   if (!_keyCache) return null;
-  // Check expiry
-  if (Date.now() > _keyCache.expiresAt) return null;
+  // Check expiry (TK-017: return null on expiry, triggering graceful degradation)
+  if (Date.now() > _keyCache.expiresAt) {
+    console.warn('[trilc:keys] key cache expired, will attempt refresh');
+    return null; // Return null → triggers graceful degradation in chat handler
+  }
   return _keyCache;
 }
 
 export function getKeyCacheFilePath(dataDir: string): string {
   return join(dataDir, 'keys.json');
+}
+
+export function applyKeyCacheToEnvironment(cache: KeyCache, env: NodeJS.ProcessEnv = process.env): void {
+  const deepseek = cache.keys.deepseek;
+  if (deepseek?.api_key) env.DEEPSEEK_API_KEY = deepseek.api_key;
+  if (deepseek?.base_url) env.DEEPSEEK_BASE_URL = deepseek.base_url;
+
+  const anthropic = cache.keys.anthropic;
+  if (anthropic?.api_key) env.ANTHROPIC_API_KEY = anthropic.api_key;
+  if (anthropic?.base_url) env.ANTHROPIC_BASE_URL = anthropic.base_url;
+
+  const openai = cache.keys.openai;
+  if (openai?.api_key) env.OPENAI_API_KEY = openai.api_key;
+  if (openai?.base_url) env.OPENAI_BASE_URL = openai.base_url;
+
+  const trimetaverse = cache.keys.trimetaverse;
+  if (trimetaverse?.api_key) env.TRIMODEL_TRIMETAVERSE_API_KEY = trimetaverse.api_key;
+  if (trimetaverse?.base_url) env.TRIMODEL_TRISTACISS_BASE_URL = trimetaverse.base_url;
+
+  if (cache.defaultModel) env.TRIMODEL_DEFAULT_MODEL = cache.defaultModel;
 }
 
 /**
@@ -149,7 +254,19 @@ export function getKeyCacheFilePath(dataDir: string): string {
  */
 export async function initKeyCache(apiUrl: string, dataDir: string, apiToken?: string): Promise<void> {
   const filePath = getKeyCacheFilePath(dataDir);
-  _storage = new FileKeyStorage(filePath);
+
+  // Phase 2: Respect TRIMODEL_KEY_STORAGE_MODE for rollback
+  const storageMode = process.env.TRIMODEL_KEY_STORAGE_MODE ?? 's2';
+  if (storageMode === 's3') {
+    _storage = new FileKeyStorage(filePath);
+    console.log('[trilc:keys] using S3 plaintext storage mode (TRIMODEL_KEY_STORAGE_MODE=s3)');
+  } else if (!canDeriveKey()) {
+    // S2 requested but key derivation unavailable → fallback to S3
+    _storage = new FileKeyStorage(filePath);
+    console.warn('[trilc:keys] S2 encryption requested but key derivation unavailable — falling back to S3');
+  } else {
+    _storage = new EncryptedKeyStorage(filePath);
+  }
 
   // 1. Load cached keys from disk
   _keyCache = _storage.read();
@@ -210,6 +327,14 @@ async function doRefresh(apiUrl: string, apiToken?: string): Promise<void> {
     };
     _storage?.write(_keyCache);
     console.log(`[trilc:keys] refreshed keys:`, sanitizeKeysForLog(_keyCache));
+    // TK-011: Notify external consumers of updated key cache
+    if (_onKeyCacheUpdated) {
+      try {
+        _onKeyCacheUpdated(_keyCache);
+      } catch (err) {
+        console.warn('[trilc:keys] onKeyCacheUpdated callback failed:', err instanceof Error ? err.message : String(err));
+      }
+    }
   } catch (err) {
     console.warn(`[trilc:keys] refresh failed: ${err instanceof Error ? err.message : String(err)}`);
   }

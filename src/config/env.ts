@@ -18,10 +18,16 @@ export type TriLCEnv = {
 
 import { hostname } from 'node:os';
 import { resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 
 function resolveFromWorkspace(): string {
-  // Auto-discover TriCompany from TriLC's workspace
-  return process.env.TRICOMPANY_SOURCE_PATH ?? resolve(process.cwd(), '..', 'TriCompany', '.github', 'source-agents');
+  // Check env var first
+  if (process.env.TRICOMPANY_SOURCE_PATH) return process.env.TRICOMPANY_SOURCE_PATH;
+  // Check local contracts/ (TriCade MSI ships contracts alongside daemon)
+  const localContracts = resolve(process.cwd(), 'contracts');
+  if (existsSync(localContracts)) return localContracts;
+  // Fallback: auto-discover TriCompany from TriLC's workspace
+  return resolve(process.cwd(), '..', 'TriCompany', '.github', 'source-agents');
 }
 
 export function readEnv(): TriLCEnv {

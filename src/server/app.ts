@@ -29,7 +29,13 @@ import { registerShellExecTool, getDefaultSupervisor, cancelAllShellProcesses } 
 import { createSessionStore } from '../session-store/index.js';
 import { runSafetyCheck } from '../session-store/safety-check.js';
 import type { SessionRecord, SessionMessageRecord, SessionStatus } from '../session-store/types.js';
-import { initKeyCache, stopKeyCache } from '../config/key-cache.js';
+import {
+  applyKeyCacheToEnvironment,
+  getKeyCache,
+  initKeyCache,
+  onKeyCacheUpdated,
+  stopKeyCache,
+} from '../config/key-cache.js';
 import { TaskMirrorPusher } from '../mirror/pusher.js';
 import type { MirrorTaskSnapshot } from '../mirror/types.js';
 
@@ -461,6 +467,7 @@ interface TaskStreamEntry {
   sessionId: string;
   message: string;
   conversationId: string;
+  model: string;
   systemPrompt: string;
   context: { files: string[]; workspaceRoot: string };
   createdAt: number;
@@ -577,10 +584,11 @@ export function createTriLCApp(env: TriLCEnv) {
       // Step 2: Set TriModel API URL for HTTP-priority model fetching
       setTrimodelApiUrl(env.trimodelApiUrl);
 
-      // Step 2b: Initialize key cache (async, non-blocking — server starts regardless)
-      initKeyCache(env.trimodelApiUrl, env.dataDir, process.env.TRIMODEL_API_TOKEN).catch((err) => {
-        console.warn('[trilc] key cache init failed:', err instanceof Error ? err.message : String(err));
-      });
+      // Step 2b: Initialize provider credentials before accepting model traffic.
+      onKeyCacheUpdated(applyKeyCacheToEnvironment);
+      await initKeyCache(env.trimodelApiUrl, env.dataDir, process.env.TRIMODEL_API_TOKEN);
+      const initialKeyCache = getKeyCache();
+      if (initialKeyCache) applyKeyCacheToEnvironment(initialKeyCache);
 
       // Phase 2: Initialize contract resolver (load agents from TriCompany)
       const { getContractResolver } = await import('../config/contract-resolver.js');
@@ -627,7 +635,8 @@ export function createTriLCApp(env: TriLCEnv) {
               const tools = resolver.getToolControl(id);
               return {
                 id,
-                displayName: id,
+                  displayName: typeof tools?.name === 'string' ? tools.name : id,
+                  description: typeof tools?.description === 'string' ? tools.description : undefined,
                 hasSystemPrompt: !!resolver.getSystemPrompt(id),
                 decisionRights: rights,
                 tools,
@@ -1363,10 +1372,12 @@ export function createTriLCApp(env: TriLCEnv) {
           }
 
           const sessionId = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+          const model = getKeyCache()?.defaultModel ?? process.env.TRIMODEL_DEFAULT_MODEL ?? 'deepseek-chat';
           const entry: TaskStreamEntry = {
             sessionId,
             message: body.message.trim(),
             conversationId: body.conversationId ?? `conv_${Date.now().toString(36)}`,
+            model,
             systemPrompt: body.systemPrompt ?? 'You are a coding assistant. Complete the given task using available tools.',
             context: {
               files: body.context?.files ?? [],
@@ -1384,7 +1395,7 @@ export function createTriLCApp(env: TriLCEnv) {
           try {
             sessionStore.createSession({
               id: sessionId,
-              model: 'auto',
+              model: entry.model,
               systemPrompt: entry.systemPrompt,
               cwd: entry.context.workspaceRoot,
             });
@@ -1440,9 +1451,10 @@ export function createTriLCApp(env: TriLCEnv) {
             // Track tool states for progress reporting
             let toolCount = 0;
             let deltaContent = '';
+            let terminalError: string | undefined;
 
             for await (const event of agentLoop({
-              model: 'auto',
+              model: entry.model,
               systemPrompt,
               messages,
               maxTurns: 25,
@@ -1494,13 +1506,15 @@ export function createTriLCApp(env: TriLCEnv) {
                 }
                 case 'error': {
                   const err = event as any;
+                  const errorMessage = err.message ?? String(err);
+                  terminalError = errorMessage;
                   writeSSE('task_error', {
                     status: 'failed',
-                    error: err.message ?? String(err),
+                    error: errorMessage,
                   });
                   entry.status = 'error';
                   // S7: Publish task:failed for mirror pusher
-                  publish({ type: 'task:failed', taskId: sessionId, error: err.message ?? String(err) });
+                  publish({ type: 'task:failed', taskId: sessionId, error: errorMessage });
                   break;
                 }
                 default: {
@@ -1508,6 +1522,16 @@ export function createTriLCApp(env: TriLCEnv) {
                   break;
                 }
               }
+            }
+
+            if (terminalError) {
+              try {
+                sessionStore.updateSessionStatus(sessionId, 'interrupted');
+              } catch {
+                // ignore
+              }
+              res.end();
+              return;
             }
 
             // Task completed successfully
