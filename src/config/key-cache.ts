@@ -202,7 +202,7 @@ async function fetchKeysFromApi(apiUrl: string, apiToken?: string): Promise<{ ke
 
     return {
       keys: json.keys ?? {},
-      defaultModel: json.default_model ?? 'deepseek-chat',
+      defaultModel: json.default_model ?? 'deepseek-v4-pro',
       refreshIntervalS: json.refresh_interval_s ?? KEY_REFRESH_INTERVAL_S_DEFAULT,
     };
   } finally {

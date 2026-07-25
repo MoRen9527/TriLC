@@ -56,6 +56,11 @@
 - 若不持续区分 `TriLC` 的本地 runtime / planner / tool bus 职责与 PC 端软件层的工作台职责，后续很容易混淆本地执行面和桌面入口面。
 - 若不持续更新 planner 和 node lifecycle 的成熟度，后续人格型 agent 会高估执行能力。
 
+## Known Issues / Follow-ups
+
+- **2026-07-25 工程纪律登记（AgentEvent 消费约束）**：`@trimetaverse/agent-core` 的 `agentLoop` 每轮模型回复会 emit 两类事件——`content_delta`（每个 stream chunk 一次，增量文本）与 `assistant_message`（整轮结束一次性，完整聚合 content + tool_calls）。**二者在 content 维度上语义重叠且互斥**：`assistant_message.content` 即同一轮 `content_delta.delta` 的聚合，下游消费者二选一，禁止同时累加/转发，否则会产生重复文本（如 "ABC"+"ABC"）。`tool_calls` 维度有**两个同源事件**：`assistant_message`（聚合 `tool_calls[]`）与独立的 `tool_call`（单调用事件，携带同 id/name/arguments）。下游必须按 **tool_use id 去重**（先到先处理、后到跳过），禁止双源同时开 tool_use block / 转发 tool_calls delta，否则客户端会看到重复的 `content_block_start`（同 id）或重复的 tool_calls chunk。两个 converter（`anthropic-stream.ts` / `openai-stream.ts`）均已用 `processedToolUseIds: Set<string>` 落地该去重（每轮 `request_start` 清空）。正确兜底范式参考 `src/server/app.ts` `/internal/v1/sessions/{id}/stream` 中的 `if (am.content && !deltaContent)` 写法——仅在未收到任何 delta 时用 `assistant_message.content` 兜底。本次 `/v1/messages`、`/chat/completions` 流式与 JSON 四处消费点违反该约束的 Bug 已在修复中；本条纪律作为防复发基线长期生效。
+- **2026-07-25 review 偏差登记（ink 依赖）**：TriLC 实际依赖 `ink@^5.2.0`（npm 公开包），CTO 历史技术 review 中"自研 Ink vendor 吸收"未落地。当前以 npm 公开包依赖运行，不阻塞本次 AgentEvent 重复文本修复；后续若进入正式宿主切换或供应链收敛阶段，需另行评估是否进入 vendor 吸收或锁定包指纹，作为 follow-up 待办。
+
 ## Phase 1 配置平面改造（W30，cpo-trimodel-deployment）
 
 ### Key 缓存模块（`src/config/key-cache.ts`）
