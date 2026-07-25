@@ -22,6 +22,14 @@ interface StreamState {
   hasEmittedRole: boolean;
   inputTokens: number;
   outputTokens: number;
+  // Dedup guard: agentLoop emits both content_delta (incremental) and
+  // assistant_message (full aggregate) for the same text. Forwarding both
+  // produces duplicate text on the client.
+  hasTextDelta: boolean;
+  // Dedup guard: agentLoop emits BOTH assistant_message.tool_calls (aggregate)
+  // AND tool_call (per-call) for the same tool_use id each turn. Emit the
+  // tool_calls delta only once per id.
+  processedToolUseIds: Set<string>;
 }
 
 function createStreamState(model: string): StreamState {
@@ -34,6 +42,8 @@ function createStreamState(model: string): StreamState {
     hasEmittedRole: false,
     inputTokens: 0,
     outputTokens: 0,
+    hasTextDelta: false,
+    processedToolUseIds: new Set(),
   };
 }
 
@@ -159,6 +169,10 @@ export async function agentEventsToOpenAISSE(
         }
 
         case 'request_start': {
+          // Per-turn reset of the delta flag, so multi-turn streams do not
+          // inherit the previous turn's "we already streamed deltas" state.
+          s.hasTextDelta = false;
+          s.processedToolUseIds.clear();
           break;
         }
 
@@ -170,6 +184,7 @@ export async function agentEventsToOpenAISSE(
           }
           s.outputTokens += estimateTokens(event.delta);
           emitDelta(s, { content: event.delta }, null, emit);
+          s.hasTextDelta = true;
           break;
         }
 
@@ -178,8 +193,11 @@ export async function agentEventsToOpenAISSE(
             s.hasEmittedRole = true;
           }
 
-          // Emit text content
-          if (event.content) {
+          // Emit text content only if no incremental delta has been forwarded
+          // for this turn. When content_delta already streamed the text,
+          // assistant_message.content is an aggregate duplicate — skip it.
+          // Tool_calls handling below runs regardless.
+          if (event.content && !s.hasTextDelta) {
             emitDelta(s, { role: 'assistant', content: '' }, null, emit);
             s.outputTokens += estimateTokens(event.content);
             emitDelta(s, { content: event.content }, null, emit);
@@ -188,6 +206,8 @@ export async function agentEventsToOpenAISSE(
           // Emit tool_calls as OpenAI format tool_calls delta
           if (event.tool_calls && event.tool_calls.length > 0) {
             for (const tc of event.tool_calls) {
+              if (tc.id && s.processedToolUseIds.has(tc.id)) continue;
+              if (tc.id) s.processedToolUseIds.add(tc.id);
               emitDelta(
                 s,
                 {
@@ -213,6 +233,8 @@ export async function agentEventsToOpenAISSE(
         }
 
         case 'tool_call': {
+          if (s.processedToolUseIds.has(event.id)) break;
+          s.processedToolUseIds.add(event.id);
           emitDelta(
             s,
             {

@@ -44,6 +44,14 @@ interface StreamState {
   activeToolUseId: string | null;
   activeToolUseName: string | null;
   activeToolUseJson: string;
+  // Dedup guard: agentLoop emits both content_delta (incremental) and
+  // assistant_message (full aggregate) for the same text. We must forward
+  // only one to avoid duplicate text on the client.
+  textBlockHasDelta: boolean;
+  // Dedup guard: agentLoop emits BOTH assistant_message.tool_calls (aggregate)
+  // AND tool_call (per-call) for the same tool_use id each turn. Open the
+  // tool_use block only once per id.
+  processedToolUseIds: Set<string>;
 }
 
 function createStreamState(model: string): StreamState {
@@ -61,6 +69,8 @@ function createStreamState(model: string): StreamState {
     activeToolUseId: null,
     activeToolUseName: null,
     activeToolUseJson: '',
+    textBlockHasDelta: false,
+    processedToolUseIds: new Set(),
   };
 }
 
@@ -246,6 +256,10 @@ export async function agentEventsToAnthropicSSE(
 
         case 'request_start': {
           // Internal event, no Anthropic equivalent
+          // Per-turn reset of the delta flag, so multi-turn streams do not
+          // inherit the previous turn's "we already streamed deltas" state.
+          s.textBlockHasDelta = false;
+          s.processedToolUseIds.clear();
           break;
         }
 
@@ -258,6 +272,7 @@ export async function agentEventsToAnthropicSSE(
             delta: { type: 'text_delta', text: event.delta },
           });
           s.outputTokens += estimateTokens(event.delta);
+          s.textBlockHasDelta = true;
           if (s.currentTextBlock !== null) {
             const block = s.blocks[s.currentTextBlock];
             if (block) block.text = (block.text ?? '') + event.delta;
@@ -268,8 +283,11 @@ export async function agentEventsToAnthropicSSE(
         case 'assistant_message': {
           ensureStarted(s, emit);
 
-          // Emit text content if present
-          if (event.content) {
+          // Emit text content if present AND no incremental delta has been
+          // forwarded for this turn. When content_delta already streamed the
+          // text, assistant_message.content is an aggregate duplicate — skip
+          // it. Falls through to tool_calls handling below regardless.
+          if (event.content && !s.textBlockHasDelta) {
             startTextBlock(s, emit);
             emit('content_block_delta', {
               type: 'content_block_delta',
@@ -287,6 +305,8 @@ export async function agentEventsToAnthropicSSE(
           // Emit tool_calls as tool_use blocks
           if (event.tool_calls && event.tool_calls.length > 0) {
             for (const tc of event.tool_calls) {
+              if (tc.id && s.processedToolUseIds.has(tc.id)) continue;
+              if (tc.id) s.processedToolUseIds.add(tc.id);
               openToolUseBlock(s, tc.id, tc.function.name, emit);
               appendToolUseJson(s, tc.function.arguments, emit);
               s.outputTokens += estimateTokens(tc.function.arguments);
@@ -298,6 +318,8 @@ export async function agentEventsToAnthropicSSE(
 
         case 'tool_call': {
           ensureStarted(s, emit);
+          if (s.processedToolUseIds.has(event.id)) break;
+          s.processedToolUseIds.add(event.id);
           openToolUseBlock(s, event.id, event.name, emit);
           appendToolUseJson(s, event.arguments, emit);
           s.outputTokens += estimateTokens(event.arguments);
