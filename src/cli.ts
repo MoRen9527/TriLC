@@ -298,12 +298,21 @@ async function cmdChat(port: number): Promise<void> {
 function toShortPath(long: string): string {
   if (platform() !== 'win32') return long;
   try {
-    return execSync(`cmd /c "for %I in (${long}) do @echo %~sI"`, {
-      encoding: 'utf-8',
-      windowsHide: true,
+    // PowerShell COM object: reliable even under SYSTEM (MSI CA Impersonate=no).
+    // Falls back to cmd /c "for %I ..." in case PowerShell is unavailable.
+    const psCmd = `(New-Object -ComObject Scripting.FileSystemObject).GetFile('${long}').ShortPath`;
+    return execSync(`powershell.exe -NoProfile -Command "${psCmd}"`, {
+      encoding: 'utf-8', windowsHide: true,
     }).trim();
   } catch {
-    return long; // fallback: 8.3 may be disabled on some volumes
+    // Fallback: cmd /c "for %I in (...) do @echo %~sI"
+    try {
+      return execSync(`cmd /c "for %I in (${long}) do @echo %~sI"`, {
+        encoding: 'utf-8', windowsHide: true,
+      }).trim();
+    } catch {
+      return long;
+    }
   }
 }
 
