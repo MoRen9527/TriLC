@@ -1372,7 +1372,7 @@ export function createTriLCApp(env: TriLCEnv) {
           }
 
           const sessionId = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-          const model = getKeyCache()?.defaultModel ?? process.env.TRIMODEL_DEFAULT_MODEL ?? 'deepseek-chat';
+          const model = getKeyCache()?.defaultModel ?? process.env.TRIMODEL_DEFAULT_MODEL ?? 'deepseek-v4-pro';
           const entry: TaskStreamEntry = {
             sessionId,
             message: body.message.trim(),
@@ -1888,8 +1888,7 @@ async function getAvailableModels(): Promise<ModelInfo[]> {
     if (_modelCache) return _modelCache.models;
     return [
       { id: 'deepseek-v4-pro', displayName: 'DeepSeek V4 Pro', createdAt: '2025-01-01' },
-      { id: 'deepseek-chat', displayName: 'DeepSeek Chat', createdAt: '2024-01-01' },
-      { id: 'deepseek-reasoner', displayName: 'DeepSeek Reasoner', createdAt: '2025-01-01' },
+      { id: 'deepseek-v4-flash', displayName: 'DeepSeek V4 Flash', createdAt: '2025-01-01' },
     ];
   }
 }
