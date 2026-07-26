@@ -32,6 +32,7 @@ Commands:
   stop               Stop background daemon           trilc stop
   status             Show daemon status               trilc status [--port 8711]
   run                Run daemon in foreground         trilc run [--port 8711]
+  chat               Start TUI chat (auto-starts daemon) trilc chat [--port 8711]
   install-service    Register as Windows Service       trilc install-service [--name TriLC] [--displayName "..."]
   uninstall-service  Unregister Windows Service        trilc uninstall-service [--name TriLC]
   install-regrun     Register to Registry Run (no-admin) trilc install-regrun
@@ -246,6 +247,51 @@ async function cmdRun(port: number): Promise<void> {
   await import('./index.js');
 }
 
+// ── TUI Chat command ──
+
+async function cmdChat(port: number): Promise<void> {
+  // Step 1: healthz check
+  const health = await healthCheck(port);
+
+  if (!health.ok) {
+    console.log('[trilc] daemon not running, auto-starting...');
+  }
+
+  // Step 2: ensure daemon is running
+  await cmdStart(port);
+
+  // Step 3: wait for daemon to be ready (poll up to 30s)
+  const startTime = Date.now();
+  const maxWaitMs = 30000;
+  const pollIntervalMs = 5000;
+
+  while (Date.now() - startTime < maxWaitMs) {
+    const check = await healthCheck(port);
+    if (check.ok) {
+      console.log('[trilc] daemon ready, starting TUI...');
+      break;
+    }
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+  }
+
+  // Step 4: final healthz check
+  const finalCheck = await healthCheck(port);
+  if (!finalCheck.ok) {
+    console.error(`[trilc] daemon failed to start within ${maxWaitMs / 1000}s`);
+    process.exit(1);
+  }
+
+  // Step 5: start TUI
+  try {
+    const { startTUI } = await import('./tui/render.js');
+    const root = await startTUI();
+    await root.waitUntilExit();
+  } catch (err) {
+    console.error('[trilc] TUI error:', (err as Error).message);
+    process.exit(1);
+  }
+}
+
 // ── Windows Service commands (admin required) ──
 
 async function checkAdminPrivilege(): Promise<boolean> {
@@ -412,7 +458,7 @@ async function cmdInstallRegRun(): Promise<void> {
   try {
     const cmd = `reg add "${REGRUN_KEY}" /v ${REGRUN_VALUE} /t REG_SZ /d "\\"${nodePath}\\" \\"${cliPath}\\" run" /f`;
     await execAsync(cmd);
-    console.log('✅ TriLC 已注册到 Registry Run（登录时自动启动）。');
+    console.log('[OK] TriLC 已注册到 Registry Run（登录时自动启动）。');
   } catch (err) {
     console.error(`ERROR: Registry Run 注册失败: ${(err as Error).message}`);
     process.exit(1);
@@ -434,7 +480,7 @@ async function cmdUninstallRegRun(): Promise<void> {
 
   try {
     await execAsync(`reg delete "${REGRUN_KEY}" /v ${REGRUN_VALUE} /f`);
-    console.log('✅ TriLC 已从 Registry Run 移除。');
+    console.log('[OK] TriLC 已从 Registry Run 移除。');
   } catch (err) {
     console.error(`ERROR: Registry Run 移除失败: ${(err as Error).message}`);
     process.exit(1);
@@ -457,6 +503,9 @@ const { command, port, serviceName, displayName } = parseArgs(process.argv.slice
       break;
     case 'run':
       await cmdRun(port);
+      break;
+    case 'chat':
+      await cmdChat(port);
       break;
     case 'install-service':
       await cmdInstallService(serviceName, displayName);
