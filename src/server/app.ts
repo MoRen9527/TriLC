@@ -777,7 +777,7 @@ export function createTriLCApp(env: TriLCEnv) {
               if (event.type === 'content_delta') {
                 finalContent += event.delta;
               } else if (event.type === 'assistant_message') {
-                if (event.content) finalContent += event.content;
+                if (!finalContent && event.content) finalContent = event.content;
                 if (event.tool_calls) {
                   for (const tc of event.tool_calls) {
                     toolCalls.push({
@@ -1139,7 +1139,7 @@ export function createTriLCApp(env: TriLCEnv) {
               if (event.type === 'content_delta') {
                 finalContent += event.delta;
               } else if (event.type === 'assistant_message') {
-                if (event.content) finalContent += event.content;
+                if (!finalContent && event.content) finalContent = event.content;
                 if (event.tool_calls) {
                   for (const tc of event.tool_calls) {
                     toolCalls.push({
