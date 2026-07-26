@@ -3,8 +3,8 @@
 // Provides start/stop/status/run commands for the TriLC daemon.
 // CTO-008-P P.1: CLI entry point for PC desktop packaging.
 
-import { spawn, type ChildProcess } from 'node:child_process';
-import { readFile, writeFile, unlink, access } from 'node:fs/promises';
+import { spawn, execSync, type ChildProcess } from 'node:child_process';
+import { readFile, writeFile, unlink, access, mkdir } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -294,6 +294,19 @@ async function cmdChat(port: number): Promise<void> {
 
 // ── Windows Service commands (admin required) ──
 
+/** Convert a Windows long path to its 8.3 short equivalent (avoids space-splitting in sc/nssm). */
+function toShortPath(long: string): string {
+  if (platform() !== 'win32') return long;
+  try {
+    return execSync(`cmd /c "for %I in (${long}) do @echo %~sI"`, {
+      encoding: 'utf-8',
+      windowsHide: true,
+    }).trim();
+  } catch {
+    return long; // fallback: 8.3 may be disabled on some volumes
+  }
+}
+
 async function checkAdminPrivilege(): Promise<boolean> {
   if (platform() !== 'win32') return false;
   try {
@@ -353,44 +366,44 @@ async function cmdInstallService(name: string, displayName: string): Promise<voi
     process.exit(1);
   }
 
-  // Check if service already exists
-  if (await checkServiceExists(name)) {
-    console.log(`[trilc] Windows Service "${name}" 已存在，尝试更新...`);
-    try {
-      const { exec } = await import('node:child_process');
-      const { promisify } = await import('node:util');
-      const execAsync = promisify(exec);
-      await execAsync(`sc stop ${name}`);
-    } catch { /* may already be stopped */ }
-  }
-
-  const nodePath = process.execPath;
-  const cliPath = resolve(__dirname, 'cli.js');
-  const binPath = `"${nodePath}" "${cliPath}" run`;
+  const trilcDir = resolve(__dirname, '..');
+  const nssmPath = resolve(trilcDir, '..', 'nssm', 'nssm.exe');
+  const nodePath = toShortPath(process.execPath);
+  const cliPath = toShortPath(resolve(__dirname, 'cli.js'));
+  const logDir = resolve(process.env.PROGRAMDATA || 'C:\\ProgramData', 'TriCade', 'logs');
+  await mkdir(logDir, { recursive: true });
 
   const { exec } = await import('node:child_process');
   const { promisify } = await import('node:util');
   const execAsync = promisify(exec);
 
+  // Check if service already exists (nssm-managed or old sc create)
+  if (await checkServiceExists(name)) {
+    console.log(`[trilc] Windows Service "${name}" 已存在，尝试更新...`);
+    try { await execAsync(`sc delete ${name}`); } catch { /* old sc residue */ }
+    try { await execAsync(`"${nssmPath}" stop ${name}`);   } catch {}
+    try { await execAsync(`"${nssmPath}" remove ${name} confirm`); } catch {}
+  }
+
   try {
-    // 1. Create service
-    await execAsync(`sc create ${name} binPath= ${binPath} start= delayed-auto`);
-    console.log(`  ✓ Service "${name}" created`);
+    // 1. nssm install + configure (replaces sc create + sc failure + AppDirectory)
+    await execAsync(`"${nssmPath}" install ${name} "${nodePath}"`);
+    await execAsync(`"${nssmPath}" set ${name} AppParameters "\"${cliPath}\" run"`);
+    await execAsync(`"${nssmPath}" set ${name} AppDirectory "${trilcDir}"`);
+    await execAsync(`"${nssmPath}" set ${name} AppExit Default Restart`);
+    await execAsync(`"${nssmPath}" set ${name} Start SERVICE_DELAYED_AUTO_START`);
+    await execAsync(`"${nssmPath}" set ${name} DisplayName "${displayName} — AI-powered local agent daemon"`);
+    await execAsync(`"${nssmPath}" set ${name} AppStdout "${logDir}\\trilc-stdout.log"`);
+    await execAsync(`"${nssmPath}" set ${name} AppStderr "${logDir}\\trilc-stderr.log"`);
+    console.log(`  ✓ Service "${name}" registered via nssm`);
 
-    // 2. Set description
-    await execAsync(`sc description ${name} "${displayName} — AI-powered local agent daemon"`);
-    console.log(`  ✓ Description set`);
-
-    // 3. Set failure recovery (auto-restart on crash)
-    await execAsync(`sc failure ${name} reset= 86400 actions= restart/60000/restart/60000/restart/60000`);
-    console.log(`  ✓ Failure recovery configured (auto-restart 3×)`);
-
-    // 4. Start service
-    await execAsync(`sc start ${name}`);
+    // 2. Start service
+    await execAsync(`"${nssmPath}" start ${name}`);
     console.log(`  ✓ Service started`);
 
-    console.log(`\n✅ TriLC Windows Service "${name}" 已安装并启动。`);
+    console.log(`\n✅ TriLC Windows Service "${name}" 已安装并启动（nssm）。`);
     console.log(`   开机时将自动启动（delayed-auto）。`);
+    console.log(`   日志: ${logDir}`);
   } catch (err) {
     console.error(`ERROR: Service 注册失败: ${(err as Error).message}`);
     process.exit(1);
@@ -409,20 +422,20 @@ async function cmdUninstallService(name: string): Promise<void> {
     return;
   }
 
+  const trilcDir = resolve(__dirname, '..');
+  const nssmPath = resolve(trilcDir, '..', 'nssm', 'nssm.exe');
+
   const { exec } = await import('node:child_process');
   const { promisify } = await import('node:util');
   const execAsync = promisify(exec);
 
+  try { await execAsync(`"${nssmPath}" stop ${name}`); } catch {}
   try {
-    await execAsync(`sc stop ${name}`);
-  } catch { /* may already be stopped */ }
-
-  try {
-    await execAsync(`sc delete ${name}`);
-    console.log(`✅ TriLC Windows Service "${name}" 已卸载。`);
-  } catch (err) {
-    console.error(`ERROR: Service 删除失败: ${(err as Error).message}`);
-    process.exit(1);
+    await execAsync(`"${nssmPath}" remove ${name} confirm`);
+    console.log(`✅ TriLC Windows Service "${name}" 已卸载（nssm）。`);
+  } catch {
+    // fallback: may have been created by old sc create; try sc delete
+    try { await execAsync(`sc delete ${name}`); } catch { /* both failed, ignore */ }
   }
 
   await removePidFile();

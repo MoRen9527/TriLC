@@ -1699,7 +1699,7 @@ export function createTriLCApp(env: TriLCEnv) {
 
       await new Promise<void>((resolve, reject) => {
         server!.on('error', reject);
-        server!.listen(env.port, () => resolve());
+        server!.listen(env.port, '127.0.0.1', () => resolve());
       });
 
       // Read actual port (in case port 0 for OS-assigned)
