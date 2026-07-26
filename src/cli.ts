@@ -397,11 +397,16 @@ async function cmdInstallService(name: string, displayName: string): Promise<voi
     await execAsync(`"${nssmPath}" set ${name} AppStderr "${logDir}\\trilc-stderr.log"`);
     console.log(`  ✓ Service "${name}" registered via nssm`);
 
-    // 2. Start service
-    await execAsync(`"${nssmPath}" start ${name}`);
-    console.log(`  ✓ Service started`);
+    // 2. Start service (best-effort; delayed-auto will start on reboot if this fails)
+    try {
+      await new Promise(r => setTimeout(r, 2000)); // let SCM settle
+      await execAsync(`"${nssmPath}" start ${name}`);
+      console.log(`  ✓ Service started`);
+    } catch {
+      console.log(`  ⚠ Service start failed (will auto-start on next reboot via delayed-auto)`);
+    }
 
-    console.log(`\n✅ TriLC Windows Service "${name}" 已安装并启动（nssm）。`);
+    console.log(`\n✅ TriLC Windows Service "${name}" 已安装（nssm）。`);
     console.log(`   开机时将自动启动（delayed-auto）。`);
     console.log(`   日志: ${logDir}`);
   } catch (err) {
