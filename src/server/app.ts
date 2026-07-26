@@ -1914,10 +1914,17 @@ function convertAnthropicMessages(anthropicMessages: AnthropicMessage[]): Messag
       // Content blocks — may contain text AND tool results
       const textBlocks: string[] = [];
       const toolResults: Array<{ tool_call_id: string; content: string }> = [];
+      const toolUses: Array<{ id: string; name: string; input: Record<string, unknown> }> = [];
 
       for (const block of msg.content) {
         if (block.type === 'text' && block.text) {
           textBlocks.push(block.text);
+        } else if (block.type === 'tool_use') {
+          toolUses.push({
+            id: block.id ?? '',
+            name: block.name ?? '',
+            input: block.input ?? {},
+          });
         } else if (block.type === 'tool_result') {
           const resultContent = typeof block.content === 'string'
             ? block.content
@@ -1931,8 +1938,19 @@ function convertAnthropicMessages(anthropicMessages: AnthropicMessage[]): Messag
         }
       }
 
-      // Emit text as user/assistant message
-      if (textBlocks.length > 0) {
+      // Emit assistant text + tool_use as ONE assistant message carrying tool_calls,
+      // so following role:'tool' messages (from tool_result) pair by tool_call_id.
+      if (msg.role === 'assistant' && toolUses.length > 0) {
+        result.push({
+          role: 'assistant',
+          content: textBlocks.join('\n'),
+          tool_calls: toolUses.map((tu) => ({
+            id: tu.id,
+            type: 'function' as const,
+            function: { name: tu.name, arguments: JSON.stringify(tu.input) },
+          })),
+        });
+      } else if (textBlocks.length > 0) {
         result.push({
           role: msg.role,
           content: textBlocks.join('\n'),
