@@ -143,6 +143,13 @@ async function cmdStart(port: number): Promise<void> {
     return;
   }
 
+  // Port-in-use guard: if daemon was started by another path (nssm service, tricade),
+  // the PID file won't match but the port is already occupied.
+  if (await isPortInUse(port)) {
+    console.log(`[trilc] daemon already running on port ${port}.`);
+    return;
+  }
+
   // Clean up stale PID file
   await removePidFile();
 
@@ -240,6 +247,13 @@ async function cmdStatus(port: number): Promise<void> {
 }
 
 async function cmdRun(port: number): Promise<void> {
+  // Port-in-use guard: if another daemon (nssm service / tricade / previous cmdStart)
+  // is already listening, exit cleanly instead of conflicting.
+  if (await isPortInUse(port)) {
+    console.log(`[trilc] port ${port} already in use — daemon is already running.`);
+    return;
+  }
+
   // Foreground mode: set env port and run main
   process.env.TRILC_PORT = String(port);
 
@@ -313,6 +327,21 @@ function toShortPath(long: string): string {
     } catch {
       return long;
     }
+  }
+}
+
+/** Check if a TCP port is already in use (another daemon / nssm service). */
+async function isPortInUse(port: number): Promise<boolean> {
+  try {
+    const { createServer } = await import('node:net');
+    return await new Promise<boolean>((resolve) => {
+      const s = createServer();
+      s.once('error', () => resolve(true));   // EADDRINUSE
+      s.once('listening', () => { s.close(); resolve(false); });
+      s.listen(port, '127.0.0.1');
+    });
+  } catch {
+    return true; // assume occupied on error
   }
 }
 
