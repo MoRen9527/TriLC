@@ -395,15 +395,25 @@ async function cmdInstallService(name: string, displayName: string): Promise<voi
   }
 
   try {
-    // 1. nssm install + configure (replaces sc create + sc failure + AppDirectory)
-    await execAsync(`"${nssmPath}" install ${name} "${nodePath}"`);
-    await execAsync(`"${nssmPath}" set ${name} AppParameters "\"${cliPath}\" run"`);
+    // 1. nssm install (registers service, Application = 8.3 node path)
+    await execAsync(`"${nssmPath}" install ${name} ${nodePath}`);
+
+    // 2. Write AppParameters via registry (avoids shell quoting issues with nssm set).
+    //    8.3 paths have no spaces → no inner quotes needed.
+    const regParamsKey = `HKLM\\SYSTEM\\CurrentControlSet\\Services\\${name}\\Parameters`;
+    await execAsync(`reg add "${regParamsKey}" /v AppParameters /t REG_EXPAND_SZ /d "${cliPath} run" /f`);
+
+    // 3. nssm set for remaining config (simple values, no quoting issues)
     await execAsync(`"${nssmPath}" set ${name} AppDirectory "${trilcDir}"`);
     await execAsync(`"${nssmPath}" set ${name} AppExit Default Restart`);
     await execAsync(`"${nssmPath}" set ${name} Start SERVICE_DELAYED_AUTO_START`);
     await execAsync(`"${nssmPath}" set ${name} DisplayName "${displayName} — AI-powered local agent daemon"`);
     await execAsync(`"${nssmPath}" set ${name} AppStdout "${logDir}\\trilc-stdout.log"`);
     await execAsync(`"${nssmPath}" set ${name} AppStderr "${logDir}\\trilc-stderr.log"`);
+    // Critical: daemon needs ~3s to init, nssm default AppThrottle 1500ms causes PAUSED
+    await execAsync(`"${nssmPath}" set ${name} AppThrottle 5000`);
+    // Node doesn't implement service controls → skip graceful stop, just kill
+    await execAsync(`"${nssmPath}" set ${name} AppStopMethodSkip 6`);
     console.log(`  ✓ Service "${name}" registered via nssm`);
 
     // 2. Start service (best-effort; delayed-auto will start on reboot if this fails)
