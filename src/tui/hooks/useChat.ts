@@ -92,18 +92,29 @@ export function useChat() {
         setMessages((prev) => {
           const copy = [...prev];
           const last = copy[copy.length - 1];
-          if (last?.role === 'assistant') last.content = streamContent;
+          // Replace last with a NEW object so React.memo shallow compare sees a
+          // new reference and re-renders (mutating `last` in place was skipped).
+          if (last?.role === 'assistant') {
+            copy[copy.length - 1] = { ...last, content: streamContent };
+          }
           return copy;
         });
       },
       onToolUse: (id, name, input) => {
         setMessages((prev) => {
-          const copy = [...prev]; const last = copy[copy.length - 1];
+          const copy = [...prev];
+          const last = copy[copy.length - 1];
           if (last?.role === 'assistant') {
-            last.toolCalls = [...(last.toolCalls || []), { id, name, arguments: input, status: 'pending' as const }];
-            for (let i = last.toolCalls.length - 2; i >= 0; i--) {
-              if (last.toolCalls[i].status === 'pending') last.toolCalls[i] = { ...last.toolCalls[i], status: 'done' as const };
-            }
+            const prevCalls = last.toolCalls || [];
+            // Flip prior pending calls to done, then append the new pending call.
+            // New array + new last object so memo shallow compare detects change.
+            const newCalls = [
+              ...prevCalls.map((tc) =>
+                tc.status === 'pending' ? { ...tc, status: 'done' as const } : tc,
+              ),
+              { id, name, arguments: input, status: 'pending' as const },
+            ];
+            copy[copy.length - 1] = { ...last, toolCalls: newCalls };
           }
           return copy;
         });
@@ -116,11 +127,16 @@ export function useChat() {
           const copy = [...prev];
           const last = copy[copy.length - 1];
           if (last?.role === 'assistant') {
-            last.isStreaming = false;
-            last.content = streamContent;
-            if (last.toolCalls) last.toolCalls = last.toolCalls.map((tc) =>
-              tc.status === 'pending' ? { ...tc, status: 'done' as const } : tc
-            );
+            // New object with finalized fields; flips any leftover pending tool
+            // calls to done. Required for memo shallow compare to detect change.
+            copy[copy.length - 1] = {
+              ...last,
+              isStreaming: false,
+              content: streamContent,
+              toolCalls: last.toolCalls?.map((tc) =>
+                tc.status === 'pending' ? { ...tc, status: 'done' as const } : tc,
+              ),
+            };
           }
           // Persist session asynchronously
           setSessionId((currentSid) => {
