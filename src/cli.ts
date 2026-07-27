@@ -300,10 +300,11 @@ async function cmdChat(port: number): Promise<void> {
     const { startTUI } = await import('./tui/render.js');
     const root = await startTUI();
     await root.waitUntilExit();
+    console.log('[trilc] TUI closed.');
   } catch (err) {
     console.error('[trilc] TUI error:', (err as Error).message);
-    process.exit(1);
   }
+  process.exit(0);
 }
 
 // ── Windows Service commands (admin required) ──
