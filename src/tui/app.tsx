@@ -1,10 +1,15 @@
-// ©¤©¤ Ink TUI App ©¤©¤
-import React, { useEffect } from 'react';
+// â”€â”€ Ink TUI App â”€â”€
+import React, { useEffect, useState, useCallback } from 'react';
 import { Box, Text, useInput } from 'ink';
-import { useChat } from './hooks/useChat.js';
+import { useChat, type Message } from './hooks/useChat.js';
 
-// Memoized message row ¡ª prevents re-printing
-const MessageLine = React.memo(function MessageLine({ msg }: { msg: any }) {
+interface ResumeOptions {
+  sessionId?: string;
+  messages?: Array<{ role: 'user' | 'assistant'; content: string }>;
+}
+
+// Memoized message row â€” prevents re-printing
+const MessageLine = React.memo(function MessageLine({ msg }: { msg: Message }) {
   if (msg.role === 'user') {
     return React.createElement(Box, { flexDirection: "column" },
       React.createElement(Text, { color: "yellow", bold: true }, "You:"),
@@ -13,25 +18,55 @@ const MessageLine = React.memo(function MessageLine({ msg }: { msg: any }) {
   }
   return React.createElement(Box, { flexDirection: "column" },
     React.createElement(Text, { color: "green" }, msg.content),
-    msg.toolCalls?.map((tc: any, j: number) =>
+    msg.toolCalls?.map((tc, j) =>
       React.createElement(Box, { key: j, marginLeft: 2 },
         React.createElement(Text, { dimColor: true },
           `[tool] ${tc.name} ${tc.status === 'done' ? 'OK' : '...'}`)))
   );
 });
 
-export default function App({ onAbortRef }: { onAbortRef?: React.MutableRefObject<(() => void) | null> }) {
-  const { messages, send, isLoading, requestState, error, abort } = useChat();
-  const [input, setInput] = React.useState('');
+export default function App({ onAbortRef, resume }: { onAbortRef?: React.MutableRefObject<(() => void) | null>; resume?: ResumeOptions }) {
+  const { messages, send, isLoading, requestState, error, abort, loadSession } = useChat();
+  const [input, setInput] = useState('');
+  const [resumeLoaded, setResumeLoaded] = useState(false);
 
   useEffect(() => {
     if (onAbortRef) onAbortRef.current = abort;
     return () => { if (onAbortRef) onAbortRef.current = null; };
   }, [abort, onAbortRef]);
 
+  // Handle resume on mount
+  useEffect(() => {
+    if (resumeLoaded) return;
+    if (!resume) { setResumeLoaded(true); return; }
+
+    // If messages were pre-fetched, display them and set session
+    if (resume.messages && resume.messages.length > 0) {
+      // Display the messages as history, then prompt for next input
+      // We don't send automatically â€” user types next message
+      setResumeLoaded(true);
+    } else if (resume.sessionId) {
+      // Try loading from API
+      loadSession(resume.sessionId).then((data) => {
+        if (data) {
+          // Messages will be loaded via the hook's state
+        }
+        setResumeLoaded(true);
+      }).catch(() => setResumeLoaded(true));
+    } else {
+      setResumeLoaded(true);
+    }
+  }, [resume, resumeLoaded, loadSession]);
+
+  // â”€â”€ Send logic with resume-aware â”€â”€
+  const handleSend = useCallback((text: string) => {
+    if (!text.trim()) return;
+    send(text.trim());
+  }, [send]);
+
   useInput((inputChar, key) => {
     if (key.return) {
-      if (input.trim()) { send(input.trim()); setInput(''); }
+      if (input.trim()) { handleSend(input.trim()); setInput(''); }
     } else if (key.backspace || key.delete) {
       setInput(v => v.slice(0, -1));
     } else if (inputChar && inputChar >= ' ') {
@@ -39,23 +74,34 @@ export default function App({ onAbortRef }: { onAbortRef?: React.MutableRefObjec
     }
   });
 
+  // Show resume messages if any
+  const resumeMsgs: Message[] = resume?.messages?.map((m) => ({
+    role: m.role as 'user' | 'assistant',
+    content: m.content,
+    isStreaming: false,
+  })) ?? [];
+
   // Only render last message when streaming, all messages otherwise
-  const displayMsgs = messages.length > 0 && messages[messages.length - 1].isStreaming
-    ? messages.slice(0, -1) // complete messages
-    : messages;
+  const allMsgs = resumeMsgs.length > 0 && messages.length === 0 ? resumeMsgs : messages;
+  const displayMsgs = allMsgs.length > 0 && allMsgs[allMsgs.length - 1].isStreaming
+    ? allMsgs.slice(0, -1)
+    : allMsgs;
 
   return React.createElement(Box, { flexDirection: "column", height: "100%" },
     React.createElement(Box, { flexGrow: 1, flexDirection: "column" },
       displayMsgs.length === 0 && React.createElement(Box, { paddingY: 1 },
         React.createElement(Text, { color: "cyan", bold: true }, "TriLC TUI Chat"),
-        React.createElement(Text, { dimColor: true }, "Type and Enter. /exit to quit. Ctrl+C twice.")
+        React.createElement(Text, { dimColor: true }, resume ? `Session: ${resume.sessionId ?? '(loaded)'} â€” Type and Enter. /exit to quit.` : "Type and Enter. /exit to quit. Ctrl+C twice.")
+      ),
+      resumeMsgs.length > 0 && messages.length === 0 && React.createElement(Box, { paddingY: 0 },
+        React.createElement(Text, { dimColor: true }, `â”€â”€ Resumed ${resumeMsgs.length} messages â”€â”€`)
       ),
       ...displayMsgs.map((msg, i) =>
         React.createElement(MessageLine, { key: i, msg })
       ),
-      // Show streaming message separately (uses absolute key to prevent re-render)
-      messages.length > 0 && messages[messages.length - 1].isStreaming &&
-        React.createElement(MessageLine, { key: 'streaming', msg: messages[messages.length - 1] }),
+      // Show streaming message separately
+      allMsgs.length > 0 && allMsgs[allMsgs.length - 1].isStreaming &&
+        React.createElement(MessageLine, { key: 'streaming', msg: allMsgs[allMsgs.length - 1] }),
       requestState === 'waitingForFirstToken' && React.createElement(Text, { dimColor: true }, "Thinking..."),
       error && React.createElement(Text, { color: "red" }, `Error: ${error}`)
     ),

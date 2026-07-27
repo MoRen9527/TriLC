@@ -32,7 +32,8 @@ Commands:
   stop               Stop background daemon           trilc stop
   status             Show daemon status               trilc status [--port 8711]
   run                Run daemon in foreground         trilc run [--port 8711]
-  chat               Start TUI chat (auto-starts daemon) trilc chat [--port 8711] [--agent &lt;id&gt;]
+  chat               Start TUI chat (auto-starts daemon) trilc chat [--port 8711] [--agent &lt;id&gt;] [--resume &lt;id&gt;] [--list-sessions]
+  list-sessions      List all saved sessions            trilc list-sessions [--port 8711]
   install-service    Register as Windows Service       trilc install-service [--name TriLC] [--displayName "..."]
   uninstall-service  Unregister Windows Service        trilc uninstall-service [--name TriLC]
   install-regrun     Register to Registry Run (no-admin) trilc install-regrun
@@ -42,16 +43,20 @@ Options:
   --port <n>          Port for HTTP server (default: ${DEFAULT_PORT})
   --name <s>          Windows Service name (default: ${DEFAULT_SERVICE_NAME})
   --displayName <s>   Windows Service display name
-  --agent <id>        Agent contract ID for chat (e.g. ceo-chief-of-staff)`);
+  --agent <id>        Agent contract ID for chat (e.g. ceo-chief-of-staff)
+  --resume <id>       Resume a previous session by ID
+  --list-sessions     List all saved sessions`);
 }
 
 // ── Argument parsing ──
-function parseArgs(args: string[]): { command: string; port: number; serviceName: string; displayName: string; agent?: string } {
+function parseArgs(args: string[]): { command: string; port: number; serviceName: string; displayName: string; agent?: string; resume?: string; listSessions?: boolean } {
   const command = args[0] ?? 'help';
   let port = DEFAULT_PORT;
   let serviceName = DEFAULT_SERVICE_NAME;
   let displayName = 'TriMetaverse Local Controller';
   let agent: string | undefined;
+  let resume: string | undefined;
+  let listSessions = false;
 
   for (let i = 1; i < args.length; i++) {
     if (args[i] === '--port' && args[i + 1]) {
@@ -66,10 +71,15 @@ function parseArgs(args: string[]): { command: string; port: number; serviceName
     } else if (args[i] === '--agent' && args[i + 1]) {
       agent = args[i + 1];
       i++;
+    } else if (args[i] === '--resume' && args[i + 1]) {
+      resume = args[i + 1];
+      i++;
+    } else if (args[i] === '--list-sessions') {
+      listSessions = true;
     }
   }
 
-  return { command, port, serviceName, displayName, agent };
+  return { command, port, serviceName, displayName, agent, resume, listSessions };
 }
 
 // ── PID file management ──
@@ -268,7 +278,7 @@ async function cmdRun(port: number): Promise<void> {
 
 // ── TUI Chat command ──
 
-async function cmdChat(port: number, agent?: string): Promise<void> {
+async function cmdChat(port: number, agent?: string, resume?: string): Promise<void> {
   // Step 1: healthz check
   const health = await healthCheck(port);
 
@@ -300,11 +310,34 @@ async function cmdChat(port: number, agent?: string): Promise<void> {
     process.exit(1);
   }
 
-  // Step 5: start TUI
+  // Step 5: if resume, fetch session from daemon
+  let resumeOpts: { sessionId?: string; messages?: Array<{ role: 'user' | 'assistant'; content: string }> } | undefined;
+  if (resume) {
+    try {
+      const fetchUrl = `http://127.0.0.1:${port}/internal/v1/sessions/${resume}`;
+      const res = await fetch(fetchUrl);
+      const json = await res.json() as { ok: boolean; session?: { id: string }; messages?: Array<{ role: string; content: string | null }> };
+      if (json.ok && json.messages) {
+        const msgs = json.messages
+          .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content)
+          .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content! }));
+        resumeOpts = { sessionId: resume, messages: msgs };
+        console.log(`[trilc] resumed session ${resume} with ${msgs.length} messages`);
+      } else {
+        console.error(`[trilc] session ${resume} not found or has no messages`);
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(`[trilc] failed to fetch session ${resume}:`, (err as Error).message);
+      process.exit(1);
+    }
+  }
+
+  // Step 6: start TUI
   if (agent) console.log(`[trilc] agent: ${agent}`);
   try {
     const { startTUI } = await import('./tui/render.js');
-    const root = await startTUI();
+    const root = await startTUI(resumeOpts);
     await root.waitUntilExit();
     console.log('[trilc] TUI closed.');
   } catch (err) {
@@ -446,8 +479,38 @@ async function cmdUninstallRegRun(): Promise<void> {
   }
 }
 
+// ── List Sessions ──
+
+async function cmdListSessions(port: number): Promise<void> {
+  const health = await healthCheck(port);
+  if (!health.ok) {
+    console.log('[trilc] daemon not running. Start with: trilc start');
+    return;
+  }
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/internal/v1/sessions?limit=50`);
+    const json = await res.json() as { ok: boolean; sessions?: Array<{ id: string; title?: string; status: string; createdAt: string }> };
+    if (json.ok && json.sessions) {
+      if (json.sessions.length === 0) {
+        console.log('No saved sessions.');
+      } else {
+        console.log(`\n${'SESSION ID'.padEnd(28)} STATUS     CREATED`);
+        console.log('-'.repeat(60));
+        for (const s of json.sessions) {
+          console.log(`${s.id.padEnd(28)} ${s.status.padEnd(10)} ${s.createdAt}`);
+        }
+        console.log(`\nResume a session: trilc chat --resume <id>`);
+      }
+    } else {
+      console.log('No sessions available.');
+    }
+  } catch (err) {
+    console.error('[trilc] failed to list sessions:', (err as Error).message);
+  }
+}
+
 // ── Entry ──
-const { command, port, serviceName, displayName, agent } = parseArgs(process.argv.slice(2));
+const { command, port, serviceName, displayName, agent, resume, listSessions } = parseArgs(process.argv.slice(2));
 
 (async () => {
   switch (command) {
@@ -464,7 +527,10 @@ const { command, port, serviceName, displayName, agent } = parseArgs(process.arg
       await cmdRun(port);
       break;
     case 'chat':
-      await cmdChat(port, agent);
+      await cmdChat(port, agent, resume);
+      break;
+    case 'list-sessions':
+      await cmdListSessions(port);
       break;
     case 'install-service':
       await cmdInstallService(serviceName, displayName);

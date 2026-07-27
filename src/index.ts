@@ -2,8 +2,24 @@ import { readEnv } from './config/env.js';
 import { LocalRuntimeDaemon } from './runtime/daemon.js';
 import { createTriLCApp } from './server/app.js';
 
+// ── Tool registration (CC-equivalent five tools) ──
+// Register before daemon starts accepting agent traffic.
+import { registerReadTool } from './tools/file-read.js';
+import { registerWriteTool } from './tools/file-write.js';
+import { registerEditTool } from './tools/file-edit.js';
+import { registerGlobTool } from './tools/file-glob.js';
+import { registerGrepTool } from './tools/file-grep.js';
+
 async function main(): Promise<void> {
   const env = readEnv();
+
+  // Register CC-equivalent tools (globally via agent-core)
+  registerReadTool();
+  registerWriteTool();
+  registerEditTool();
+  registerGlobTool();
+  registerGrepTool();
+  console.log('[trilc] registered 5 CC-equivalent tools: Read, Write, Edit, Glob, Grep');
 
   // Start local runtime daemon (heartbeat, node registration)
   const daemon = new LocalRuntimeDaemon(env);

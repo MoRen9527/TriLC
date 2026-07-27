@@ -1,11 +1,16 @@
-// ©¤©¤ Ink TUI bootstrap (npm ink) ©¤©¤
+// â”€â”€ Ink TUI bootstrap (npm ink) â”€â”€
 import React from 'react';
 import { render } from 'ink';
 import App from './app.js';
 
 const SIGINT_RESET_MS = 1000;
 
-export async function startTUI(): Promise<{ unmount: () => void; waitUntilExit: () => Promise<void> }> {
+export interface TUIResumeOptions {
+  sessionId?: string;
+  messages?: Array<{ role: 'user' | 'assistant'; content: string }>;
+}
+
+export async function startTUI(resume?: TUIResumeOptions): Promise<{ unmount: () => void; waitUntilExit: () => Promise<void> }> {
   let exitResolve: (() => void) | null = null;
   const exitPromise = new Promise<void>(r => { exitResolve = r; });
 
@@ -31,7 +36,7 @@ export async function startTUI(): Promise<{ unmount: () => void; waitUntilExit: 
   process.on('SIGINT', handleSigint);
 
   const { unmount, waitUntilExit: inkWait } = render(
-    React.createElement(App, { onAbortRef: abortRef }),
+    React.createElement(App, { onAbortRef: abortRef, resume }),
     { exitOnCtrlC: false, patchConsole: true }
   );
 

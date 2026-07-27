@@ -1253,6 +1253,77 @@ export function createTriLCApp(env: TriLCEnv) {
           return;
         }
 
+        // ── POST /internal/v1/sessions ──
+        // Saves a TUI chat session: creates or appends messages to an existing session.
+        // Body: { sessionId?: string, model?: string, messages: [{ role, content }] }
+        // If sessionId is omitted, a new one is created.
+        if (req.url === '/internal/v1/sessions' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: {
+            sessionId?: string;
+            model?: string;
+            title?: string;
+            messages?: Array<{ role: 'user' | 'assistant' | 'system' | 'tool'; content: string | null }>;
+          } = {};
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'invalid_json' }));
+            return;
+          }
+
+          try {
+            let sessionId = body.sessionId;
+            if (!sessionId || !sessionStore.getSession(sessionId)) {
+              sessionId = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+              sessionStore.createSession({
+                id: sessionId,
+                model: body.model ?? 'deepseek-v4-flash',
+                systemPrompt: 'You are a coding assistant.',
+                cwd: env.cwd,
+                title: body.title,
+              });
+            }
+
+            if (body.messages && body.messages.length > 0) {
+              sessionStore.saveMessages(sessionId!, body.messages);
+              sessionStore.updateSessionStatus(sessionId!, 'active');
+            }
+
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, sessionId }));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: msg }));
+          }
+          return;
+        }
+
+        // ── GET /internal/v1/sessions/{id} ──
+        // Returns a single session with its messages.
+        if (req.url?.startsWith('/internal/v1/sessions/') && !req.url.endsWith('/stream') && !req.url.endsWith('/cancel') && req.method === 'GET') {
+          const sessionIdMatch = req.url.match(/^\/internal\/v1\/sessions\/([^/]+)$/);
+          if (sessionIdMatch) {
+            const sessionId = sessionIdMatch[1];
+            const session = sessionStore.getSession(sessionId);
+            if (!session) {
+              res.writeHead(404, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'not_found', message: `Session ${sessionId} not found` }));
+              return;
+            }
+            const messages = sessionStore.getMessages(sessionId);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, session, messages }));
+            return;
+          }
+        }
+
         // ── POST /internal/v1/sessions/recover ──
         // Recovers an interrupted session with optional work-tree safety check.
         // Body: { sessionId?: string } — if omitted, recovers the most recent interrupted session.
