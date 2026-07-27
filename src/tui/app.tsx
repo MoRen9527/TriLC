@@ -2,6 +2,8 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { useChat, type Message } from './hooks/useChat.js';
+import Markdown from './components/Markdown.js';
+import ToolCallLine from './components/ToolCallLine.js';
 
 interface ResumeOptions {
   sessionId?: string;
@@ -17,11 +19,14 @@ const MessageLine = React.memo(function MessageLine({ msg }: { msg: Message }) {
     );
   }
   return React.createElement(Box, { flexDirection: "column" },
-    React.createElement(Text, { color: "green" }, msg.content),
+    React.createElement(Markdown, { content: msg.content }),
     msg.toolCalls?.map((tc, j) =>
-      React.createElement(Box, { key: j, marginLeft: 2 },
-        React.createElement(Text, { dimColor: true },
-          `[tool] ${tc.name} ${tc.status === 'done' ? 'OK' : '...'}`)))
+      React.createElement(ToolCallLine, {
+        key: j,
+        name: tc.name,
+        args: tc.arguments ?? '{}',
+        status: (tc.status === 'blocked' ? 'error' : tc.status) as 'pending' | 'done' | 'error',
+      }))
   );
 });
 
