@@ -430,13 +430,13 @@ async function cmdInstallRegRun(): Promise<void> {
 
   // Check mutual exclusion: if Service already registered
   if (await checkServiceExists(DEFAULT_SERVICE_NAME)) {
-    console.error('ERROR: 检测到 TriLC 已注册为 Windows Service。');
-    console.error('请先运行 trilc uninstall-service 移除后再使用 Registry Run。');
+    console.error('ERROR: TriLC already registered as Windows Service.');
+    console.error('Run trilc uninstall-service first, then retry install-regrun.');
     process.exit(1);
   }
 
   if (await checkRegRunExists()) {
-    console.log('[trilc] TriLC 已在 Registry Run 中注册。');
+    console.log('[trilc] TriLC already registered in Registry Run.');
     return;
   }
 
@@ -450,9 +450,9 @@ async function cmdInstallRegRun(): Promise<void> {
   try {
     const cmd = `reg add "${REGRUN_KEY}" /v ${REGRUN_VALUE} /t REG_SZ /d "\\"${nodePath}\\" \\"${cliPath}\\" run" /f`;
     await execAsync(cmd);
-    console.log('[OK] TriLC 已注册到 Registry Run（登录时自动启动）。');
+    console.log('[OK] TriLC registered in Registry Run (auto-start on login).');
   } catch (err) {
-    console.error(`ERROR: Registry Run 注册失败: ${(err as Error).message}`);
+    console.error(`ERROR: Registry Run registration failed: ${(err as Error).message}`);
     process.exit(1);
   }
 }
@@ -462,7 +462,7 @@ async function cmdUninstallRegRun(): Promise<void> {
 
   const exists = await checkRegRunExists();
   if (!exists) {
-    console.log('[trilc] TriLC 未在 Registry Run 中注册。');
+    console.log('[trilc] TriLC not found in Registry Run.');
     return;
   }
 
