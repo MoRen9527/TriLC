@@ -32,7 +32,7 @@ Commands:
   stop               Stop background daemon           trilc stop
   status             Show daemon status               trilc status [--port 8711]
   run                Run daemon in foreground         trilc run [--port 8711]
-  chat               Start TUI chat (auto-starts daemon) trilc chat [--port 8711]
+  chat               Start TUI chat (auto-starts daemon) trilc chat [--port 8711] [--agent &lt;id&gt;]
   install-service    Register as Windows Service       trilc install-service [--name TriLC] [--displayName "..."]
   uninstall-service  Unregister Windows Service        trilc uninstall-service [--name TriLC]
   install-regrun     Register to Registry Run (no-admin) trilc install-regrun
@@ -41,15 +41,17 @@ Commands:
 Options:
   --port <n>          Port for HTTP server (default: ${DEFAULT_PORT})
   --name <s>          Windows Service name (default: ${DEFAULT_SERVICE_NAME})
-  --displayName <s>   Windows Service display name`);
+  --displayName <s>   Windows Service display name
+  --agent <id>        Agent contract ID for chat (e.g. ceo-chief-of-staff)`);
 }
 
 // ── Argument parsing ──
-function parseArgs(args: string[]): { command: string; port: number; serviceName: string; displayName: string } {
+function parseArgs(args: string[]): { command: string; port: number; serviceName: string; displayName: string; agent?: string } {
   const command = args[0] ?? 'help';
   let port = DEFAULT_PORT;
   let serviceName = DEFAULT_SERVICE_NAME;
   let displayName = 'TriMetaverse Local Controller';
+  let agent: string | undefined;
 
   for (let i = 1; i < args.length; i++) {
     if (args[i] === '--port' && args[i + 1]) {
@@ -61,10 +63,13 @@ function parseArgs(args: string[]): { command: string; port: number; serviceName
     } else if (args[i] === '--displayName' && args[i + 1]) {
       displayName = args[i + 1];
       i++;
+    } else if (args[i] === '--agent' && args[i + 1]) {
+      agent = args[i + 1];
+      i++;
     }
   }
 
-  return { command, port, serviceName, displayName };
+  return { command, port, serviceName, displayName, agent };
 }
 
 // ── PID file management ──
@@ -263,7 +268,7 @@ async function cmdRun(port: number): Promise<void> {
 
 // ── TUI Chat command ──
 
-async function cmdChat(port: number): Promise<void> {
+async function cmdChat(port: number, agent?: string): Promise<void> {
   // Step 1: healthz check
   const health = await healthCheck(port);
 
@@ -296,6 +301,7 @@ async function cmdChat(port: number): Promise<void> {
   }
 
   // Step 5: start TUI
+  if (agent) console.log(`[trilc] agent: ${agent}`);
   try {
     const { startTUI } = await import('./tui/render.js');
     const root = await startTUI();
@@ -441,7 +447,7 @@ async function cmdUninstallRegRun(): Promise<void> {
 }
 
 // ── Entry ──
-const { command, port, serviceName, displayName } = parseArgs(process.argv.slice(2));
+const { command, port, serviceName, displayName, agent } = parseArgs(process.argv.slice(2));
 
 (async () => {
   switch (command) {
@@ -458,7 +464,7 @@ const { command, port, serviceName, displayName } = parseArgs(process.argv.slice
       await cmdRun(port);
       break;
     case 'chat':
-      await cmdChat(port);
+      await cmdChat(port, agent);
       break;
     case 'install-service':
       await cmdInstallService(serviceName, displayName);
