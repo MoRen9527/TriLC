@@ -308,28 +308,6 @@ async function cmdChat(port: number): Promise<void> {
 
 // ── Windows Service commands (admin required) ──
 
-/** Convert a Windows long path to its 8.3 short equivalent (avoids space-splitting in sc/nssm). */
-function toShortPath(long: string): string {
-  if (platform() !== 'win32') return long;
-  try {
-    // PowerShell COM object: reliable even under SYSTEM (MSI CA Impersonate=no).
-    // Falls back to cmd /c "for %I ..." in case PowerShell is unavailable.
-    const psCmd = `(New-Object -ComObject Scripting.FileSystemObject).GetFile('${long}').ShortPath`;
-    return execSync(`powershell.exe -NoProfile -Command "${psCmd}"`, {
-      encoding: 'utf-8', windowsHide: true,
-    }).trim();
-  } catch {
-    // Fallback: cmd /c "for %I in (...) do @echo %~sI"
-    try {
-      return execSync(`cmd /c "for %I in (${long}) do @echo %~sI"`, {
-        encoding: 'utf-8', windowsHide: true,
-      }).trim();
-    } catch {
-      return long;
-    }
-  }
-}
-
 /** Check if a TCP port is already in use (another daemon / nssm service). */
 async function isPortInUse(port: number): Promise<boolean> {
   try {
@@ -384,114 +362,22 @@ async function checkRegRunExists(): Promise<boolean> {
   }
 }
 
-async function cmdInstallService(name: string, displayName: string): Promise<void> {
-  if (platform() !== 'win32') {
-    console.error('ERROR: Windows Service registration is only available on Windows.');
-    process.exit(1);
-  }
+// ── install-service / uninstall-service ──
+// DEPRECATED after architecture review (2026-07-27):
+//   nssm SYSTEM service cannot access user API keys and introduced port-conflict
+//   complexity.  Delegate to install-regrun / uninstall-regrun instead.
+//   RegRun auto-starts TriLC at user login — no admin, users own keys, zero external
+//   dependencies.  The old CLI names are kept so existing MSI CustomActions and
+//   install scripts do not break — they transparently map to RegRun now.
 
-  const isAdmin = await checkAdminPrivilege();
-  if (!isAdmin) {
-    console.error('ERROR: 需要管理员权限才能注册 Windows Service。');
-    console.error('请以管理员身份运行终端，或使用 install-regrun（无需管理员）');
-    process.exit(1);
-  }
-
-  // Check mutual exclusion: if RegRun already registered
-  if (await checkRegRunExists()) {
-    console.error('ERROR: 检测到 TriLC 已通过 Registry Run 注册。');
-    console.error('请先运行 trilc uninstall-regrun 移除后再安装 Windows Service。');
-    process.exit(1);
-  }
-
-  const trilcDir = resolve(__dirname, '..');
-  const nssmPath = resolve(trilcDir, '..', 'nssm', 'nssm.exe');
-  const nodePath = toShortPath(process.execPath);
-  const cliPath = toShortPath(resolve(__dirname, 'cli.js'));
-  const logDir = resolve(process.env.PROGRAMDATA || 'C:\\ProgramData', 'TriCade', 'logs');
-  await mkdir(logDir, { recursive: true });
-
-  const { exec } = await import('node:child_process');
-  const { promisify } = await import('node:util');
-  const execAsync = promisify(exec);
-
-  // Check if service already exists (nssm-managed or old sc create)
-  if (await checkServiceExists(name)) {
-    console.log(`[trilc] Windows Service "${name}" 已存在，尝试更新...`);
-    try { await execAsync(`sc delete ${name}`); } catch { /* old sc residue */ }
-    try { await execAsync(`"${nssmPath}" stop ${name}`);   } catch {}
-    try { await execAsync(`"${nssmPath}" remove ${name} confirm`); } catch {}
-  }
-
-  try {
-    // 1. nssm install (registers service, Application = 8.3 node path)
-    await execAsync(`"${nssmPath}" install ${name} ${nodePath}`);
-
-    // 2. Write AppParameters via registry (avoids shell quoting issues with nssm set).
-    //    8.3 paths have no spaces → no inner quotes needed.
-    const regParamsKey = `HKLM\\SYSTEM\\CurrentControlSet\\Services\\${name}\\Parameters`;
-    await execAsync(`reg add "${regParamsKey}" /v AppParameters /t REG_EXPAND_SZ /d "${cliPath} run" /f`);
-
-    // 3. nssm set for remaining config (simple values, no quoting issues)
-    await execAsync(`"${nssmPath}" set ${name} AppDirectory "${trilcDir}"`);
-    await execAsync(`"${nssmPath}" set ${name} AppExit Default Restart`);
-    await execAsync(`"${nssmPath}" set ${name} Start SERVICE_DELAYED_AUTO_START`);
-    await execAsync(`"${nssmPath}" set ${name} DisplayName "${displayName} — AI-powered local agent daemon"`);
-    await execAsync(`"${nssmPath}" set ${name} AppStdout "${logDir}\\trilc-stdout.log"`);
-    await execAsync(`"${nssmPath}" set ${name} AppStderr "${logDir}\\trilc-stderr.log"`);
-    // Critical: daemon needs ~3s to init, nssm default AppThrottle 1500ms causes PAUSED
-    await execAsync(`"${nssmPath}" set ${name} AppThrottle 5000`);
-    // Node doesn't implement service controls → skip graceful stop, just kill
-    await execAsync(`"${nssmPath}" set ${name} AppStopMethodSkip 6`);
-    console.log(`  ✓ Service "${name}" registered via nssm`);
-
-    // 2. Start service (best-effort; delayed-auto will start on reboot if this fails)
-    try {
-      await new Promise(r => setTimeout(r, 2000)); // let SCM settle
-      await execAsync(`"${nssmPath}" start ${name}`);
-      console.log(`  ✓ Service started`);
-    } catch {
-      console.log(`  ⚠ Service start failed (will auto-start on next reboot via delayed-auto)`);
-    }
-
-    console.log(`\n✅ TriLC Windows Service "${name}" 已安装（nssm）。`);
-    console.log(`   开机时将自动启动（delayed-auto）。`);
-    console.log(`   日志: ${logDir}`);
-  } catch (err) {
-    console.error(`ERROR: Service 注册失败: ${(err as Error).message}`);
-    process.exit(1);
-  }
+async function cmdInstallService(_name: string, _displayName: string): Promise<void> {
+  console.log('[trilc] install-service → install-regrun (nssm/SYSTEM service deprecated).');
+  await cmdInstallRegRun();
 }
 
-async function cmdUninstallService(name: string): Promise<void> {
-  if (platform() !== 'win32') {
-    console.log('[trilc] Windows Service uninstall not applicable on this platform.');
-    return;
-  }
-
-  const exists = await checkServiceExists(name);
-  if (!exists) {
-    console.log(`[trilc] Windows Service "${name}" 未找到。`);
-    return;
-  }
-
-  const trilcDir = resolve(__dirname, '..');
-  const nssmPath = resolve(trilcDir, '..', 'nssm', 'nssm.exe');
-
-  const { exec } = await import('node:child_process');
-  const { promisify } = await import('node:util');
-  const execAsync = promisify(exec);
-
-  try { await execAsync(`"${nssmPath}" stop ${name}`); } catch {}
-  try {
-    await execAsync(`"${nssmPath}" remove ${name} confirm`);
-    console.log(`✅ TriLC Windows Service "${name}" 已卸载（nssm）。`);
-  } catch {
-    // fallback: may have been created by old sc create; try sc delete
-    try { await execAsync(`sc delete ${name}`); } catch { /* both failed, ignore */ }
-  }
-
-  await removePidFile();
+async function cmdUninstallService(_name: string): Promise<void> {
+  console.log('[trilc] uninstall-service → uninstall-regrun.');
+  await cmdUninstallRegRun();
 }
 
 // ── Registry Run commands (no admin required) ──
