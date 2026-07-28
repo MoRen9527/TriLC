@@ -72,8 +72,20 @@ function renderBlockToken(
     case 'paragraph':
       return React.createElement(Text, { key },
         ...flattenInlineTokens((token.tokens as Array<Record<string, unknown>>) ?? []));
-    case 'code':
-      return React.createElement(Text, { dimColor: true, key }, (token.text as string) ?? '');
+    case 'code': {
+      const codeText = (token.text as string) ?? '';
+      const lang = (token.lang as string) || '';
+      const lines = codeText.split('\n');
+      return React.createElement(Box, { flexDirection: 'column', marginLeft: 1, key },
+        lang ? React.createElement(Text, { dimColor: true, key: `${key}-lang` }, `  ${lang}`) : null,
+        ...lines.map((line, li) =>
+          React.createElement(Text, { key: `${key}-l${li}` },
+            React.createElement(Text, { dimColor: true }, `${String(li + 1).padStart(3)} `),
+            React.createElement(Text, { color: 'cyan' }, line),
+          ),
+        ),
+      );
+    }
     case 'list': {
       const items = (token.items as Array<Record<string, unknown>>) ?? [];
       const ordered = token.ordered as boolean;

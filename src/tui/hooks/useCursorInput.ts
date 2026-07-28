@@ -9,9 +9,10 @@ interface UseCursorInputOptions {
   onSubmit: (text: string) => void;
   onCommand?: (inputText: string) => boolean;
   onBash?: (cmd: string) => void;
+  onPasteOverflow?: (fullLen: number) => void;
 }
 
-export function useCursorInput({ onSubmit, onCommand, onBash }: UseCursorInputOptions) {
+export function useCursorInput({ onSubmit, onCommand, onBash, onPasteOverflow }: UseCursorInputOptions) {
   const columns = Math.max(20, (process.stdout?.columns ?? 80) - 4);
   const [cursor, setCursor] = useState<Cursor>(() =>
     Cursor.fromText('', columns),
@@ -177,6 +178,12 @@ export function useCursorInput({ onSubmit, onCommand, onBash }: UseCursorInputOp
       // ── Printable characters — exit history mode ──
       if (inputChar && !key.ctrl && !key.meta && inputChar >= ' ') {
         historyIndexRef.current = -1;
+        // Paste detection: single input >100 chars with newlines → truncate to 10K
+        if (inputChar.length > 100 && inputChar.includes('\n')) {
+          const truncated = inputChar.slice(0, 10000);
+          onPasteOverflow?.(inputChar.length);
+          return prev.insert(truncated.replace(/\n/g, ' '));
+        }
         return prev.insert(inputChar.replace(/\n/g, ' '));
       }
 

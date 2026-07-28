@@ -3,9 +3,12 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { Box, Text } from 'ink';
 import { useChat, type Message } from './hooks/useChat.js';
 import { useCursorInput } from './hooks/useCursorInput.js';
+import { useDoublePress } from './hooks/useDoublePress.js';
 import Markdown from './components/Markdown.js';
 import ToolCallLine from './components/ToolCallLine.js';
 import StatusLine from './components/StatusLine.js';
+import ThinkingLine from './components/ThinkingLine.js';
+import ErrorMessage from './components/ErrorMessage.js';
 import { ThemeProvider, useTheme, type Theme } from './design-system/theme.js';
 
 interface ResumeOptions {
@@ -13,7 +16,7 @@ interface ResumeOptions {
   messages?: Array<{ role: 'user' | 'assistant'; content: string }>;
 }
 
-const MessageLine = React.memo(function MessageLine({ msg }: { msg: Message }) {
+const MessageLine = React.memo(function MessageLine({ msg, verbose }: { msg: Message; verbose?: boolean }) {
   const theme = useTheme();
   if (msg.role === 'user') {
     return React.createElement(Box, { flexDirection: "column" },
@@ -22,6 +25,7 @@ const MessageLine = React.memo(function MessageLine({ msg }: { msg: Message }) {
     );
   }
   return React.createElement(Box, { flexDirection: "column" },
+    msg.thinking ? React.createElement(ThinkingLine, { content: msg.thinking, collapsed: !verbose }) : null,
     React.createElement(Markdown, { content: msg.content }),
     msg.toolCalls?.map((tc, j) =>
       React.createElement(ToolCallLine, { key: j, name: tc.name, args: tc.arguments ?? '{}',
@@ -40,10 +44,25 @@ function levenshtein(a: string, b: string): number {
   return dp[m]![n]!;
 }
 
-export default function App({ onAbortRef, resume }: { onAbortRef?: React.MutableRefObject<(() => void) | null>; resume?: ResumeOptions }) {
+export default function App({ onAbortRef, onCtrlCRef, resume }: { onAbortRef?: React.MutableRefObject<(() => void) | null>; onCtrlCRef?: React.MutableRefObject<(() => void) | null>; resume?: ResumeOptions }) {
   const { messages, send, isLoading, requestState, error, abort, loadSession, clearMessages, addSystemMessage } = useChat();
   const theme = useTheme();
   const [verbose, setVerbose] = useState(false);
+
+  const handleCtrlC = useDoublePress(
+    () => {
+      clear();
+      addSystemMessage('Press Ctrl+C again to exit.');
+    },
+    () => {
+      process.exit(0);
+    },
+  );
+
+  useEffect(() => {
+    if (onCtrlCRef) onCtrlCRef.current = handleCtrlC;
+    return () => { if (onCtrlCRef) onCtrlCRef.current = null; };
+  }, [handleCtrlC, onCtrlCRef]);
 
   const COMMANDS: Record<string, { desc: string; handler: (args: string) => string }> = {
     '/exit':    { desc: 'Exit TriCade', handler: () => { process.exit(0); return ''; } },
@@ -80,7 +99,12 @@ export default function App({ onAbortRef, resume }: { onAbortRef?: React.Mutable
     })();
   }, [addSystemMessage]);
 
-  const { inputText, cursorOffset, clear } = useCursorInput({ onSubmit: handleSend, onCommand: handleCommand, onBash: handleBash });
+  const { inputText, cursorOffset, clear } = useCursorInput({
+    onSubmit: handleSend, onCommand: handleCommand, onBash: handleBash,
+    onPasteOverflow: (fullLen: number) => {
+      addSystemMessage(`[Paste truncated: ${fullLen} chars → 10K max]`);
+    },
+  });
   const [resumeLoaded, setResumeLoaded] = useState(false);
 
   const renderInputBox = () => {
@@ -122,10 +146,10 @@ export default function App({ onAbortRef, resume }: { onAbortRef?: React.Mutable
       resumeMsgs.length > 0 && messages.length === 0 && React.createElement(Box, { paddingY: 0 },
         React.createElement(Text, { dimColor: true }, `── Resumed ${resumeMsgs.length} messages ──`)
       ),
-      ...displayMsgs.map((msg, i) => React.createElement(MessageLine, { key: i, msg })),
-      allMsgs.length > 0 && allMsgs[allMsgs.length - 1].isStreaming && React.createElement(MessageLine, { key: 'streaming', msg: allMsgs[allMsgs.length - 1] }),
+      ...displayMsgs.map((msg, i) => React.createElement(MessageLine, { key: i, msg, verbose })),
+      allMsgs.length > 0 && allMsgs[allMsgs.length - 1].isStreaming && React.createElement(MessageLine, { key: 'streaming', msg: allMsgs[allMsgs.length - 1], verbose }),
       requestState === 'waitingForFirstToken' && React.createElement(Text, { dimColor: true }, "Thinking..."),
-      error && React.createElement(Text, { color: theme.error }, `Error: ${error}`)
+      error && React.createElement(ErrorMessage, { message: error })
     ),
     React.createElement(Box, { flexDirection: "column", borderStyle: "single" }, renderInputBox()),
     React.createElement(StatusLine, { model: "deepseek-v4-flash", cwd: process.cwd(), inputTokens: 0, outputTokens: 0 })

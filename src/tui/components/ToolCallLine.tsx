@@ -8,22 +8,40 @@ import { Box, Text } from 'ink';
 import { useBlink } from '../hooks/useBlink.js';
 
 const BLACK_CIRCLE = '●'; // ● (CC figures.BLACK_CIRCLE equivalent)
-const MAX_VALUE_LEN = 40;
 const MAX_LINE_LEN = 70;
 const BLINK_INTERVAL = 800; // CC-compatible blink cadence
 
-function extractArgs(argsJson: string): string {
+function trunc(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+
+function extractArgs(name: string, argsJson: string): string {
   try {
-    const obj = JSON.parse(argsJson);
+    const obj = JSON.parse(argsJson) as Record<string, unknown>;
     if (typeof obj !== 'object' || obj === null) return '';
-    const entries = Object.entries(obj as Record<string, unknown>);
-    if (entries.length === 0) return '';
-    const parts = entries.slice(0, 2).map(([k, v]) => {
-      const valStr = typeof v === 'string' ? v : JSON.stringify(v);
-      const truncated = valStr.length > MAX_VALUE_LEN ? valStr.slice(0, MAX_VALUE_LEN) + '…' : valStr;
-      return `${k}: ${truncated}`;
-    });
-    return parts.join(', ');
+    switch (name) {
+      case 'Read':
+      case 'Write':
+        return obj.file_path ? `${obj.file_path}` : '';
+      case 'Edit':
+        if (!obj.file_path) return '';
+        if (obj.old_string) {
+          return `${obj.file_path} ("${trunc(String(obj.old_string), 20)}"→"${trunc(String(obj.new_string ?? ''), 20)}")`;
+        }
+        return `${obj.file_path}`;
+      case 'Bash':
+        return obj.command ? trunc(String(obj.command), 50) : '';
+      case 'Grep':
+      case 'Glob':
+        return obj.pattern ? trunc(String(obj.pattern), 40) : '';
+      default: {
+        const entries = Object.entries(obj);
+        if (entries.length === 0) return '';
+        return entries.slice(0, 2).map(([k, v]) =>
+          `${k}: ${trunc(String(v), 30)}`
+        ).join(', ');
+      }
+    }
   } catch { return ''; }
 }
 
@@ -48,6 +66,6 @@ export default function ToolCallLine({ name, args, status }: Props) {
   const dim = status === 'pending';
 
   return React.createElement(Box, { marginLeft: 2 },
-    React.createElement(Text, { color, dimColor: dim }, `${circle} ${formatLine(name, extractArgs(args))}`),
+    React.createElement(Text, { color, dimColor: dim }, `${circle} ${formatLine(name, extractArgs(name, args))}`),
   );
 }

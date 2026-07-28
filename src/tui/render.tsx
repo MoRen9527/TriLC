@@ -16,11 +16,18 @@ export async function startTUI(resume?: TUIResumeOptions): Promise<{ unmount: ()
   const exitPromise = new Promise<void>(r => { exitResolve = r; });
 
   const abortRef: React.MutableRefObject<(() => void) | null> = { current: null };
+  const ctrlCRef: React.MutableRefObject<(() => void) | null> = { current: null };
 
   let sigintCount = 0;
   let sigintTimer: ReturnType<typeof setTimeout> | null = null;
 
   const handleSigint = () => {
+    // If app has a Ctrl+C handler (useDoublePress), use it
+    if (ctrlCRef.current) {
+      ctrlCRef.current();
+      return;
+    }
+    // Fallback: legacy behavior for abort / exit
     if (abortRef.current) {
       sigintCount++;
       if (sigintCount === 1) {
@@ -37,7 +44,7 @@ export async function startTUI(resume?: TUIResumeOptions): Promise<{ unmount: ()
   process.on('SIGINT', handleSigint);
 
   const { unmount, waitUntilExit: inkWait } = render(
-    React.createElement(ThemeProvider, null, React.createElement(App, { onAbortRef: abortRef, resume })),
+    React.createElement(ThemeProvider, null, React.createElement(App, { onAbortRef: abortRef, onCtrlCRef: ctrlCRef, resume })),
     { exitOnCtrlC: false, patchConsole: true }
   );
 

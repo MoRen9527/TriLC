@@ -9,7 +9,7 @@ const MODEL = 'deepseek-v4-flash';
 
 export type RequestState = 'idle' | 'waitingForFirstToken' | 'streaming';
 export interface ToolCall { id: string; name: string; arguments: string; status: 'pending' | 'done' | 'blocked'; }
-export interface Message { role: 'user' | 'assistant'; content: string; isStreaming?: boolean; toolCalls?: ToolCall[]; }
+export interface Message { role: 'user' | 'assistant'; content: string; isStreaming?: boolean; toolCalls?: ToolCall[]; thinking?: string; }
 
 async function saveSession(sessionId: string | null, messages: Message[], model: string): Promise<string> {
   try {
