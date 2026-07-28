@@ -34,7 +34,7 @@ const MessageLine = React.memo(function MessageLine({ msg }: { msg: Message }) {
 });
 
 export default function App({ onAbortRef, resume }: { onAbortRef?: React.MutableRefObject<(() => void) | null>; resume?: ResumeOptions }) {
-  const { messages, send, isLoading, requestState, error, abort, loadSession } = useChat();
+  const { messages, send, isLoading, requestState, error, abort, loadSession, clearMessages, addSystemMessage } = useChat();
   const theme = useTheme();
   // ── Send logic with resume-aware ──
   const handleSend = useCallback((text: string) => {
@@ -42,7 +42,31 @@ export default function App({ onAbortRef, resume }: { onAbortRef?: React.Mutable
     send(text.trim());
   }, [send]);
 
-  const { inputText, cursorOffset, clear } = useCursorInput({ onSubmit: handleSend });
+  // ── Slash-command handler ──
+  const handleCommand = useCallback((inputText: string): boolean => {
+    const cmd = inputText.trim().toLowerCase();
+    switch (cmd) {
+      case '/exit':
+        process.exit(0);
+        return true; // unreachable, satisfies TS
+      case '/help':
+        addSystemMessage(
+          'Available commands:\n' +
+          '  /exit  - Exit TriCade\n' +
+          '  /help  - Show this help\n' +
+          '  /clear - Clear conversation history'
+        );
+        return true;
+      case '/clear':
+        clearMessages();
+        return true;
+      default:
+        addSystemMessage(`Unknown command: ${inputText}. Type /help for available commands.`);
+        return true;
+    }
+  }, [clearMessages, addSystemMessage]);
+
+  const { inputText, cursorOffset, clear } = useCursorInput({ onSubmit: handleSend, onCommand: handleCommand });
   const [resumeLoaded, setResumeLoaded] = useState(false);
 
   useEffect(() => {

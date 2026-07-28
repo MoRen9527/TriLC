@@ -191,5 +191,13 @@ export function useChat() {
 
   const getSessionId = useCallback(() => sessionId, [sessionId]);
 
-  return { messages, send, isLoading: requestState !== 'idle', requestState, error, abort, sessionId: getSessionId, loadSession };
+  const clearMessages = useCallback(() => {
+    setMessages([]);
+  }, []);
+
+  const addSystemMessage = useCallback((content: string) => {
+    setMessages((prev) => [...prev, { role: 'assistant', content, isStreaming: false }]);
+  }, []);
+
+  return { messages, send, isLoading: requestState !== 'idle', requestState, error, abort, sessionId: getSessionId, loadSession, clearMessages, addSystemMessage };
 }
