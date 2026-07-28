@@ -5,6 +5,7 @@ import { useChat, type Message } from './hooks/useChat.js';
 import { useCursorInput } from './hooks/useCursorInput.js';
 import Markdown from './components/Markdown.js';
 import ToolCallLine from './components/ToolCallLine.js';
+import StatusLine from './components/StatusLine.js';
 import { ThemeProvider, useTheme, type Theme } from './design-system/theme.js';
 
 interface ResumeOptions {
@@ -130,6 +131,7 @@ export default function App({ onAbortRef, resume }: { onAbortRef?: React.Mutable
     ),
     React.createElement(Box, { flexDirection: "column", borderStyle: "single" },
       React.createElement(Text, { dimColor: true }, isLoading ? "Waiting..." : `> ${inputText.substring(0, cursorOffset)}█${inputText.substring(cursorOffset)}`)
-    )
+    ),
+    React.createElement(StatusLine, { model: "deepseek-v4-flash", cwd: process.cwd(), inputTokens: 0, outputTokens: 0 })
   );
 }

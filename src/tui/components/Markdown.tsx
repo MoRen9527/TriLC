@@ -95,7 +95,7 @@ function renderBlockToken(
       const innerText = ((token.tokens as Array<Record<string, unknown>>) ?? [])
         .map((t: Record<string, unknown>) => (t.text as string) ?? (t.raw as string) ?? '')
         .join(' ');
-      return React.createElement(Text, { dimColor: true, key }, `│ ${innerText}`);
+      return React.createElement(Text, { dimColor: true, key }, `▎ ${innerText}`);
     }
     case 'hr':
       return React.createElement(Text, { dimColor: true, key }, '───');

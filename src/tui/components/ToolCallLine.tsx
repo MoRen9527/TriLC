@@ -1,94 +1,53 @@
-// ── ToolCall line component (Ink) ──
-// Displays tool name + key args with a tri-state prefix (pending spinner / done check / error cross).
-// Self-maintains a braille spinner via setInterval; cleans up when status leaves 'pending'.
-import React, { useState, useEffect, useRef } from 'react';
+// ── ToolCall line component (CC-aligned, ● + useBlink) ──
+// Displays tool name + key args with CC-style ● prefix:
+//   pending: ● blinking dimColor
+//   done:    ● solid green
+//   error:   ● solid red
+import React from 'react';
 import { Box, Text } from 'ink';
+import { useBlink } from '../hooks/useBlink.js';
 
-// ── Constants ──
-const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const SPINNER_INTERVAL_MS = 80;
+const BLACK_CIRCLE = '●'; // ● (CC figures.BLACK_CIRCLE equivalent)
 const MAX_VALUE_LEN = 40;
-const MAX_LINE_LEN = 70; // leaves room for prefix + space within 72
+const MAX_LINE_LEN = 70;
+const BLINK_INTERVAL = 800; // CC-compatible blink cadence
 
-// ── Args extraction ──
-// Parses the JSON args string, extracts the first 2 key-value pairs,
-// truncates each value to MAX_VALUE_LEN chars.
 function extractArgs(argsJson: string): string {
   try {
     const obj = JSON.parse(argsJson);
     if (typeof obj !== 'object' || obj === null) return '';
     const entries = Object.entries(obj as Record<string, unknown>);
     if (entries.length === 0) return '';
-
     const parts = entries.slice(0, 2).map(([k, v]) => {
       const valStr = typeof v === 'string' ? v : JSON.stringify(v);
-      const truncated = valStr.length > MAX_VALUE_LEN
-        ? valStr.slice(0, MAX_VALUE_LEN) + '…'
-        : valStr;
+      const truncated = valStr.length > MAX_VALUE_LEN ? valStr.slice(0, MAX_VALUE_LEN) + '…' : valStr;
       return `${k}: ${truncated}`;
     });
-
     return parts.join(', ');
-  } catch {
-    return '';
-  }
+  } catch { return ''; }
 }
 
-// ── Line formatting ──
-// Ensures the total display line (tool name + args) fits within MAX_LINE_LEN.
 function formatLine(name: string, argsDisplay: string): string {
   const full = argsDisplay ? `${name} ${argsDisplay}` : name;
-  if (full.length <= MAX_LINE_LEN) return full;
-  return full.slice(0, MAX_LINE_LEN) + '…';
+  return full.length <= MAX_LINE_LEN ? full : full.slice(0, MAX_LINE_LEN) + '…';
 }
 
-// ── Props ──
-interface ToolCallLineProps {
-  name: string;
-  args: string;
-  status: 'pending' | 'done' | 'error';
-}
+interface Props { name: string; args: string; status: 'pending' | 'done' | 'error'; }
 
-// ── Component ──
-export default function ToolCallLine({ name, args, status }: ToolCallLineProps) {
-  const [spinnerIdx, setSpinnerIdx] = useState(0);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+export default function ToolCallLine({ name, args, status }: Props) {
+  const isBlinking = useBlink(status === 'pending', BLINK_INTERVAL);
 
-  // Self-maintained braille spinner
-  useEffect(() => {
-    if (status !== 'pending') {
-      if (intervalRef.current !== null) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-      return;
-    }
+  // Pending: show ● only on visible half-cycle (blinking effect)
+  const showCircle = status !== 'pending' || isBlinking;
+  const circle = showCircle ? BLACK_CIRCLE : ' ';
 
-    intervalRef.current = setInterval(() => {
-      setSpinnerIdx((prev) => (prev + 1) % SPINNER_FRAMES.length);
-    }, SPINNER_INTERVAL_MS);
+  const color = status === 'done' ? 'green'
+              : status === 'error' ? 'red'
+              : 'yellow';
 
-    return () => {
-      if (intervalRef.current !== null) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-    };
-  }, [status]);
-
-  // Determine prefix and color by status
-  const prefix = status === 'pending'
-    ? SPINNER_FRAMES[spinnerIdx]
-    : status === 'done' ? '✓' : '✗'; // ✓ : ✗
-
-  const textProps: Record<string, unknown> = status === 'pending'
-    ? { dimColor: true }
-    : { color: status === 'done' ? 'green' : 'red' };
-
-  const argsDisplay = extractArgs(args);
-  const line = formatLine(name, argsDisplay);
+  const dim = status === 'pending';
 
   return React.createElement(Box, { marginLeft: 2 },
-    React.createElement(Text, textProps, `${prefix} ${line}`),
+    React.createElement(Text, { color, dimColor: dim }, `${circle} ${formatLine(name, extractArgs(args))}`),
   );
 }
