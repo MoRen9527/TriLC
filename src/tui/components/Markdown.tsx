@@ -4,6 +4,17 @@ import React from 'react';
 import { Box, Text } from 'ink';
 import { lexer } from 'marked';
 
+// marked internally HTML-escapes text tokens (&quot; &amp; &lt; &gt; &#39;).
+// Decode them back for terminal rendering.
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#39;/g, "'");
+}
+
 // ── Inline token flattening ──
 // Recursively flatten nested inline tokens (strong, em, codespan, text, link, del)
 // into a flat array of Ink Text elements.
@@ -17,7 +28,7 @@ function flattenInlineTokens(tokens: Array<Record<string, unknown>>): React.Reac
         return React.createElement(Text, { italic: true, key: i },
           ...flattenInlineTokens((token.tokens as Array<Record<string, unknown>>) ?? []));
       case 'codespan':
-        return React.createElement(Text, { italic: true, dimColor: true, key: i }, (token.text as string) ?? '');
+        return React.createElement(Text, { italic: true, dimColor: true, key: i }, decodeEntities((token.text as string) ?? ''));
       case 'text': {
         // A text token may itself carry nested inline tokens (e.g. inside a
         // strong/em). Flatten them to preserve nested formatting; otherwise
@@ -26,11 +37,11 @@ function flattenInlineTokens(tokens: Array<Record<string, unknown>>): React.Reac
         const childTokens = (token.tokens as Array<Record<string, unknown>> | undefined) ?? [];
         return childTokens.length
           ? React.createElement(Text, { key: i }, ...flattenInlineTokens(childTokens))
-          : React.createElement(Text, { key: i }, (token.text as string) ?? '');
+          : React.createElement(Text, { key: i }, decodeEntities((token.text as string) ?? ''));
       }
       case 'link':
         // Inline links: display only the link text, dimmed
-        return React.createElement(Text, { dimColor: true, key: i }, (token.text as string) ?? '');
+        return React.createElement(Text, { dimColor: true, key: i }, decodeEntities((token.text as string) ?? ''));
       case 'del':
         return React.createElement(Text, { strikethrough: true, key: i },
           ...flattenInlineTokens((token.tokens as Array<Record<string, unknown>>) ?? []));
