@@ -5,6 +5,8 @@
 # Dependencies, vendor snapshots, and generated output
 node_modules/
 vendor/
+# CC 2.1.88 absorption baseline — governed exception per company-governance-state.md §vendor
+!vendor/cc-tui/
 dist/
 build/
 coverage/
