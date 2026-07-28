@@ -72,6 +72,7 @@ export default function App({ onAbortRef, onCtrlCRef, resume }: { onAbortRef?: R
     '/verbose': { desc: 'Toggle verbose mode', handler: () => { setVerbose(v => !v); return `Verbose ${verbose ? 'OFF' : 'ON'}.`; } },
     '/status':  { desc: 'Show session stats', handler: () => `Session: ${messages.length} msgs, model: deepseek-v4-flash` },
     '/compact': { desc: 'Compact context (stub)', handler: () => 'Auto-compact not yet implemented (P2).' },
+    '/sessions': { desc: 'List saved sessions', handler: async () => { try { const r = await fetch('http://localhost:8711/internal/v1/sessions?limit=10'); const j = await r.json() as any; return (j.sessions||[]).map((s:any)=>`${s.id?.slice(0,12)}…  ${s.status??'?'}  ${s.created_at??''}`).join('\n') || 'No sessions'; } catch { return 'Cannot reach daemon'; } } },
   };
 
   const handleSend = useCallback((text: string) => { if (text.trim()) send(text.trim()); }, [send]);
@@ -140,7 +141,7 @@ export default function App({ onAbortRef, onCtrlCRef, resume }: { onAbortRef?: R
   return React.createElement(Box, { flexDirection: "column", height: "100%" },
     React.createElement(Box, { flexGrow: 1, flexDirection: "column" },
       displayMsgs.length === 0 && React.createElement(Box, { paddingY: 1 },
-        React.createElement(Text, { color: theme.info, bold: true }, "TriCade"),
+        React.createElement(Text, { color: theme.info, bold: true }, "TriCade v0.4.0"),
         React.createElement(Text, { dimColor: true }, resume ? `Session: ${resume.sessionId ?? '(loaded)'} — Type and Enter. /exit to quit.` : "Type and Enter. /exit to quit. Ctrl+C twice.")
       ),
       resumeMsgs.length > 0 && messages.length === 0 && React.createElement(Box, { paddingY: 0 },

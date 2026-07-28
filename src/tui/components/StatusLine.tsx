@@ -15,7 +15,7 @@ export default function StatusLine({ model, cwd, inputTokens, outputTokens }: Pr
 
   return React.createElement(Box, { flexDirection: "row" },
     React.createElement(Text, { dimColor: true, wrap: "truncate" },
-      `${model}  │  ${cwdShort}  │  in:${inputTokens}  out:${outputTokens}`
+      `${model}  │  ${cwdShort}  │  in:${inputTokens}  out:${outputTokens}  ctx:0%`
     )
   );
 }
