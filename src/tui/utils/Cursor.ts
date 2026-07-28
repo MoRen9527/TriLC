@@ -240,6 +240,105 @@ export class Cursor {
     return this.left().modifyText(this);
   }
 
+  // ── Helper stubs for CC API compatibility (TriLC has no image refs) ──
+  private imageRefStartingAt(_offset: number): { start: number; end: number } | null {
+    return null;
+  }
+
+  private snapOutOfImageRef(offset: number, _toward: 'start' | 'end'): number {
+    return offset;
+  }
+
+  // ── Deletion series (A级复制 from CC Cursor.ts) ──
+
+  /**
+   * Deletes a token before the cursor if one exists.
+   * Supports pasted text refs: [Pasted text #1], [Pasted text #1 +10 lines],
+   * [...Truncated text #1 +10 lines...]
+   *
+   * Returns null if no token found at cursor position.
+   * Only triggers when cursor is at end of token (followed by whitespace or EOL).
+   */
+  deleteTokenBefore(): Cursor | null {
+    // Cursor at chip.start is the "selected" state — backspace deletes the
+    // chip forward, not the char before it.
+    const chipAfter = this.imageRefStartingAt(this.offset);
+    if (chipAfter) {
+      const end =
+        this.text[chipAfter.end] === ' ' ? chipAfter.end + 1 : chipAfter.end;
+      return this.modifyText(new Cursor(this.measuredText, end));
+    }
+
+    if (this.isAtStart()) {
+      return null;
+    }
+
+    // Only trigger if cursor is at a word boundary (whitespace or end of string after cursor)
+    const charAfter = this.text[this.offset];
+    if (charAfter !== undefined && !/\s/.test(charAfter)) {
+      return null;
+    }
+
+    const textBefore = this.text.slice(0, this.offset);
+
+    // Check for pasted/truncated text refs
+    const pasteMatch = textBefore.match(
+      /(^|\s)\[(Pasted text #\d+(?: \+\d+ lines)?|Image #\d+|\.\.\.Truncated text #\d+ \+\d+ lines\.\.\.)\]$/,
+    );
+    if (pasteMatch) {
+      const matchStart = pasteMatch.index! + pasteMatch[1]!.length;
+      return new Cursor(this.measuredText, matchStart).modifyText(this);
+    }
+
+    return null;
+  }
+
+  /** Delete from cursor to end of line. Returns new cursor and killed text. */
+  deleteToLineEnd(): { cursor: Cursor; killed: string } {
+    // If cursor is on a newline character, delete just that character
+    if (this.text[this.offset] === '\n') {
+      return { cursor: this.modifyText(this.right()), killed: '\n' };
+    }
+
+    const endCursor = this.endOfLine();
+    const killed = this.text.slice(this.offset, endCursor.offset);
+    return { cursor: this.modifyText(endCursor), killed };
+  }
+
+  /** Delete from cursor to start of line. Returns new cursor and killed text. */
+  deleteToLineStart(): { cursor: Cursor; killed: string } {
+    // If cursor is right after a newline (at start of line), delete just that
+    // newline — symmetric with deleteToLineEnd's newline handling.
+    if (this.offset > 0 && this.text[this.offset - 1] === '\n') {
+      return { cursor: this.left().modifyText(this), killed: '\n' };
+    }
+
+    const startCursor = this.startOfLine();
+    const killed = this.text.slice(startCursor.offset, this.offset);
+    return { cursor: startCursor.modifyText(this), killed };
+  }
+
+  /** Delete the word before cursor. Returns new cursor and killed text. */
+  deleteWordBefore(): { cursor: Cursor; killed: string } {
+    if (this.isAtStart()) {
+      return { cursor: this, killed: '' };
+    }
+    const target = this.snapOutOfImageRef(this.prevWord().offset, 'start');
+    const prevWordCursor = new Cursor(this.measuredText, target);
+    const killed = this.text.slice(prevWordCursor.offset, this.offset);
+    return { cursor: prevWordCursor.modifyText(this), killed };
+  }
+
+  /** Delete the word after cursor. Returns new cursor. */
+  deleteWordAfter(): Cursor {
+    if (this.isAtEnd()) {
+      return this;
+    }
+
+    const target = this.snapOutOfImageRef(this.nextWord().offset, 'end');
+    return this.modifyText(new Cursor(this.measuredText, target));
+  }
+
   // ── Equality / boundary checks ──
 
   equals(other: Cursor): boolean {
@@ -254,5 +353,10 @@ export class Cursor {
 
   isAtEnd(): boolean {
     return this.offset >= this.text.length;
+  }
+
+  /** Snapshot of cursor position in visual (wrapped) line/column. */
+  cursorPosition(): { line: number; column: number } {
+    return this.getPosition();
   }
 }
