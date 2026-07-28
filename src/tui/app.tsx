@@ -1,9 +1,11 @@
 // ── Ink TUI App ──
 import React, { useEffect, useState, useCallback } from 'react';
-import { Box, Text, useInput } from 'ink';
+import { Box, Text } from 'ink';
 import { useChat, type Message } from './hooks/useChat.js';
+import { useCursorInput } from './hooks/useCursorInput.js';
 import Markdown from './components/Markdown.js';
 import ToolCallLine from './components/ToolCallLine.js';
+import { ThemeProvider, useTheme, type Theme } from './design-system/theme.js';
 
 interface ResumeOptions {
   sessionId?: string;
@@ -12,9 +14,10 @@ interface ResumeOptions {
 
 // Memoized message row — prevents re-printing
 const MessageLine = React.memo(function MessageLine({ msg }: { msg: Message }) {
+  const theme = useTheme();
   if (msg.role === 'user') {
     return React.createElement(Box, { flexDirection: "column" },
-      React.createElement(Text, { color: "yellow", bold: true }, "You:"),
+      React.createElement(Text, { color: theme.warning, bold: true }, "You:"),
       React.createElement(Text, null, msg.content)
     );
   }
@@ -32,7 +35,14 @@ const MessageLine = React.memo(function MessageLine({ msg }: { msg: Message }) {
 
 export default function App({ onAbortRef, resume }: { onAbortRef?: React.MutableRefObject<(() => void) | null>; resume?: ResumeOptions }) {
   const { messages, send, isLoading, requestState, error, abort, loadSession } = useChat();
-  const [input, setInput] = useState('');
+  const theme = useTheme();
+  // ── Send logic with resume-aware ──
+  const handleSend = useCallback((text: string) => {
+    if (!text.trim()) return;
+    send(text.trim());
+  }, [send]);
+
+  const { inputText, cursorOffset, clear } = useCursorInput({ onSubmit: handleSend });
   const [resumeLoaded, setResumeLoaded] = useState(false);
 
   useEffect(() => {
@@ -63,22 +73,6 @@ export default function App({ onAbortRef, resume }: { onAbortRef?: React.Mutable
     }
   }, [resume, resumeLoaded, loadSession]);
 
-  // ── Send logic with resume-aware ──
-  const handleSend = useCallback((text: string) => {
-    if (!text.trim()) return;
-    send(text.trim());
-  }, [send]);
-
-  useInput((inputChar, key) => {
-    if (key.return) {
-      if (input.trim()) { handleSend(input.trim()); setInput(''); }
-    } else if (key.backspace || key.delete) {
-      setInput(v => v.slice(0, -1));
-    } else if (inputChar && inputChar >= ' ') {
-      setInput(v => v + inputChar);
-    }
-  });
-
   // Show resume messages if any
   const resumeMsgs: Message[] = resume?.messages?.map((m) => ({
     role: m.role as 'user' | 'assistant',
@@ -95,7 +89,7 @@ export default function App({ onAbortRef, resume }: { onAbortRef?: React.Mutable
   return React.createElement(Box, { flexDirection: "column", height: "100%" },
     React.createElement(Box, { flexGrow: 1, flexDirection: "column" },
       displayMsgs.length === 0 && React.createElement(Box, { paddingY: 1 },
-        React.createElement(Text, { color: "cyan", bold: true }, "TriLC TUI Chat"),
+        React.createElement(Text, { color: theme.info, bold: true }, "TriCade"),
         React.createElement(Text, { dimColor: true }, resume ? `Session: ${resume.sessionId ?? '(loaded)'} — Type and Enter. /exit to quit.` : "Type and Enter. /exit to quit. Ctrl+C twice.")
       ),
       resumeMsgs.length > 0 && messages.length === 0 && React.createElement(Box, { paddingY: 0 },
@@ -108,10 +102,10 @@ export default function App({ onAbortRef, resume }: { onAbortRef?: React.Mutable
       allMsgs.length > 0 && allMsgs[allMsgs.length - 1].isStreaming &&
         React.createElement(MessageLine, { key: 'streaming', msg: allMsgs[allMsgs.length - 1] }),
       requestState === 'waitingForFirstToken' && React.createElement(Text, { dimColor: true }, "Thinking..."),
-      error && React.createElement(Text, { color: "red" }, `Error: ${error}`)
+      error && React.createElement(Text, { color: theme.error }, `Error: ${error}`)
     ),
     React.createElement(Box, { flexDirection: "column", borderStyle: "single" },
-      React.createElement(Text, { dimColor: true }, isLoading ? "Waiting..." : `> ${input}`)
+      React.createElement(Text, { dimColor: true }, isLoading ? "Waiting..." : `> ${inputText.substring(0, cursorOffset)}█${inputText.substring(cursorOffset)}`)
     )
   );
 }
