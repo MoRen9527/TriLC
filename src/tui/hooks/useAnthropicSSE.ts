@@ -37,6 +37,9 @@ export function connectAnthropicSSE(opts: AnthropicSSEOptions): () => void {
       const decoder = new TextDecoder();
       let buffer = '';
 
+      // Track which content block indices are tool_result (skip their deltas)
+      const toolResultBlocks = new Set<number>();
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -52,9 +55,6 @@ export function connectAnthropicSSE(opts: AnthropicSSEOptions): () => void {
           try {
             const event = JSON.parse(data);
             switch (event.type) {
-              case 'content_block_delta':
-                if (event.delta?.text) opts.onContentDelta(event.delta.text);
-                break;
               case 'content_block_start':
                 if (event.content_block?.type === 'tool_use') {
                   opts.onToolUse(
@@ -62,6 +62,17 @@ export function connectAnthropicSSE(opts: AnthropicSSEOptions): () => void {
                     event.content_block.name || '',
                     ''
                   );
+                } else if (event.content_block?.type === 'tool_result') {
+                  // Mark this block index as tool_result — skip its deltas
+                  if (event.index !== undefined) toolResultBlocks.add(event.index);
+                }
+                break;
+              case 'content_block_delta':
+                // Skip deltas from tool_result blocks (they're tool output, not model text)
+                if (event.index !== undefined && toolResultBlocks.has(event.index)) break;
+                // Only forward text_delta (skip input_json_delta which is tool params)
+                if (event.delta?.text && event.delta?.type !== 'input_json_delta') {
+                  opts.onContentDelta(event.delta.text);
                 }
                 break;
               case 'content_block_stop':
