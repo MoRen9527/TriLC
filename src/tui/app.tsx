@@ -64,7 +64,7 @@ export default function App({ onAbortRef, onCtrlCRef, resume }: { onAbortRef?: R
     return () => { if (onCtrlCRef) onCtrlCRef.current = null; };
   }, [handleCtrlC, onCtrlCRef]);
 
-  const COMMANDS: Record<string, { desc: string; handler: (args: string) => string }> = {
+  const COMMANDS: Record<string, { desc: string; handler: (args: string) => string | Promise<string> }> = {
     '/exit':    { desc: 'Exit TriCade', handler: () => { process.exit(0); return ''; } },
     '/help':    { desc: 'Show commands', handler: () => Object.entries(COMMANDS).map(([k,v]) => `  ${k}  — ${v.desc}`).join('\n') },
     '/clear':   { desc: 'Clear message history', handler: () => { clearMessages(); return 'Cleared.'; } },
@@ -82,7 +82,7 @@ export default function App({ onAbortRef, onCtrlCRef, resume }: { onAbortRef?: R
     const cmdName = (parts[0] ?? '').toLowerCase();
     const args = parts.slice(1).join(' ');
     const entry = COMMANDS[cmdName];
-    if (entry) { addSystemMessage(entry.handler(args)); return true; }
+    if (entry) { const r = entry.handler(args); if (typeof r === 'string') addSystemMessage(r); else r.then(s => addSystemMessage(s)); return true; }
     const names = Object.keys(COMMANDS);
     const closest = names.reduce((best, n) => { const d = levenshtein(cmdName, n); return d < best.d ? { name: n, d } : best; }, { name: '', d: 99 });
     const hint = closest.d <= 3 ? ` Did you mean ${closest.name}?` : '';
