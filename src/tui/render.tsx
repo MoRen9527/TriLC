@@ -2,6 +2,7 @@
 import React from 'react';
 import { render } from 'ink';
 import App from './app.js';
+import { ThemeProvider } from './design-system/theme.js';
 
 const SIGINT_RESET_MS = 1000;
 
@@ -36,7 +37,7 @@ export async function startTUI(resume?: TUIResumeOptions): Promise<{ unmount: ()
   process.on('SIGINT', handleSigint);
 
   const { unmount, waitUntilExit: inkWait } = render(
-    React.createElement(App, { onAbortRef: abortRef, resume }),
+    React.createElement(ThemeProvider, null, React.createElement(App, { onAbortRef: abortRef, resume })),
     { exitOnCtrlC: false, patchConsole: true }
   );
 
