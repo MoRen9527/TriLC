@@ -19,17 +19,22 @@ interface ResumeOptions {
 const MessageLine = React.memo(function MessageLine({ msg, verbose }: { msg: Message; verbose?: boolean }) {
   const theme = useTheme();
   if (msg.role === 'user') {
-    return React.createElement(Box, { flexDirection: "column" },
-      React.createElement(Text, { color: theme.warning, bold: true }, "You:"),
-      React.createElement(Text, null, msg.content)
+    return React.createElement(Box, { flexDirection: "column", paddingBottom: 1 },
+      React.createElement(Text, { color: theme.warning, bold: true }, "▸ You"),
+      React.createElement(Box, { paddingLeft: 2 },
+        React.createElement(Text, null, msg.content)
+      )
     );
   }
-  return React.createElement(Box, { flexDirection: "column" },
+  return React.createElement(Box, { flexDirection: "column", paddingBottom: 1 },
     msg.thinking ? React.createElement(ThinkingLine, { content: msg.thinking, collapsed: !verbose }) : null,
-    React.createElement(Markdown, { content: msg.content }),
     msg.toolCalls?.map((tc, j) =>
-      React.createElement(ToolCallLine, { key: j, name: tc.name, args: tc.arguments ?? '{}',
-        status: (tc.status === 'blocked' ? 'error' : tc.status) as 'pending' | 'done' | 'error' }))
+      React.createElement(ToolCallLine, { key: `tc-${j}`, name: tc.name, args: tc.arguments ?? '{}',
+        status: (tc.status === 'blocked' ? 'error' : tc.status) as 'pending' | 'done' | 'error' })
+    ),
+    React.createElement(Box, { paddingLeft: 1 },
+      React.createElement(Markdown, { content: msg.content })
+    )
   );
 });
 
