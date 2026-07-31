@@ -7,6 +7,8 @@ node_modules/
 vendor/
 # CC 2.1.88 absorption baseline — governed exception per company-governance-state.md §vendor
 !vendor/cc-tui/
+# Full CC source — design reference, per CTO directive 2026-07-31
+!vendor/claude-code-full/
 dist/
 build/
 coverage/
