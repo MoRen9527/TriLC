@@ -5,6 +5,13 @@
 状态：初版 · CTO 技术线产出
 作者：CTO 小狄
 
+> **2026-07-31 更新（v0.9.0）**：本设计 §1-§7 规划的"吸收 CC fork ink 引擎"已于 v0.9.0 完成。
+> - stock npm ink 已删除；CC fork 引擎落地为 `src/tui/ink/`
+> - 全部组件 import 切换至 fork（`Box`/`Text`/`render`/`useDeclaredCursor`）
+> - InputBox 接 fork 原生 `useDeclaredCursor`，IME 候选词在 VS Code/Windows Terminal 中完整支持
+> - 设计正确性已被验证：删除 stock ink 后 fork 使用顶层 React 19.2.8 + react-reconciler 0.31.0，版本冲突消失
+> - 实施偏离（首个提交走 stock ink 捷径）已纠正；本设计从"初版"升级为"已实现设计"
+
 ---
 
 ## 0. 前置声明
