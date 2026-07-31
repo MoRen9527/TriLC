@@ -284,6 +284,14 @@ async function cmdChat(port: number, agent?: string, resume?: string): Promise<v
 
   if (!health.ok) {
     console.log('[trilc] daemon not running, auto-starting...');
+    // Kill any stale daemon occupying the port but not responding
+    const existingPid = await readPid();
+    if (existingPid && isProcessAlive(existingPid)) {
+      console.log(`[trilc] stale daemon detected (pid=${existingPid}), killing...`);
+      try { process.kill(existingPid, 'SIGTERM'); } catch {}
+      await new Promise((r) => setTimeout(r, 1000));
+      await removePidFile();
+    }
   }
 
   // Step 2: ensure daemon is running
@@ -448,7 +456,7 @@ async function cmdInstallRegRun(): Promise<void> {
   const execAsync = promisify(exec);
 
   try {
-    const cmd = `reg add "${REGRUN_KEY}" /v ${REGRUN_VALUE} /t REG_SZ /d "\\"${nodePath}\\" \\"${cliPath}\\" run" /f`;
+    const cmd = `reg add "${REGRUN_KEY}" /v ${REGRUN_VALUE} /t REG_SZ /d "\\"${nodePath}\\" \\"${cliPath}\\" start" /f`;
     await execAsync(cmd);
     console.log('[OK] TriLC registered in Registry Run (auto-start on login).');
   } catch (err) {

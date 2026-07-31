@@ -1,0 +1,10 @@
+Alpha line one
+BETA LINE TWO
+alpha line three
+GAMMA line four
+delta line five
+ALPHA LINE SIX
+omega line seven
+grepping test here
+another line with alpha
+final line

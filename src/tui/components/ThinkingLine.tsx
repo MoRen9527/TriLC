@@ -2,7 +2,7 @@
 // verbose mode: shows expanded thinking with content preview (up to 200 chars)
 // collapsed mode: shows minimal "∴ Thinking" indicator
 import React from 'react';
-import { Box, Text } from 'ink';
+import { Box, Text } from '../fork.js';
 
 export default function ThinkingLine({ content, collapsed }: { content: string; collapsed: boolean }) {
   if (collapsed) {

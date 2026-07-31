@@ -7,6 +7,63 @@
 import stringWidth from 'string-width';
 import { MeasuredText } from './MeasuredText.js';
 
+// ── Kill ring (A级复制 from CC 2.1.88 vendor/cc-tui/utils/Cursor.ts) ──
+// Global state shared across all input fields.
+const KILL_RING_MAX_SIZE = 10;
+let killRing: string[] = [];
+let killRingIndex = 0;
+let lastActionWasKill = false;
+let lastYankStart = 0;
+let lastYankLength = 0;
+let lastActionWasYank = false;
+
+export function pushToKillRing(text: string, direction: 'prepend' | 'append' = 'append'): void {
+  if (text.length > 0) {
+    if (lastActionWasKill && killRing.length > 0) {
+      if (direction === 'prepend') killRing[0] = text + killRing[0];
+      else killRing[0] = killRing[0] + text;
+    } else {
+      killRing.unshift(text);
+      if (killRing.length > KILL_RING_MAX_SIZE) killRing.pop();
+    }
+    lastActionWasKill = true;
+    lastActionWasYank = false;
+  }
+}
+
+export function getLastKill(): string { return killRing[0] ?? ''; }
+export function getKillRingSize(): number { return killRing.length; }
+export function resetKillAccumulation(): void { lastActionWasKill = false; }
+
+export function yankPop(): { text: string; start: number; length: number } | null {
+  if (!lastActionWasYank || killRing.length <= 1) return null;
+  killRingIndex = (killRingIndex + 1) % killRing.length;
+  const text = killRing[killRingIndex] ?? '';
+  return { text, start: lastYankStart, length: lastYankLength };
+}
+
+export function updateYankLength(length: number): void { lastYankLength = length; }
+
+export function recordYank(start: number, length: number): void {
+  lastYankStart = start;
+  lastYankLength = length;
+  killRingIndex = 0;
+  lastActionWasYank = true;
+}
+
+function clearYankState(): void {
+  lastYankStart = 0; lastYankLength = 0; lastActionWasYank = false;
+}
+
+// ── Vim helpers (A级复制 from CC 2.1.88 vendor/cc-tui/utils/Cursor.ts) ──
+export const WHITESPACE_REGEX = /\s/;
+export const isVimWhitespace = (ch: string): boolean => WHITESPACE_REGEX.test(ch);
+const VIM_WORD_REGEX = /^[\wÀ-ÖØ-öø-ÿ]$/u;
+export const isVimWordChar = (ch: string): boolean =>
+  ch.length > 0 && !isVimWhitespace(ch) && VIM_WORD_REGEX.test(ch);
+export const isVimPunctuation = (ch: string): boolean =>
+  ch.length > 0 && !isVimWhitespace(ch) && !isVimWordChar(ch);
+
 type Position = {
   line: number;
   column: number;
@@ -203,6 +260,95 @@ export class Cursor {
     return new Cursor(this.measuredText, 0);
   }
 
+  // ── Vim word navigation (A级复制 from CC 2.1.88 vendor/cc-tui/utils/Cursor.ts) ──
+
+  private graphemeAt(pos: number): string {
+    if (pos >= this.text.length) return '';
+    const nextOff = this.measuredText.nextOffset(pos);
+    return this.text.slice(pos, nextOff);
+  }
+
+  private isOverWhitespace(): boolean {
+    const currentChar = this.text[this.offset] ?? '';
+    return /\s/.test(currentChar);
+  }
+
+  nextVimWord(): Cursor {
+    if (this.isAtEnd()) return this;
+    let pos = this.offset;
+    const advance = (p: number): number => this.measuredText.nextOffset(p);
+    const currentGrapheme = this.graphemeAt(pos);
+    if (!currentGrapheme) return this;
+    if (isVimWordChar(currentGrapheme)) {
+      while (pos < this.text.length && isVimWordChar(this.graphemeAt(pos))) pos = advance(pos);
+    } else if (isVimPunctuation(currentGrapheme)) {
+      while (pos < this.text.length && isVimPunctuation(this.graphemeAt(pos))) pos = advance(pos);
+    }
+    while (pos < this.text.length && WHITESPACE_REGEX.test(this.graphemeAt(pos))) pos = advance(pos);
+    return new Cursor(this.measuredText, pos);
+  }
+
+  endOfVimWord(): Cursor {
+    if (this.isAtEnd()) return this;
+    const text = this.text;
+    let pos = this.offset;
+    const advance = (p: number): number => this.measuredText.nextOffset(p);
+    if (this.graphemeAt(pos) === '') return this;
+    pos = advance(pos);
+    while (pos < text.length && WHITESPACE_REGEX.test(this.graphemeAt(pos))) pos = advance(pos);
+    if (pos >= text.length) return new Cursor(this.measuredText, text.length);
+    const charAtPos = this.graphemeAt(pos);
+    if (isVimWordChar(charAtPos)) {
+      while (pos < text.length) { const nextPos = advance(pos); if (nextPos >= text.length || !isVimWordChar(this.graphemeAt(nextPos))) break; pos = nextPos; }
+    } else if (isVimPunctuation(charAtPos)) {
+      while (pos < text.length) { const nextPos = advance(pos); if (nextPos >= text.length || !isVimPunctuation(this.graphemeAt(nextPos))) break; pos = nextPos; }
+    }
+    return new Cursor(this.measuredText, pos);
+  }
+
+  prevVimWord(): Cursor {
+    if (this.isAtStart()) return this;
+    let pos = this.offset;
+    const retreat = (p: number): number => this.measuredText.prevOffset(p);
+    pos = retreat(pos);
+    while (pos > 0 && WHITESPACE_REGEX.test(this.graphemeAt(pos))) pos = retreat(pos);
+    if (pos === 0 && WHITESPACE_REGEX.test(this.graphemeAt(0))) return new Cursor(this.measuredText, 0);
+    const charAtPos = this.graphemeAt(pos);
+    if (isVimWordChar(charAtPos)) {
+      while (pos > 0) { const prevPos = retreat(pos); if (!isVimWordChar(this.graphemeAt(prevPos))) break; pos = prevPos; }
+    } else if (isVimPunctuation(charAtPos)) {
+      while (pos > 0) { const prevPos = retreat(pos); if (!isVimPunctuation(this.graphemeAt(prevPos))) break; pos = prevPos; }
+    }
+    return new Cursor(this.measuredText, pos);
+  }
+
+  nextWORD(): Cursor {
+    let cursor: Cursor = this;
+    while (!cursor.isOverWhitespace() && !cursor.isAtEnd()) cursor = cursor.right();
+    while (cursor.isOverWhitespace() && !cursor.isAtEnd()) cursor = cursor.right();
+    return cursor;
+  }
+
+  endOfWORD(): Cursor {
+    if (this.isAtEnd()) return this;
+    let cursor: Cursor = this;
+    const atEndOfWORD = !cursor.isOverWhitespace() && (cursor.right().isOverWhitespace() || cursor.right().isAtEnd());
+    if (atEndOfWORD) { cursor = cursor.right(); return cursor.endOfWORD(); }
+    if (cursor.isOverWhitespace()) cursor = cursor.nextWORD();
+    while (!cursor.right().isOverWhitespace() && !cursor.isAtEnd()) cursor = cursor.right();
+    return cursor;
+  }
+
+  prevWORD(): Cursor {
+    let cursor: Cursor = this;
+    if (cursor.left().isOverWhitespace()) cursor = cursor.left();
+    while (cursor.isOverWhitespace() && !cursor.isAtStart()) cursor = cursor.left();
+    if (!cursor.isOverWhitespace()) {
+      while (!cursor.left().isOverWhitespace() && !cursor.isAtStart()) cursor = cursor.left();
+    }
+    return cursor;
+  }
+
   // ── Text mutation ──
 
   modifyText(end: Cursor, insertString: string = ''): Cursor {
@@ -297,11 +443,14 @@ export class Cursor {
   deleteToLineEnd(): { cursor: Cursor; killed: string } {
     // If cursor is on a newline character, delete just that character
     if (this.text[this.offset] === '\n') {
-      return { cursor: this.modifyText(this.right()), killed: '\n' };
+      const killed = '\n';
+      pushToKillRing(killed);
+      return { cursor: this.modifyText(this.right()), killed };
     }
 
     const endCursor = this.endOfLine();
     const killed = this.text.slice(this.offset, endCursor.offset);
+    if (killed) pushToKillRing(killed);
     return { cursor: this.modifyText(endCursor), killed };
   }
 
@@ -310,11 +459,14 @@ export class Cursor {
     // If cursor is right after a newline (at start of line), delete just that
     // newline — symmetric with deleteToLineEnd's newline handling.
     if (this.offset > 0 && this.text[this.offset - 1] === '\n') {
-      return { cursor: this.left().modifyText(this), killed: '\n' };
+      const killed = '\n';
+      pushToKillRing(killed);
+      return { cursor: this.left().modifyText(this), killed };
     }
 
     const startCursor = this.startOfLine();
     const killed = this.text.slice(startCursor.offset, this.offset);
+    if (killed) pushToKillRing(killed);
     return { cursor: startCursor.modifyText(this), killed };
   }
 
@@ -326,6 +478,7 @@ export class Cursor {
     const target = this.snapOutOfImageRef(this.prevWord().offset, 'start');
     const prevWordCursor = new Cursor(this.measuredText, target);
     const killed = this.text.slice(prevWordCursor.offset, this.offset);
+    if (killed) pushToKillRing(killed);
     return { cursor: prevWordCursor.modifyText(this), killed };
   }
 
@@ -337,6 +490,134 @@ export class Cursor {
 
     const target = this.snapOutOfImageRef(this.nextWord().offset, 'end');
     return this.modifyText(new Cursor(this.measuredText, target));
+  }
+
+  // ── Vim line/file navigation (A级复制 from CC 2.1.88 vendor/cc-tui/utils/Cursor.ts) ──
+
+  up(): Cursor {
+    const { line, column } = this.getPosition();
+    if (line === 0) return this;
+
+    const prevLine = this.measuredText.getWrappedText()[line - 1];
+    if (prevLine === undefined) return this;
+
+    const prevLineDisplayWidth = stringWidth(prevLine);
+    if (column > prevLineDisplayWidth) {
+      const newOffset = this.getOffset({ line: line - 1, column: prevLineDisplayWidth });
+      return new Cursor(this.measuredText, newOffset, 0);
+    }
+
+    const newOffset = this.getOffset({ line: line - 1, column });
+    return new Cursor(this.measuredText, newOffset, 0);
+  }
+
+  down(): Cursor {
+    const { line, column } = this.getPosition();
+    if (line >= this.measuredText.lineCount - 1) return this;
+
+    const nextLine = this.measuredText.getWrappedText()[line + 1];
+    if (nextLine === undefined) return this;
+
+    const nextLineDisplayWidth = stringWidth(nextLine);
+    if (column > nextLineDisplayWidth) {
+      const newOffset = this.getOffset({ line: line + 1, column: nextLineDisplayWidth });
+      return new Cursor(this.measuredText, newOffset, 0);
+    }
+
+    const newOffset = this.getOffset({ line: line + 1, column });
+    return new Cursor(this.measuredText, newOffset, 0);
+  }
+
+  goToLine(lineNumber: number): Cursor {
+    const lines = this.text.split('\n');
+    const targetLine = Math.min(Math.max(0, lineNumber - 1), lines.length - 1);
+    let offset = 0;
+    for (let i = 0; i < targetLine; i++) {
+      offset += (lines[i]?.length ?? 0) + 1;
+    }
+    return new Cursor(this.measuredText, offset, 0);
+  }
+
+  startOfFirstLine(): Cursor {
+    return new Cursor(this.measuredText, 0, 0);
+  }
+
+  endOfFile(): Cursor {
+    return new Cursor(this.measuredText, this.text.length, 0);
+  }
+
+  startOfLastLine(): Cursor {
+    const lastNewlineIndex = this.text.lastIndexOf('\n');
+    if (lastNewlineIndex === -1) {
+      return this.startOfLine();
+    }
+    return new Cursor(this.measuredText, lastNewlineIndex + 1, 0);
+  }
+
+  // ── Logical line navigation (A级复制 from CC Cursor.ts) ──
+  // These use literal \n as line separators, independent of display wrapping.
+
+  private findLogicalLineStart(fromOffset: number = this.offset): number {
+    const prevNewline = this.text.lastIndexOf('\n', fromOffset - 1);
+    return prevNewline === -1 ? 0 : prevNewline + 1;
+  }
+
+  private findLogicalLineEnd(fromOffset: number = this.offset): number {
+    const nextNewline = this.text.indexOf('\n', fromOffset);
+    return nextNewline === -1 ? this.text.length : nextNewline;
+  }
+
+  private getLogicalLineBounds(): { start: number; end: number } {
+    return {
+      start: this.findLogicalLineStart(),
+      end: this.findLogicalLineEnd(),
+    };
+  }
+
+  private createCursorWithColumn(lineStart: number, lineEnd: number, targetColumn: number): Cursor {
+    const lineLength = lineEnd - lineStart;
+    const clampedColumn = Math.min(targetColumn, lineLength);
+    const rawOffset = lineStart + clampedColumn;
+    const offset = this.measuredText.snapToGraphemeBoundary(rawOffset);
+    return new Cursor(this.measuredText, offset, 0);
+  }
+
+  endOfLogicalLine(): Cursor {
+    return new Cursor(this.measuredText, this.findLogicalLineEnd(), 0);
+  }
+
+  startOfLogicalLine(): Cursor {
+    return new Cursor(this.measuredText, this.findLogicalLineStart(), 0);
+  }
+
+  firstNonBlankInLogicalLine(): Cursor {
+    const { start, end } = this.getLogicalLineBounds();
+    const lineText = this.text.slice(start, end);
+    const match = lineText.match(/\S/);
+    const offset = start + (match?.index ?? 0);
+    return new Cursor(this.measuredText, offset, 0);
+  }
+
+  upLogicalLine(): Cursor {
+    const { start: currentStart } = this.getLogicalLineBounds();
+    if (currentStart === 0) {
+      return new Cursor(this.measuredText, 0, 0);
+    }
+    const currentColumn = this.offset - currentStart;
+    const prevLineEnd = currentStart - 1;
+    const prevLineStart = this.findLogicalLineStart(prevLineEnd);
+    return this.createCursorWithColumn(prevLineStart, prevLineEnd, currentColumn);
+  }
+
+  downLogicalLine(): Cursor {
+    const { start: currentStart, end: currentEnd } = this.getLogicalLineBounds();
+    if (currentEnd >= this.text.length) {
+      return new Cursor(this.measuredText, this.text.length, 0);
+    }
+    const currentColumn = this.offset - currentStart;
+    const nextLineStart = currentEnd + 1;
+    const nextLineEnd = this.findLogicalLineEnd(nextLineStart);
+    return this.createCursorWithColumn(nextLineStart, nextLineEnd, currentColumn);
   }
 
   // ── Equality / boundary checks ──

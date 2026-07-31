@@ -6,6 +6,21 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve, isAbsolute, dirname } from 'node:path';
 import { register as registerTool } from '@trimetaverse/agent-core';
 
+// ── Quote normalization (A级复制 from CC FileEditTool/utils.ts) ──
+// CC's fuzzy match: when exact old_string match fails, normalize curly quotes
+// to straight quotes and try again. This catches the common case where the
+// model uses straight quotes " " but the file has curly quotes " " (or vice
+// versa), avoiding spurious "String not found" errors.
+const RIGHT_SINGLE_CURLY = '’';   // '
+const LEFT_DOUBLE_CURLY = '“';    // "
+const RIGHT_DOUBLE_CURLY = '”';   // "
+function normalizeQuotes(s: string): string {
+  return s
+    .replaceAll(RIGHT_SINGLE_CURLY, "'")
+    .replaceAll(LEFT_DOUBLE_CURLY, '"')
+    .replaceAll(RIGHT_DOUBLE_CURLY, '"');
+}
+
 export function registerEditTool(): void {
   registerTool(
     {
@@ -80,15 +95,26 @@ export function registerEditTool(): void {
           });
         }
 
-        // Count matches
-        const occurrences = originalContent.split(oldString).length - 1;
-
-        if (occurrences === 0) {
-          return JSON.stringify({
-            error: `String to replace not found in file.\nString: ${oldString.slice(0, 200)}`,
-            file_path: filePath,
-          });
+        // Try exact match first; fall back to quote-normalized fuzzy match.
+        let actualOldString: string;
+        if (originalContent.includes(oldString)) {
+          actualOldString = oldString;
+        } else {
+          const normOld = normalizeQuotes(oldString);
+          const normFile = normalizeQuotes(originalContent);
+          const normIndex = normFile.indexOf(normOld);
+          if (normIndex !== -1) {
+            actualOldString = originalContent.substring(normIndex, normIndex + oldString.length);
+          } else {
+            return JSON.stringify({
+              error: `String to replace not found in file.\nString: ${oldString.slice(0, 200)}`,
+              file_path: filePath,
+            });
+          }
         }
+
+        // Count matches
+        const occurrences = originalContent.split(actualOldString).length - 1;
 
         if (occurrences > 1 && !replaceAll) {
           return JSON.stringify({
@@ -97,12 +123,12 @@ export function registerEditTool(): void {
           });
         }
 
-        // Perform replacement
+        // Perform replacement (0-occurrence already handled above)
         let updatedContent: string;
         if (replaceAll) {
-          updatedContent = originalContent.split(oldString).join(newString);
+          updatedContent = originalContent.split(actualOldString).join(newString);
         } else {
-          updatedContent = originalContent.replace(oldString, newString);
+          updatedContent = originalContent.replace(actualOldString, newString);
         }
 
         // Ensure parent directory exists

@@ -17,17 +17,29 @@ export type TriLCEnv = {
 };
 
 import { hostname } from 'node:os';
-import { resolve } from 'node:path';
+import { resolve, dirname } from 'node:path';
 import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 function resolveFromWorkspace(): string {
   // Check env var first
   if (process.env.TRICOMPANY_SOURCE_PATH) return process.env.TRICOMPANY_SOURCE_PATH;
-  // Check local contracts/ (TriCade MSI ships contracts alongside daemon)
-  const localContracts = resolve(process.cwd(), 'contracts');
-  if (existsSync(localContracts)) return localContracts;
-  // Fallback: auto-discover TriCompany from TriLC's workspace
-  return resolve(process.cwd(), '..', 'TriCompany', '.github', 'source-agents');
+
+  // Determine the script's own directory (works in both dev and MSI deployment).
+  // Using process.cwd() is unreliable: daemon started via RegRun has cwd=C:\Windows\System32.
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+
+  // MSI deployment: contracts/ sits at tools/trilc/contracts/
+  // dist/config/env.js → ../../contracts → tools/trilc/contracts/
+  const msiContracts = resolve(scriptDir, '..', '..', 'contracts');
+  if (existsSync(msiContracts)) return msiContracts;
+
+  // Development workspace: TriCompany/source-agents next to TriLC
+  const devContracts = resolve(scriptDir, '..', '..', '..', 'TriCompany', 'source-agents');
+  if (existsSync(devContracts)) return devContracts;
+
+  // Last resort: return the development path (will log a warning in contract-resolver)
+  return devContracts;
 }
 
 export function readEnv(): TriLCEnv {

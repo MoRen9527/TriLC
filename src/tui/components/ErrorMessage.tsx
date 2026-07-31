@@ -1,6 +1,6 @@
 // ── ErrorMessage (P1-7): error rendering with optional details ──
 import React from 'react';
-import { Box, Text } from 'ink';
+import { Box, Text } from '../fork.js';
 
 export default function ErrorMessage({ message, details }: { message: string; details?: string }) {
   return React.createElement(Box, { flexDirection: "column" },

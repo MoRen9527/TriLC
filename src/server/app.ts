@@ -14,9 +14,10 @@ import { createServer, type Server, type ServerResponse } from 'node:http';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import type { TriLCEnv } from '../config/env.js';
-import { agentLoop, register as registerTool } from '@trimetaverse/agent-core';
-import type { AgentEvent, AgentLoopOptions } from '@trimetaverse/agent-core';
+import { agentLoop, register as registerTool, canUseTool } from '@trimetaverse/agent-core';
+import type { AgentEvent, AgentLoopOptions, AgentLoopDeps } from '@trimetaverse/agent-core';
 import type { AgentTier, PermissionMode, PermissionRule } from '@trimetaverse/agent-core';
+import { isPlanModeActive, PLAN_MODE_WHITELIST } from '../tools/plan-mode.js';
 import { validateMessage, type GuardResult } from '@trimetaverse/agent-core';
 import type { Message, ToolDefinition, UsageSummary } from 'trimodel';
 import { createModelClient } from 'trimodel';
@@ -38,6 +39,90 @@ import {
 } from '../config/key-cache.js';
 import { TaskMirrorPusher } from '../mirror/pusher.js';
 import type { MirrorTaskSnapshot } from '../mirror/types.js';
+import {
+  beginInteractiveSession,
+  endInteractiveSession,
+  getPendingInteraction,
+  answerInteraction,
+  isAlwaysAllowed,
+  rememberAlwaysAllow,
+  requestInteraction,
+} from './interactions.js';
+
+// Cached roster of available sub-agents (built at daemon startup, injected
+// into system prompts so the model knows by name which agents it can invoke
+// with AgentTool — e.g. "let Xiao Jia check this" → AgentTool(agentType=ceo-chief-of-staff)).
+let cachedAgentRoster = '';
+
+// ── P3: Interactive permission rules ──
+// Dangerous tools that trigger an interactive allow/deny/always prompt when
+// the request opts in via `interactive: true`. Mode stays bypassPermissions
+// so everything else passes at pipeline step 4; these hit step 2 (ask).
+const INTERACTIVE_ASK_RULES: PermissionRule[] = [
+  { toolName: 'shell_exec', behavior: 'ask', source: 'session' },
+  { toolName: 'Bash', behavior: 'ask', source: 'session' },
+  { toolName: 'Edit', behavior: 'ask', source: 'session' },
+  { toolName: 'Write', behavior: 'ask', source: 'session' },
+];
+
+/** Compact human-readable summary of tool args for the permission prompt. */
+function summarizeToolArgs(toolName: string, args: Record<string, unknown>): string {
+  const str = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v));
+  if (toolName === 'shell_exec' || toolName === 'Bash') {
+    return str(args.command ?? args.cmd ?? '').slice(0, 200);
+  }
+  if (toolName === 'Edit' || toolName === 'Write') {
+    return str(args.file_path ?? args.filePath ?? args.path ?? '').slice(0, 200);
+  }
+  return JSON.stringify(args).slice(0, 200);
+}
+
+// ── P7: Plan mode tool gating ──
+// Injects deps.checkToolPermission into every AgentLoopOptions so that
+// EnterPlanMode→ExitPlanMode brackets are enforced at tool-execution time.
+// The callback runs AFTER permissionEngine (P3) and BEFORE actual execution.
+function buildPlanModeDeps(): AgentLoopDeps {
+  return {
+    checkToolPermission: (toolName, tier) => {
+      // First tier check (agent-core native tier gating)
+      const tierResult = canUseTool(toolName, tier);
+      if (!tierResult.allowed) return tierResult;
+
+      // Plan mode whitelist check (P7)
+      if (isPlanModeActive() && !PLAN_MODE_WHITELIST.has(toolName)) {
+        return {
+          allowed: false,
+          reason:
+            `Plan mode active: tool "${toolName}" is blocked. ` +
+            'Only read/plan tools are allowed during plan mode. ' +
+            'Use ExitPlanMode to resume full capabilities.',
+        };
+      }
+
+      return { allowed: true };
+    },
+  };
+}
+
+/** P3: onPermissionAsk bridge — routes 'ask' decisions to the TUI. */
+async function askPermissionViaTui(
+  toolName: string,
+  args: Record<string, unknown>,
+  reason?: string,
+): Promise<'allow' | 'deny' | 'always'> {
+  if (isAlwaysAllowed(toolName)) return 'allow';
+  const verdict = await requestInteraction(
+    'permission',
+    { toolName, argsSummary: summarizeToolArgs(toolName, args), reason },
+    120_000, // 2min timeout → fail closed (deny)
+    'deny',
+  );
+  if (verdict === 'always') {
+    rememberAlwaysAllow(toolName);
+    return 'allow';
+  }
+  return verdict === 'allow' ? 'allow' : 'deny';
+}
 
 // ── ConnectionManager ──
 // Tracks TriMC reachability for fast fallback decisions.
@@ -595,6 +680,27 @@ export function createTriLCApp(env: TriLCEnv) {
       const agentCount = await getContractResolver(env.tricompanySourcePath).loadAll();
       console.log(`[trilc] contract resolver: ${agentCount} agents loaded`);
 
+      // Build assistant-facing agent roster (injected into system prompt).
+      try {
+        const resolver = getContractResolver();
+        const lines: string[] = [];
+        for (const id of resolver.listAgents()) {
+          const rights = resolver.getDecisionRights(id);
+          const hasPrompt = !!resolver.getSystemPrompt(id);
+          // Use decision_rights to give the model context on what each agent can do
+          const can = rights ? Object.entries(rights).filter(([,v]) => Array.isArray(v) && v.length > 0).map(([k]) => k).join('/') : '';
+          lines.push(`- **${id}**${can ? ` (${can})` : ''}${hasPrompt ? '' : ''}`);
+        }
+        cachedAgentRoster = `\n\n## Available Sub-Agents (use AgentTool)\n\n` +
+          `These agents are loaded from TriCompany. Use AgentTool with subagent_type set to an agent ID when the user asks to delegate work.\n\n` +
+          lines.join('\n') +
+          `\n- **code_explorer** — search codebases` +
+          `\n- **test_runner** — run tests` +
+          `\n- **file_processor** — transform files` +
+          `\n- **code_reviewer** — review code` +
+          `\n\nWhen the user says "let X handle this" or "have Y check it", find the matching agent above and call AgentTool.`;
+      } catch { /* fall through */ }
+
       server = createServer(async (req, res) => {
         // ── /healthz ──
         if (req.url === '/healthz') {
@@ -672,6 +778,49 @@ export function createTriLCApp(env: TriLCEnv) {
           return;
         }
 
+        // ── GET /internal/v1/interactions/pending ──
+        // P3: TUI polls this while a request is in flight to discover
+        // AskUserQuestion / permission prompts awaiting user input.
+        if (req.url === '/internal/v1/interactions/pending' && req.method === 'GET') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, pending: getPendingInteraction() }));
+          return;
+        }
+
+        // ── POST /internal/v1/interactions/answer ──
+        // P3: TUI posts the user's response. Body: { id, response }.
+        // question → response: { answers: Record<string,string>, cancelled?: boolean }
+        // permission → response: 'allow' | 'deny' | 'always'
+        if (req.url === '/internal/v1/interactions/answer' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: { id?: string; response?: unknown } = {};
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'invalid_json' }));
+            return;
+          }
+          if (!body.id) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'id is required' }));
+            return;
+          }
+          const answered = answerInteraction(body.id, body.response);
+          if (!answered) {
+            res.writeHead(409, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'stale_or_missing_interaction' }));
+            return;
+          }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+
         // ── POST /v1/messages ──
         // Anthropic Messages API compatible endpoint.
         // Accepts: model, messages, system, max_tokens, stream, tools
@@ -697,6 +846,16 @@ export function createTriLCApp(env: TriLCEnv) {
           console.log(`[trilc] /v1/messages model=${model}`);
           const maxTurns = parsed.max_tokens ? Math.min(Math.ceil(parsed.max_tokens / 100), 25) : 25;
 
+          // P3: interactive opt-in — the TUI sets interactive:true, enabling
+          // AskUserQuestion waiting and permission prompts for this request.
+          // res 'close' fires on every completion path (stream end, JSON end,
+          // error, client disconnect), guaranteeing the session is ended.
+          const isInteractive = parsed.interactive === true;
+          if (isInteractive) {
+            beginInteractiveSession();
+            res.on('close', () => endInteractiveSession());
+          }
+
           // Convert Anthropic messages to internal Message format
           const internalMessages: Message[] = convertAnthropicMessages(parsed.messages ?? []);
 
@@ -714,11 +873,21 @@ export function createTriLCApp(env: TriLCEnv) {
 
           const loopOptions: AgentLoopOptions = {
             model,
-            systemPrompt: parsed.system || undefined,
+            systemPrompt: parsed.system || defaultSystemPrompt(),
             messages: internalMessages,
             maxTurns,
             tier: 'main',
             cwd: env.cwd,
+            // P3: interactive requests get the dangerous-tool ask rules plus
+            // the TUI permission bridge; non-interactive clients unchanged.
+            ...(isInteractive
+              ? {
+                  permissionRules: INTERACTIVE_ASK_RULES,
+                  onPermissionAsk: askPermissionViaTui,
+                }
+              : {}),
+            // P7: Plan mode tool gating via deps.checkToolPermission
+            deps: buildPlanModeDeps(),
           };
           const wantsStream = parsed.stream !== false;
 
@@ -978,6 +1147,8 @@ export function createTriLCApp(env: TriLCEnv) {
             cwd: parsed.cwd ?? env.cwd,
             permissionMode: parsed.permissionMode,
             permissionRules: parsed.permissionRules,
+            // P7: Plan mode tool gating via deps.checkToolPermission
+            deps: buildPlanModeDeps(),
           };
 
           const wantsSSE =
@@ -1078,7 +1249,7 @@ export function createTriLCApp(env: TriLCEnv) {
           const maxTurns = parsed.max_tokens ? Math.min(Math.ceil(parsed.max_tokens / 100), 25) : 25;
 
           // Convert OpenAI messages to internal format
-          const { systemPrompt, internalMessages } = convertOpenAIMessages(parsed.messages ?? []);
+          const { systemPrompt: oaiSystem, internalMessages } = convertOpenAIMessages(parsed.messages ?? []);
 
           // Register tools from request (if any)
           const toolDefs = convertOpenAITools(parsed.tools ?? []);
@@ -1092,11 +1263,13 @@ export function createTriLCApp(env: TriLCEnv) {
 
           const loopOptions: AgentLoopOptions = {
             model,
-            systemPrompt,
+            systemPrompt: oaiSystem || defaultSystemPrompt(),
             messages: internalMessages,
             maxTurns,
             tier: 'main',
             cwd: env.cwd,
+            // P7: Plan mode tool gating via deps.checkToolPermission
+            deps: buildPlanModeDeps(),
           };
 
           const wantsStream = parsed.stream !== false;
@@ -1210,7 +1383,7 @@ export function createTriLCApp(env: TriLCEnv) {
               sessionStore.createSession({
                 id: sessionId,
                 model,
-                systemPrompt,
+                systemPrompt: oaiSystem || defaultSystemPrompt(),
                 cwd: env.cwd,
               });
               const allMsgs: Array<{
@@ -1284,7 +1457,7 @@ export function createTriLCApp(env: TriLCEnv) {
               sessionStore.createSession({
                 id: sessionId,
                 model: body.model ?? 'deepseek-v4-flash',
-                systemPrompt: 'You are a coding assistant.',
+                systemPrompt: defaultSystemPrompt(),
                 cwd: env.cwd,
                 title: body.title,
               });
@@ -1307,7 +1480,7 @@ export function createTriLCApp(env: TriLCEnv) {
 
         // ── GET /internal/v1/sessions/{id} ──
         // Returns a single session with its messages.
-        if (req.url?.startsWith('/internal/v1/sessions/') && !req.url.endsWith('/stream') && !req.url.endsWith('/cancel') && req.method === 'GET') {
+        if (req.url?.startsWith('/internal/v1/sessions/') && !req.url.endsWith('/stream') && !req.url.endsWith('/cancel') && !req.url.endsWith('/fork') && req.method === 'GET') {
           const sessionIdMatch = req.url.match(/^\/internal\/v1\/sessions\/([^/]+)$/);
           if (sessionIdMatch) {
             const sessionId = sessionIdMatch[1];
@@ -1320,6 +1493,55 @@ export function createTriLCApp(env: TriLCEnv) {
             const messages = sessionStore.getMessages(sessionId);
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ ok: true, session, messages }));
+            return;
+          }
+        }
+
+        // ── POST /internal/v1/sessions/{id}/fork (P6) ──
+        // Forks a conversation session: copies all messages to a new session ID.
+        // CC equivalent: /branch command (session transcript fork, not git worktree).
+        if (req.url?.startsWith('/internal/v1/sessions/') && req.url.endsWith('/fork') && req.method === 'POST') {
+          const forkMatch = req.url.match(/^\/internal\/v1\/sessions\/(.+)\/fork$/);
+          if (forkMatch) {
+            const originalId = forkMatch[1];
+            const original = sessionStore.getSession(originalId);
+            if (!original) {
+              res.writeHead(404, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'not_found', message: `Session ${originalId} not found` }));
+              return;
+            }
+            const messages = sessionStore.getMessages(originalId);
+            if (messages.length === 0) {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'empty', message: 'No messages to fork' }));
+              return;
+            }
+            const { randomUUID } = await import('node:crypto');
+            const forkId = randomUUID();
+            const forkedTitle = (original.title ?? 'Branched conversation') + ' (Branch)';
+            sessionStore.createSession({
+              id: forkId,
+              model: original.model,
+              systemPrompt: original.systemPrompt,
+              cwd: original.cwd,
+              title: forkedTitle,
+            });
+            sessionStore.saveMessages(forkId, messages.map(m => ({
+              role: m.role,
+              content: m.content,
+              toolCalls: m.toolCalls ? JSON.parse(m.toolCalls) : null,
+              toolCallId: m.toolCallId,
+              reasoningContent: m.reasoningContent,
+            })));
+            console.log(`[trilc] forked session ${originalId.slice(0,12)} → ${forkId.slice(0,12)} (${messages.length} messages)`);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: true,
+              originalId,
+              sessionId: forkId,
+              title: forkedTitle,
+              messageCount: messages.length,
+            }));
             return;
           }
         }
@@ -1449,7 +1671,7 @@ export function createTriLCApp(env: TriLCEnv) {
             message: body.message.trim(),
             conversationId: body.conversationId ?? `conv_${Date.now().toString(36)}`,
             model,
-            systemPrompt: body.systemPrompt ?? 'You are a coding assistant. Complete the given task using available tools.',
+            systemPrompt: body.systemPrompt ?? defaultSystemPrompt(),
             context: {
               files: body.context?.files ?? [],
               workspaceRoot: body.context?.workspaceRoot ?? env.cwd,
@@ -1516,7 +1738,7 @@ export function createTriLCApp(env: TriLCEnv) {
           // Build agentLoop options from task entry
           const cwd = entry.context.workspaceRoot || env.cwd;
           const messages: Message[] = [{ role: 'user', content: entry.message }];
-          const systemPrompt = entry.systemPrompt || 'You are a coding assistant. Complete the given task using available tools.';
+          const systemPrompt = entry.systemPrompt || defaultSystemPrompt();
 
           try {
             // Track tool states for progress reporting
@@ -1835,6 +2057,8 @@ interface AnthropicRequest {
   max_tokens?: number;
   stream?: boolean;
   tools?: AnthropicTool[];
+  /** P3: opt-in interactive mode — enables TUI question/permission prompts. */
+  interactive?: boolean;
 }
 
 interface AnthropicMessage {
@@ -2054,6 +2278,64 @@ function convertAnthropicTools(tools: AnthropicTool[]): ToolDefinition[] {
       parameters: t.input_schema ?? { type: 'object', properties: {} },
     },
   }));
+}
+
+/**
+ * Build a platform-aware default system prompt.
+ *
+ * Critical: without this, the model generates Unix-style commands (ls, find,
+ * pwd, cat) which either fail or — worse — hang on Windows. Windows `find.exe`
+ * with Unix args reads from stdin and blocks until timeout. Telling the model
+ * the OS + shell up front prevents the "agent hangs on file search" failure.
+ *
+ * P2-Batch1-#5: Automatically loads CLAUDE.md from current directory if present.
+ * Uses cache-first approach: first call async-loads, subsequent calls use cache.
+ */
+
+// Cached CLAUDE.md content per directory
+let cachedClaudeMd: { cwd: string; content: string | null; loaded: boolean } | null = null;
+
+// Start async load in background (non-blocking)
+function startCLAUDE_mdLoad(cwd: string): void {
+  if (cachedClaudeMd && cachedClaudeMd.cwd === cwd && cachedClaudeMd.loaded) return;
+
+  import('node:fs/promises').then(async ({ readFile }) => {
+    import('node:path').then(async ({ resolve }) => {
+      try {
+        const claudeMdPath = resolve(cwd, 'CLAUDE.md');
+        const content = await readFile(claudeMdPath, 'utf-8');
+        cachedClaudeMd = { cwd, content, loaded: true };
+      } catch {
+        cachedClaudeMd = { cwd, content: null, loaded: true };
+      }
+    });
+  });
+}
+
+function defaultSystemPrompt(cwd?: string): string {
+  const isWin = process.platform === 'win32';
+  const shell = isWin
+    ? 'Windows. Commands run via cmd.exe. Use Windows-compatible commands: dir (not ls), where (not which), type (not cat), findstr (not grep). Avoid Unix-only flags like -name. Prefer PowerShell-style or native Windows commands.'
+    : process.platform === 'darwin'
+      ? 'macOS. Commands run via sh.'
+      : 'Linux. Commands run via sh.';
+
+  const basePrompt = `You are TriCade, a capable coding and task assistant running on ${shell} When you need to run shell commands or search files, generate commands compatible with this platform. Prefer the Read/Glob/Grep tools for file operations instead of raw shell commands when available.`;
+
+  // P2-Batch1-#5: Trigger async load if needed
+  const targetCwd = cwd || process.cwd();
+  if (!cachedClaudeMd || cachedClaudeMd.cwd !== targetCwd) {
+    // Reset cache and start loading
+    cachedClaudeMd = { cwd: targetCwd, content: null, loaded: false };
+    startCLAUDE_mdLoad(targetCwd);
+  }
+
+  // Append cached content if available
+  if (cachedClaudeMd && cachedClaudeMd.content) {
+    return `${basePrompt}\n\n## Project Instructions (from CLAUDE.md)\n\n${cachedClaudeMd.content}`;
+  }
+
+  return basePrompt + cachedAgentRoster;
 }
 
 /**

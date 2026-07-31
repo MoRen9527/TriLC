@@ -1,7 +1,8 @@
 // ── Markdown renderer (Ink) ──
 // Parses markdown via marked.lexer → recursive token tree → Ink Text/Box components.
+// P2-Batch1-#1: diff 渲染 — 解析 tool_result 中的 unified diff 格式，用颜色渲染 +/- 行
 import React from 'react';
-import { Box, Text } from 'ink';
+import { Box, Text } from '../fork.js';
 import { lexer } from 'marked';
 
 // marked internally HTML-escapes text tokens (&quot; &amp; &lt; &gt; &#39;).
@@ -13,6 +14,64 @@ function decodeEntities(s: string): string {
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&#39;/g, "'");
+}
+
+// ── Diff detection and parsing (P2-Batch1-#1) ──
+// Detects unified diff format: lines starting with +, -, @@, or space in context
+function isDiffContent(content: string): boolean {
+  const lines = content.split('\n');
+  let diffLineCount = 0;
+  // Need at least 3 diff-signature lines to consider it a diff
+  for (const line of lines) {
+    if (line.startsWith('+++ ') || line.startsWith('--- ')) return true;
+    if (line.startsWith('@@ ')) return true;
+    if (line.startsWith('+') || line.startsWith('-')) diffLineCount++;
+  }
+  return diffLineCount >= 3;
+}
+
+// Parse unified diff into rendered elements
+// P2-fix: cap rendered lines to prevent TUI stalls on very large diffs.
+const MAX_DIFF_LINES = 200;
+function renderDiff(content: string, key: string): React.ReactElement {
+  const lines = content.split('\n');
+  const truncated = lines.length > MAX_DIFF_LINES;
+  const visible = truncated ? lines.slice(0, MAX_DIFF_LINES) : lines;
+  const elements: React.ReactElement[] = [];
+
+  for (let i = 0; i < visible.length; i++) {
+    const line = visible[i]!;
+    const lineKey = `${key}-diff-${i}`;
+
+    if (line.startsWith('+++ ') || line.startsWith('--- ')) {
+      // File header — dim cyan
+      elements.push(React.createElement(Text, { key: lineKey, dimColor: true, color: 'cyan' }, line));
+    } else if (line.startsWith('@@ ')) {
+      // Hunk header — dim yellow
+      elements.push(React.createElement(Text, { key: lineKey, dimColor: true, color: 'yellow' }, line));
+    } else if (line.startsWith('+')) {
+      // Added line — green
+      elements.push(React.createElement(Text, { key: lineKey, color: 'green' }, line));
+    } else if (line.startsWith('-')) {
+      // Removed line — red
+      elements.push(React.createElement(Text, { key: lineKey, color: 'red' }, line));
+    } else if (line.startsWith(' ')) {
+      // Context line — dim
+      elements.push(React.createElement(Text, { key: lineKey, dimColor: true }, line));
+    } else {
+      // Other lines (e.g., diff headers) — normal dim
+      elements.push(React.createElement(Text, { key: lineKey, dimColor: true }, line));
+    }
+  }
+
+  if (truncated) {
+    elements.push(React.createElement(Text, { key: `${key}-diff-trunc`, dimColor: true, italic: true },
+      `… ${lines.length - MAX_DIFF_LINES} more lines truncated (diff too large)`));
+  }
+
+  return React.createElement(Box, { flexDirection: 'column', marginLeft: 1, key },
+    ...elements,
+  );
 }
 
 // ── Inline token flattening ──
@@ -76,6 +135,12 @@ function renderBlockToken(
       const codeText = (token.text as string) ?? '';
       const lang = (token.lang as string) || '';
       const lines = codeText.split('\n');
+
+      // P2-Batch1-#1: Detect diff in code blocks
+      if (lang === 'diff' || (lang === '' && isDiffContent(codeText))) {
+        return renderDiff(codeText, key);
+      }
+
       return React.createElement(Box, { flexDirection: 'column', marginLeft: 1, key },
         lang ? React.createElement(Text, { dimColor: true, key: `${key}-lang` }, `  ${lang}`) : null,
         ...lines.map((line, li) =>
@@ -155,8 +220,18 @@ function renderBlockToken(
 }
 
 // ── Component ──
-export default function Markdown({ content }: { content: string }) {
+interface MarkdownProps {
+  content: string;
+  isToolResult?: boolean; // P2-Batch1-#1: 标记是否为 tool_result 内容
+}
+
+export default function Markdown({ content, isToolResult }: MarkdownProps) {
   if (!content) return React.createElement(Text, null, '');
+
+  // P2-Batch1-#1: 优先检测 tool_result 中的 diff（tool_result 通常不在 markdown 代码块中）
+  if (isToolResult && isDiffContent(content)) {
+    return renderDiff(content, 'md-tool-result-diff');
+  }
 
   try {
     const tokens = lexer(content);

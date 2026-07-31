@@ -1,18 +1,31 @@
-// ── useBlink hook (CC-compatible, no CC compiler runtime) ──
-// Toggles a boolean on an interval — used by ToolCallLine for ● animation.
-import { useState, useEffect } from 'react';
+// ── useBlink hook (CC-aligned: returns [ref, isVisible]) ──
+// Based on CC 2.1.88 vendor/cc-tui/hooks/useBlink.ts
+// Adapted: uses setInterval (no ClockContext in TriLC Ink setup),
+//           but returns [ref, isVisible] matching CC API signature.
+import { useState, useEffect, useRef, useCallback } from 'react';
+import type { DOMElement } from '../fork.js';
 
-export function useBlink(active: boolean, interval = 800): boolean {
-  const [visible, setVisible] = useState(true);
+const BLINK_INTERVAL_MS = 600;
+
+export function useBlink(
+  enabled: boolean,
+  intervalMs: number = BLINK_INTERVAL_MS,
+): [ref: (element: DOMElement | null) => void, isVisible: boolean] {
+  const [isVisible, setIsVisible] = useState(true);
+  const elementRef = useRef<DOMElement | null>(null);
+
+  const ref = useCallback((element: DOMElement | null) => {
+    elementRef.current = element;
+  }, []);
 
   useEffect(() => {
-    if (!active) {
-      setVisible(true); // solid when not blinking
+    if (!enabled) {
+      setIsVisible(true); // solid when not blinking
       return;
     }
-    const id = setInterval(() => setVisible(v => !v), interval);
+    const id = setInterval(() => setIsVisible(v => !v), intervalMs);
     return () => clearInterval(id);
-  }, [active, interval]);
+  }, [enabled, intervalMs]);
 
-  return visible;
+  return [ref, isVisible];
 }

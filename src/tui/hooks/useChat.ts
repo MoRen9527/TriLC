@@ -1,15 +1,41 @@
 // ── Chat controller (Ink, Anthropic /v1/messages) ──
 // Persists sessions to daemon /internal/v1/sessions on each complete exchange.
+// REGR-005: ContentBlock + blocks[] enable tool-call streaming (ordered insertion).
 import { useState, useCallback, useRef } from 'react';
 import { connectAnthropicSSE } from './useAnthropicSSE.js';
 
 const SESSION_ENDPOINT = 'http://localhost:8711/internal/v1/sessions';
 const ENDPOINT = 'http://localhost:8711/v1/messages';
-const MODEL = 'deepseek-v4-flash';
+const DEFAULT_MODEL = 'deepseek-v4-flash';
 
 export type RequestState = 'idle' | 'waitingForFirstToken' | 'streaming';
 export interface ToolCall { id: string; name: string; arguments: string; status: 'pending' | 'done' | 'blocked'; }
-export interface Message { role: 'user' | 'assistant'; content: string; isStreaming?: boolean; toolCalls?: ToolCall[]; thinking?: string; }
+
+// ── ContentBlock: ordered block model for streaming tool insertion ──
+// REPLACES the flat content + toolCalls model with interleaved blocks.
+// Backward compat: if msg.blocks is empty/undefined, fall back to content + toolCalls.
+export interface ContentBlock {
+  type: 'text' | 'tool_use' | 'tool_result';
+  index: number;
+  // text block
+  text?: string;
+  // tool_use block
+  toolId?: string;
+  toolName?: string;
+  toolInput?: string;
+  toolStatus?: 'pending' | 'done' | 'error';
+  // tool_result block
+  toolResultContent?: string;
+}
+
+export interface Message {
+  role: 'user' | 'assistant';
+  content: string; // keep for backward compat
+  blocks?: ContentBlock[]; // NEW: ordered content blocks (REGR-005)
+  isStreaming?: boolean;
+  toolCalls?: ToolCall[]; // keep for backward compat
+  thinking?: string;
+}
 
 async function saveSession(sessionId: string | null, messages: Message[], model: string): Promise<string> {
   try {
@@ -45,8 +71,14 @@ export function useChat() {
   const [requestState, setRequestState] = useState<RequestState>('idle');
   const [error, setError] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [inputTokens, setInputTokens] = useState(0);
+  const [outputTokens, setOutputTokens] = useState(0);
+  const [model, setModelState] = useState<string>(DEFAULT_MODEL);
   const abortRef = useRef<(() => void) | null>(null);
   const doneRef = useRef(false);
+  const messagesRef = useRef<Message[]>([]);
+  // Sync ref so send() can read latest messages without stale closure
+  messagesRef.current = messages;
 
   const abort = useCallback(() => {
     abortRef.current?.(); abortRef.current = null; doneRef.current = true;
@@ -59,22 +91,23 @@ export function useChat() {
 
     abortRef.current?.(); setError(null); doneRef.current = false;
 
-    // Build conversation context: include any resumed messages
+    // Build conversation context from ALL existing messages (not just resume).
+    // Previous code dropped history on every send() — fixed by preserving the
+    // current message list and appending the new user + streaming assistant.
+    const base = resumeMessages ?? messagesRef.current;
     const apiMessages: Array<{ role: string; content: string }> = [];
-    if (resumeMessages) {
-      for (const msg of resumeMessages) {
-        if (msg.role === 'user' || msg.role === 'assistant') {
-          apiMessages.push({ role: msg.role, content: msg.content });
-        }
+    for (const msg of base) {
+      if (msg.isStreaming) continue;
+      if (msg.role === 'user' || msg.role === 'assistant') {
+        apiMessages.push({ role: msg.role, content: msg.content || '' });
       }
     }
     apiMessages.push({ role: 'user', content: text });
 
-    // Initial state: resume messages + new user message + empty assistant
     const initialMessages: Message[] = [
-      ...(resumeMessages ?? []),
+      ...base.filter(m => !m.isStreaming),
       { role: 'user', content: text },
-      { role: 'assistant', content: '', isStreaming: true, toolCalls: [] },
+      { role: 'assistant', content: '', isStreaming: true, toolCalls: [], blocks: [] },
     ];
 
     setMessages(initialMessages);
@@ -85,7 +118,53 @@ export function useChat() {
 
     const cancel = connectAnthropicSSE({
       endpoint: ENDPOINT,
-      body: { model: MODEL, max_tokens: 4096, messages: apiMessages, stream: true },
+      // P3: interactive:true opts this client into AskUserQuestion waiting
+      // and permission prompts via the daemon interaction bridge.
+      body: { model, max_tokens: 4096, messages: apiMessages, stream: true, interactive: true },
+
+      // ── REGR-005: onContentBlockStart — append new block to streaming message ──
+      onContentBlockStart: (blockType, index) => {
+        setMessages((prev) => {
+          const copy = [...prev];
+          const last = copy[copy.length - 1];
+          if (last?.role === 'assistant') {
+            const blocks = [...(last.blocks || [])];
+            const newBlock: ContentBlock = {
+              type: blockType,
+              index,
+              ...(blockType === 'tool_use' ? { toolStatus: 'pending' as const, toolInput: '' } : {}),
+              ...(blockType === 'text' ? { text: '' } : {}),
+            };
+            blocks.push(newBlock);
+            copy[copy.length - 1] = { ...last, blocks };
+          }
+          return copy;
+        });
+      },
+
+      // ── REGR-005: onContentBlockDelta — accumulate text / input_json into blocks ──
+      onContentBlockDelta: (index, delta) => {
+        setMessages((prev) => {
+          const copy = [...prev];
+          const last = copy[copy.length - 1];
+          if (last?.role === 'assistant' && last.blocks) {
+            const blocks = [...last.blocks];
+            const blockIdx = blocks.findIndex(b => b.index === index);
+            if (blockIdx !== -1) {
+              const block = { ...blocks[blockIdx]! };
+              if (delta.type === 'text_delta' && delta.text !== undefined) {
+                block.text = (block.text || '') + delta.text;
+              } else if (delta.type === 'input_json_delta' && delta.partial_json !== undefined) {
+                block.toolInput = (block.toolInput || '') + delta.partial_json;
+              }
+              blocks[blockIdx] = block;
+            }
+            copy[copy.length - 1] = { ...last, blocks };
+          }
+          return copy;
+        });
+      },
+
       onContentDelta: (token) => {
         streamContent += token;
         setRequestState('streaming');
@@ -100,21 +179,38 @@ export function useChat() {
           return copy;
         });
       },
+      onTokens: (inTok, outTok) => {
+        // Accumulate (not overwrite) so /cost reflects the whole session, not
+        // just the last message's usage.
+        if (inTok > 0) setInputTokens((prev) => prev + inTok);
+        if (outTok > 0) setOutputTokens((prev) => prev + outTok);
+      },
       onToolUse: (id, name, input) => {
         setMessages((prev) => {
           const copy = [...prev];
           const last = copy[copy.length - 1];
           if (last?.role === 'assistant') {
+            // ── Update toolCalls (backward compat) ──
             const prevCalls = last.toolCalls || [];
-            // Flip prior pending calls to done, then append the new pending call.
-            // New array + new last object so memo shallow compare detects change.
             const newCalls = [
               ...prevCalls.map((tc) =>
                 tc.status === 'pending' ? { ...tc, status: 'done' as const } : tc,
               ),
               { id, name, arguments: input, status: 'pending' as const },
             ];
-            copy[copy.length - 1] = { ...last, toolCalls: newCalls };
+
+            // ── Update blocks: find latest tool_use block without toolId ──
+            const blocks = last.blocks ? [...last.blocks] : undefined;
+            if (blocks) {
+              for (let i = blocks.length - 1; i >= 0; i--) {
+                if (blocks[i]!.type === 'tool_use' && !blocks[i]!.toolId) {
+                  blocks[i] = { ...blocks[i]!, toolId: id, toolName: name };
+                  break;
+                }
+              }
+            }
+
+            copy[copy.length - 1] = { ...last, toolCalls: newCalls, blocks };
           }
           return copy;
         });
@@ -127,6 +223,13 @@ export function useChat() {
           const copy = [...prev];
           const last = copy[copy.length - 1];
           if (last?.role === 'assistant') {
+            // Flip pending blocks to done
+            const blocks = last.blocks?.map((b) =>
+              b.type === 'tool_use' && b.toolStatus === 'pending'
+                ? { ...b, toolStatus: 'done' as const }
+                : b,
+            );
+
             // New object with finalized fields; flips any leftover pending tool
             // calls to done. Required for memo shallow compare to detect change.
             copy[copy.length - 1] = {
@@ -136,12 +239,13 @@ export function useChat() {
               toolCalls: last.toolCalls?.map((tc) =>
                 tc.status === 'pending' ? { ...tc, status: 'done' as const } : tc,
               ),
+              blocks,
             };
           }
           // Persist session asynchronously
           setSessionId((currentSid) => {
             const msgs = copy.filter((m) => !m.isStreaming);
-            saveSession(currentSid, msgs, MODEL).then((sid) => {
+            saveSession(currentSid, msgs, model).then((sid) => {
               if (sid && sid !== currentSid) setSessionId(sid);
             }).catch(() => {});
             return currentSid;
@@ -159,7 +263,7 @@ export function useChat() {
         setMessages((prev) => {
           setSessionId((currentSid) => {
             const msgs = prev.filter((m) => !m.isStreaming);
-            saveSession(currentSid, msgs, MODEL).catch(() => {});
+            saveSession(currentSid, msgs, model).catch(() => {});
             return currentSid;
           });
           return prev;
@@ -168,7 +272,9 @@ export function useChat() {
       },
     });
     abortRef.current = cancel;
-  }, [requestState]);
+    // Include `model` so switching via /model doesn't leave the SSE body
+    // pointing at the previous model (stale closure off-by-one).
+  }, [requestState, model]);
 
   // ── Load session for resume ──
   const loadSession = useCallback(async (sid: string): Promise<{ messages: Message[]; sessionId: string } | null> => {
@@ -199,5 +305,9 @@ export function useChat() {
     setMessages((prev) => [...prev, { role: 'assistant', content, isStreaming: false }]);
   }, []);
 
-  return { messages, send, isLoading: requestState !== 'idle', requestState, error, abort, sessionId: getSessionId, loadSession, clearMessages, addSystemMessage };
+  const setModel = useCallback((newModel: string) => {
+    setModelState(newModel);
+  }, []);
+
+  return { messages, send, isLoading: requestState !== 'idle', requestState, error, abort, sessionId: getSessionId, loadSession, clearMessages, addSystemMessage, inputTokens, outputTokens, model, setModel };
 }

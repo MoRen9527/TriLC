@@ -214,10 +214,17 @@ async function fetchKeysFromApi(apiUrl: string, apiToken?: string): Promise<{ ke
 
 export function getKeyCache(): KeyCache | null {
   if (!_keyCache) return null;
-  // Check expiry (TK-017: return null on expiry, triggering graceful degradation)
-  if (Date.now() > _keyCache.expiresAt) {
-    console.warn('[trilc:keys] key cache expired, will attempt refresh');
-    return null; // Return null → triggers graceful degradation in chat handler
+  // TK-017-fix: expired cache is still usable as fallback when TriModel is offline.
+  // Only return null if cache is excessively stale (>7 days past expiry).
+  // The design intent: TriModel provides keys online; trilc works offline with cache.
+  const expired = Date.now() > _keyCache.expiresAt;
+  const maxStaleMs = 7 * 24 * 60 * 60 * 1000; // 7 days
+  if (expired && Date.now() - _keyCache.expiresAt > maxStaleMs) {
+    console.warn('[trilc:keys] key cache excessively stale (>7d), discarding');
+    return null;
+  }
+  if (expired) {
+    console.warn(`[trilc:keys] key cache expired ${Math.round((Date.now() - _keyCache.expiresAt) / 3600_000)}h ago — using stale cache until refresh succeeds`);
   }
   return _keyCache;
 }

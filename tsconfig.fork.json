@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist",
+    "strict": false,
+    "noImplicitAny": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noImplicitReturns": false,
+    "allowUnreachableCode": true
+  },
+  "include": [
+    "vendor/claude-code-tui/**/*.ts",
+    "vendor/claude-code-tui/**/*.tsx",
+    "vendor/claude-code-tui/react-compiler-runtime.d.ts"
+  ]
+}
