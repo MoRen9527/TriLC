@@ -10,11 +10,20 @@ export type LocalBusEvent =
   | { type: 'task:running'; taskId: string }
   | { type: 'task:succeeded'; taskId: string; result: unknown }
   | { type: 'task:failed'; taskId: string; error: string }
-  | { type: 'task:cancelled'; taskId: string }           // ← S7 新增
+  | { type: 'task:cancelled'; taskId: string }
   | { type: 'node:connected' }
   | { type: 'node:degraded' }
   | { type: 'node:local' }
-  | { type: 'agent:event'; event: Record<string, unknown> };
+  | { type: 'agent:event'; event: Record<string, unknown> }
+  // ── Heartbeat events ──
+  | { type: 'heartbeat:sent'; nodeId: string }
+  | { type: 'heartbeat:received'; nodeId: string }
+  | { type: 'heartbeat:failed'; error: string }
+  // ── Cron events ──
+  | { type: 'cron:sweep'; count: number }
+  | { type: 'cron:error'; error: string }
+  | { type: 'cron:degraded'; consecutiveFailures: number }
+  | { type: 'cron:recovered' };
 
 // Singleton shared by daemon, planner, and event-queue
 export const localBus = new EventEmitter<{ event: [LocalBusEvent] }>();

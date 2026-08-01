@@ -48,6 +48,10 @@ import {
   rememberAlwaysAllow,
   requestInteraction,
 } from './interactions.js';
+import { createHeartbeatWake } from '../heartbeat/heartbeat-wake.js';
+import { createHeartbeatRunner, type TriLCHeartbeatRunner, type HeartbeatAgentConfig } from '../heartbeat/heartbeat-runner.js';
+import { createSessionReaper } from '../cron/session-reaper.js';
+import { createMinimalCronEngine, type MinimalCronEngine } from '../cron/service.js';
 
 // Cached roster of available sub-agents (built at daemon startup, injected
 // into system prompts so the model knows by name which agents it can invoke
@@ -150,29 +154,6 @@ interface ConnectionManagerOptions {
   applyReplayResponse?: (connectionId: string, res: ReplayResponse, events: ReplayEventItem[]) => void;
 }
 
-// ── Heartbeat Wake Reason Priority (absorbed from openclaw) ──
-const WAKE_PRIORITY = {
-  RETRY: 0,
-  INTERVAL: 1,
-  DEFAULT: 2,
-  ACTION: 3,
-} as const;
-
-type WakeReasonKind = 'retry' | 'interval' | 'default' | 'action';
-
-interface PendingWake {
-  reason: WakeReasonKind;
-  priority: number;
-  requestedAt: number;
-}
-
-function resolveWakePriority(reason?: string): number {
-  if (reason === 'retry') return WAKE_PRIORITY.RETRY;
-  if (reason === 'interval') return WAKE_PRIORITY.INTERVAL;
-  if (reason === 'action') return WAKE_PRIORITY.ACTION;
-  return WAKE_PRIORITY.DEFAULT;
-}
-
 // ── ConnectionManager ──
 
 class ConnectionManager {
@@ -192,16 +173,8 @@ class ConnectionManager {
   private _applyReplayResponse: (connectionId: string, res: ReplayResponse, events: ReplayEventItem[]) => void;
   private recoveryCallback: (() => void) | null = null;
 
-  // ── Heartbeat Wake State (absorbed from openclaw heartbeat-wake) ──
-  private heartbeatsEnabled = true;
-  private pendingWake: PendingWake | null = null;
-  private wakeTimer: NodeJS.Timeout | null = null;
-  private wakeTimerDueAt: number | null = null;
-  private wakeTimerKind: 'normal' | 'retry' | null = null;
-  private wakeRunning = false;
-  private wakeScheduled = false;
-  private static readonly COALESCE_MS = 250;
-  private static readonly RETRY_COOLDOWN_MS = 1_000;
+  // ── Heartbeat Wake (CTO-008-M Phase 1: extracted to heartbeat-wake module) ──
+  private wake = createHeartbeatWake();
 
   constructor(trimcBaseUrl: string, opts: ConnectionManagerOptions) {
     this.trimcBaseUrl = trimcBaseUrl;
@@ -277,14 +250,24 @@ class ConnectionManager {
 
   startHealthCheckLoop(): void {
     if (this.healthCheckTimer) return;
+
+    // Register wake handler that delegates to checkHealth
+    this.wake.setWakeHandler(async () => {
+      const ok = await this.checkHealth();
+      return ok
+        ? { status: "ran" as const, durationMs: 0 }
+        : { status: "failed" as const, reason: "health check failed" };
+    });
+
     this.healthCheckTimer = setInterval(() => {
-      if (this.heartbeatsEnabled) {
-        this.checkHealth().catch(() => {});
+      if (this.wake.isEnabled()) {
+        this.wake.requestHeartbeatNow({ reason: 'interval' });
       }
     }, this.healthCheckIntervalMs);
+
     // Immediate first check
-    if (this.heartbeatsEnabled) {
-      this.checkHealth().catch(() => {});
+    if (this.wake.isEnabled()) {
+      this.wake.requestHeartbeatNow({ reason: 'interval', coalesceMs: 0 });
     }
   }
 
@@ -293,127 +276,34 @@ class ConnectionManager {
       clearInterval(this.healthCheckTimer);
       this.healthCheckTimer = null;
     }
-    // Clean up wake timer
-    if (this.wakeTimer) {
-      clearTimeout(this.wakeTimer);
-      this.wakeTimer = null;
-      this.wakeTimerDueAt = null;
-      this.wakeTimerKind = null;
-    }
-    this.pendingWake = null;
-    this.wakeScheduled = false;
-    this.wakeRunning = false;
+    // Clear wake handler — handles all internal timer/pending/state cleanup
+    this.wake.setWakeHandler(null);
   }
 
-  // ── Heartbeat Wake (absorbed from openclaw heartbeat-wake) ──
+  // ── Heartbeat Wake (delegated to heartbeat-wake module) ──
 
   /** Enable or disable heartbeat checks (periodic + on-demand). */
   setHeartbeatsEnabled(enabled: boolean): void {
-    this.heartbeatsEnabled = enabled;
-    if (!enabled) {
-      // Clear pending wake state
-      if (this.wakeTimer) {
-        clearTimeout(this.wakeTimer);
-        this.wakeTimer = null;
-        this.wakeTimerDueAt = null;
-        this.wakeTimerKind = null;
-      }
-      this.pendingWake = null;
-      this.wakeScheduled = false;
-    }
+    this.wake.setEnabled(enabled);
   }
 
   /** Check if heartbeats are enabled. */
   areHeartbeatsEnabled(): boolean {
-    return this.heartbeatsEnabled;
+    return this.wake.isEnabled();
   }
 
   /**
-   * Request an immediate heartbeat check with coalescing.
-   * Multiple rapid calls within COALESCE_MS (250ms) are merged.
+   * Request an immediate heartbeat check with coalescing (delegated to wake module).
+   * Multiple rapid calls within coalesce window (250ms) are merged.
    * Higher priority reasons preempt lower ones.
-   *
-   * @param reason - Wake reason: 'action' (highest), 'default', 'interval', 'retry' (lowest)
-   * @param coalesceMs - Coalesce window override (default: 250ms)
    */
   requestHeartbeatNow(opts?: { reason?: string; coalesceMs?: number }): void {
-    if (!this.heartbeatsEnabled) return;
-
-    const reason = opts?.reason ?? 'action';
-    const priority = resolveWakePriority(reason);
-    const wake: PendingWake = { reason: reason as WakeReasonKind, priority, requestedAt: Date.now() };
-
-    // Merge: keep higher priority, or newer at same priority
-    if (!this.pendingWake || priority > this.pendingWake.priority ||
-        (priority === this.pendingWake.priority && wake.requestedAt >= this.pendingWake.requestedAt)) {
-      this.pendingWake = wake;
-    }
-
-    this._scheduleWake(opts?.coalesceMs ?? ConnectionManager.COALESCE_MS, 'normal');
+    this.wake.requestHeartbeatNow(opts);
   }
 
   /** Check if a wake is pending (timer scheduled or queued). */
   hasPendingWake(): boolean {
-    return this.pendingWake !== null || this.wakeTimer !== null || this.wakeScheduled;
-  }
-
-  // ── Internal wake scheduling ──
-
-  private _scheduleWake(coalesceMs: number, kind: 'normal' | 'retry'): void {
-    const delay = Number.isFinite(coalesceMs) ? Math.max(0, coalesceMs) : ConnectionManager.COALESCE_MS;
-    const dueAt = Date.now() + delay;
-
-    if (this.wakeTimer) {
-      // Retry cooldown is a hard minimum — prevents collapse
-      if (this.wakeTimerKind === 'retry') return;
-      // Keep existing timer if it fires sooner or at same time
-      if (typeof this.wakeTimerDueAt === 'number' && this.wakeTimerDueAt <= dueAt) return;
-      // New request fires sooner — preempt
-      clearTimeout(this.wakeTimer);
-      this.wakeTimer = null;
-      this.wakeTimerDueAt = null;
-      this.wakeTimerKind = null;
-    }
-
-    this.wakeTimerDueAt = dueAt;
-    this.wakeTimerKind = kind;
-    this.wakeTimer = setTimeout(() => {
-      this.wakeTimer = null;
-      this.wakeTimerDueAt = null;
-      this.wakeTimerKind = null;
-      this.wakeScheduled = false;
-      this._executeWake().catch(() => {});
-    }, delay);
-    this.wakeTimer.unref?.();
-  }
-
-  private async _executeWake(): Promise<void> {
-    const wake = this.pendingWake;
-    this.pendingWake = null;
-
-    if (this.wakeRunning) {
-      // Already running — reschedule
-      if (wake) {
-        this.pendingWake = wake;
-        this._scheduleWake(ConnectionManager.COALESCE_MS, 'normal');
-      }
-      this.wakeScheduled = true;
-      return;
-    }
-
-    this.wakeRunning = true;
-    try {
-      await this.checkHealth();
-    } catch {
-      // checkHealth handles its own error logging
-    } finally {
-      this.wakeRunning = false;
-      // If more wakes arrived during execution, schedule another round
-      if (this.pendingWake || this.wakeScheduled) {
-        this.wakeScheduled = false;
-        this._scheduleWake(ConnectionManager.RETRY_COOLDOWN_MS, 'retry');
-      }
-    }
+    return this.wake.hasPendingWake();
   }
 
   // Register callback for post-recovery actions (e.g., reset connectionId)
@@ -584,10 +474,41 @@ function buildSummary(entry: TaskStreamEntry): string {
 
 export function createTriLCApp(env: TriLCEnv) {
   let server: Server | null = null;
+  let daemonStartTime = 0;
   const eventQueue = createEventQueue({
     dbPath: `${env.dataDir}/event-queue.db`,
   });
   const sessionStore = createSessionStore(`${env.dataDir}/sessions.db`);
+
+  // ── Heartbeat Runner ──
+  const heartbeatRunner: TriLCHeartbeatRunner = createHeartbeatRunner({
+    sessionStore: {
+      createSession(s) { sessionStore.createSession(s); },
+      saveMessages(id, msgs) { sessionStore.saveMessages(id, msgs as any); },
+      updateSessionStatus(id, status) { sessionStore.updateSessionStatus(id, status); },
+    },
+    cwd: env.cwd,
+  });
+
+  // ── Session Reaper ──
+  const sessionReaper = createSessionReaper({
+    storePath: `${env.dataDir}/sessions.db`,
+  });
+
+  // ── Minimal Cron Engine ──
+  const cronEngine: MinimalCronEngine = createMinimalCronEngine({
+    dataDir: env.dataDir,
+    sessionStore: {
+      createSession(s) { sessionStore.createSession(s); },
+      saveMessages(id, msgs) { sessionStore.saveMessages(id, msgs as any); },
+      updateSessionStatus(id, status) { sessionStore.updateSessionStatus(id, status); },
+    },
+    cwd: env.cwd,
+    onJobTrigger(job) {
+      publish({ type: 'cron:sweep', count: 1 });
+      console.log(`[trilc:cron] job triggered: ${job.name}`);
+    },
+  });
   const taskStreams = new Map<string, TaskStreamEntry>();
   let connectionId = '';
   const resetConnectionId = () => {
@@ -661,6 +582,7 @@ export function createTriLCApp(env: TriLCEnv) {
 
   return {
     async start(): Promise<void> {
+      daemonStartTime = Date.now();
       connMgr.startHealthCheckLoop();
 
       // P4.2: Register shell_exec tool backed by ProcessSupervisor
@@ -705,11 +627,29 @@ export function createTriLCApp(env: TriLCEnv) {
         // ── /healthz ──
         if (req.url === '/healthz') {
           const triMcOnline = connMgr.currentState === 'connected';
+          const uptime = daemonStartTime > 0
+            ? Math.floor((Date.now() - daemonStartTime) / 1000)
+            : 0;
+          let activeTasks = 0;
+          for (const entry of taskStreams.values()) {
+            if (entry.status === 'pending' || entry.status === 'running') activeTasks++;
+          }
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify({
             ok: true,
             service: 'trilc',
             trimc: triMcOnline ? 'connected' : 'degraded',
+            uptime,
+            activeTasks,
+            queueSize: eventQueue.getQueueSize(),
+            version: env.version,
+            daemon: {
+              mode: process.platform === 'win32' ? 'schtasks' : process.platform === 'darwin' ? 'launchd' : 'systemd',
+            },
+            cron: {
+              enabled: cronEngine.isRunning,
+              jobCount: cronEngine.jobCount,
+            },
           }));
           return;
         }
@@ -1971,6 +1911,150 @@ export function createTriLCApp(env: TriLCEnv) {
           return;
         }
 
+        // ── POST /internal/v1/cron/jobs ──
+        // Add a new cron job. Body: CronJobCreate JSON.
+        if (req.url === '/internal/v1/cron/jobs' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) { chunks.push(chunk); }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: Record<string, unknown> = {};
+          try { body = JSON.parse(raw); } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'invalid_json' }));
+            return;
+          }
+          try {
+            const job = await cronEngine.addJob(body as any);
+            res.writeHead(201, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, job }));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: msg }));
+          }
+          return;
+        }
+
+        // ── GET /internal/v1/cron/jobs ──
+        // List all cron jobs.
+        if (req.url === '/internal/v1/cron/jobs' && req.method === 'GET') {
+          try {
+            const jobs = await cronEngine.listJobs();
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, jobs, count: jobs.length }));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: msg }));
+          }
+          return;
+        }
+
+        // ── PATCH /internal/v1/cron/jobs/{id} ──
+        // Update a cron job. Body: CronJobPatch JSON.
+        if (req.url?.startsWith('/internal/v1/cron/jobs/') && req.method === 'PATCH') {
+          const jobIdMatch = req.url.match(/^\/internal\/v1\/cron\/jobs\/(.+)$/);
+          if (!jobIdMatch) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'invalid_path' }));
+            return;
+          }
+          const jobId = decodeURIComponent(jobIdMatch[1]);
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) { chunks.push(chunk); }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: Record<string, unknown> = {};
+          try { body = JSON.parse(raw); } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'invalid_json' }));
+            return;
+          }
+          try {
+            const job = await cronEngine.updateJob(jobId, body as any);
+            if (!job) {
+              res.writeHead(404, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'not_found' }));
+              return;
+            }
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, job }));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: msg }));
+          }
+          return;
+        }
+
+        // ── DELETE /internal/v1/cron/jobs/{id} ──
+        // Remove a cron job.
+        if (req.url?.startsWith('/internal/v1/cron/jobs/') && req.method === 'DELETE') {
+          const jobIdMatch = req.url.match(/^\/internal\/v1\/cron\/jobs\/(.+)$/);
+          if (!jobIdMatch) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'invalid_path' }));
+            return;
+          }
+          const jobId = decodeURIComponent(jobIdMatch[1]);
+          try {
+            await cronEngine.removeJob(jobId);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: msg }));
+          }
+          return;
+        }
+
+        // ── POST /internal/v1/cron/jobs/{id}/run ──
+        // Immediately run a cron job. Body: { force?: boolean }
+        if (req.url?.startsWith('/internal/v1/cron/jobs/') && req.url.endsWith('/run') && req.method === 'POST') {
+          const jobIdMatch = req.url.match(/^\/internal\/v1\/cron\/jobs\/(.+)\/run$/);
+          if (!jobIdMatch) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'invalid_path' }));
+            return;
+          }
+          const jobId = decodeURIComponent(jobIdMatch[1]);
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) { chunks.push(chunk); }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: { force?: boolean } = {};
+          try { body = JSON.parse(raw); } catch { /* empty body OK */ }
+          try {
+            const result = await cronEngine.runJob(jobId, body.force);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: msg }));
+          }
+          return;
+        }
+
+        // ── GET /internal/v1/cron/log ──
+        // Query: ?jobId=<id>&limit=<n>. Without jobId returns recent from all jobs.
+        if (req.url?.startsWith('/internal/v1/cron/log') && req.method === 'GET') {
+          const urlObj = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
+          const jobId = urlObj.searchParams.get('jobId');
+          const limit = parseInt(urlObj.searchParams.get('limit') ?? '20', 10);
+          try {
+            const logs = jobId
+              ? await cronEngine.getExecutionLogs(jobId, limit)
+              : await cronEngine.getRecentExecutionLogs(limit);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, logs, count: logs.length }));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: msg }));
+          }
+          return;
+        }
+
         // ── POST /shutdown ──
         // Graceful shutdown endpoint for Windows-compatible daemon stop.
         // On Windows, SIGTERM is a hard kill; this provides a clean alternative.
@@ -2006,6 +2090,29 @@ export function createTriLCApp(env: TriLCEnv) {
       // S7: Start mirror pusher (event-driven + 30s heartbeat)
       mirrorPusher.start();
 
+      // ── Heartbeat Runner: default heartbeat agent ──
+      const DEFAULT_HEARTBEAT_AGENT: HeartbeatAgentConfig = {
+        agentId: "default-heartbeat",
+        intervalMs: 30 * 60 * 1000,
+        model: "deepseek-v4-flash",
+        maxTurns: 10,
+        systemPrompt: "You are a system heartbeat agent. Report current status concisely.",
+        userMessage: "Periodic heartbeat check. Confirm all systems nominal.",
+      };
+      heartbeatRunner.updateAgents([DEFAULT_HEARTBEAT_AGENT]);
+      heartbeatRunner.start();
+      publish({ type: "heartbeat:sent", nodeId: env.nodeId });
+      console.log("[trilc] heartbeat runner started (1 agent)");
+
+      // ── Session Reaper: hourly sweep ──
+      sessionReaper.start();
+      publish({ type: "cron:sweep", count: 0 });
+
+      // ── Cron Engine: load persisted jobs ──
+      cronEngine.start().catch((err) => {
+        console.warn("[trilc] cron engine start failed:", (err as Error).message);
+      });
+
       // ── Signal handling (Linux detached runtime) ──
       // On Linux, the CLI sends SIGTERM as fallback after graceful /shutdown.
       // Handle both SIGTERM and SIGINT for clean daemon shutdown.
@@ -2013,6 +2120,9 @@ export function createTriLCApp(env: TriLCEnv) {
         console.log(`[trilc] received ${signal}, shutting down...`);
         console.log('[trilc] cancelling all managed shell processes...');
         cancelAllShellProcesses();
+        cronEngine.stop();
+        sessionReaper.stop();
+        heartbeatRunner.stop();
         mirrorPusher.stop();
         if (server) {
           await new Promise<void>((res) => server!.close(() => res()));
@@ -2034,6 +2144,9 @@ export function createTriLCApp(env: TriLCEnv) {
     },
 
     async stop(): Promise<void> {
+      cronEngine.stop();
+      sessionReaper.stop();
+      heartbeatRunner.stop();
       mirrorPusher.stop();
       connMgr.stopHealthCheckLoop();
       stopKeyCache();
@@ -2330,9 +2443,9 @@ function defaultSystemPrompt(cwd?: string): string {
     startCLAUDE_mdLoad(targetCwd);
   }
 
-  // Append cached content if available
+  // Append cached content if available; always include agent roster (KI-PH2-001 fix)
   if (cachedClaudeMd && cachedClaudeMd.content) {
-    return `${basePrompt}\n\n## Project Instructions (from CLAUDE.md)\n\n${cachedClaudeMd.content}`;
+    return `${basePrompt}\n\n## Project Instructions (from CLAUDE.md)\n\n${cachedClaudeMd.content}${cachedAgentRoster}`;
   }
 
   return basePrompt + cachedAgentRoster;

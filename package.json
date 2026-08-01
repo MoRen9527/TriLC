@@ -26,6 +26,7 @@
     "chalk": "^5.6.2",
     "cli-boxes": "^4.0.1",
     "code-excerpt": "^4.0.0",
+    "croner": "^10.0.1",
     "emoji-regex": "^10.6.0",
     "figures": "^6.1.0",
     "get-east-asian-width": "^1.6.0",

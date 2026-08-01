@@ -320,6 +320,13 @@ export function createSessionStore(dbPath: string) {
     return rowToSession(row);
   }
 
+  // ── Deletion ──
+
+  function deleteSession(id: string): boolean {
+    const result = db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
+    return Number(result.changes) > 0;
+  }
+
   function close(): void {
     db.close();
   }
@@ -335,6 +342,7 @@ export function createSessionStore(dbPath: string) {
     findInterruptedSessions,
     getSessionSummary,
     expireOldSessions,
+    deleteSession,
     updateSyncStatus,
     markPendingSync,
     getPendingSyncSessions,

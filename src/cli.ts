@@ -9,6 +9,7 @@ import { constants } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, platform } from 'node:os';
+import type { TriLCDaemonServiceConfig } from './daemon/service.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -30,6 +31,7 @@ Usage: trilc <command> [options]
 Commands:
   start              Start daemon in background       trilc start [--port 8711]
   stop               Stop background daemon           trilc stop
+  restart            Restart daemon (stop → start)    trilc restart [--port 8711]
   status             Show daemon status               trilc status [--port 8711]
   run                Run daemon in foreground         trilc run [--port 8711]
   chat               Start TUI chat (auto-starts daemon) trilc chat [--port 8711] [--agent &lt;id&gt;] [--resume &lt;id&gt;] [--list-sessions]
@@ -38,6 +40,8 @@ Commands:
   uninstall-service  Unregister Windows Service        trilc uninstall-service [--name TriLC]
   install-regrun     Register to Registry Run (no-admin) trilc install-regrun
   uninstall-regrun   Remove from Registry Run           trilc uninstall-regrun
+  daemon             OS-level daemon management         trilc daemon <install|uninstall|stage|status>
+  cron               Cron job management                trilc cron <add|list|update|remove|run|log>
 
 Options:
   --port <n>          Port for HTTP server (default: ${DEFAULT_PORT})
@@ -243,6 +247,15 @@ async function gracefulShutdown(port: number): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function cmdRestart(port: number): Promise<void> {
+  console.log('[trilc] restarting daemon...');
+  await cmdStop(port);
+  // brief pause to allow port release
+  await new Promise((r) => setTimeout(r, 1000));
+  await cmdStart(port);
+  console.log('[trilc] daemon restarted');
 }
 
 async function cmdStatus(port: number): Promise<void> {
@@ -517,6 +530,226 @@ async function cmdListSessions(port: number): Promise<void> {
   }
 }
 
+// ── Daemon subcommands ──
+
+function resolveDaemonConfig(port: number): TriLCDaemonServiceConfig {
+  const entryScript = resolve(__dirname, 'cli.js');
+  return {
+    nodeBin: process.execPath,
+    entryScript,
+    programArgs: ['start', '--port', String(port)],
+    cwd: process.cwd(),
+    dataDir: process.env.TRILC_DATA_DIR ?? `${process.env.LOCALAPPDATA ?? process.env.HOME ?? '/tmp'}/trilc`,
+    port,
+  };
+}
+
+// ── Cron subcommands ──
+
+async function cronRequest(port: number, method: string, path: string, body?: unknown): Promise<unknown> {
+  const url = `http://127.0.0.1:${port}${path}`;
+  const options: RequestInit = {
+    method,
+    headers: { 'content-type': 'application/json' },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  };
+  const res = await fetch(url, options);
+  const json = await res.json();
+  if (!res.ok) {
+    const err = json && typeof json === 'object' && 'error' in json ? String(json.error) : `HTTP ${res.status}`;
+    throw new Error(err);
+  }
+  return json;
+}
+
+async function cmdCron(subcommand: string, args: string[], port: number): Promise<void> {
+  switch (subcommand) {
+    case 'add': {
+      // Interactive or flagged add: name, schedule, prompt
+      let name = '';
+      let scheduleExpr = '';
+      let scheduleKind: 'every' | 'cron' = 'every';
+      let scheduleEveryMs = 0;
+      let scheduleCron = '';
+      let systemPrompt = '';
+      let enabled = true;
+
+      // Parse flags
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === '--name' && args[i + 1]) { name = args[++i]; }
+        else if (args[i] === '--every' && args[i + 1]) { scheduleKind = 'every'; scheduleEveryMs = parseInt(args[++i], 10); }
+        else if (args[i] === '--cron' && args[i + 1]) { scheduleKind = 'cron'; scheduleCron = args[++i]; }
+        else if (args[i] === '--prompt' && args[i + 1]) { systemPrompt = args[++i]; }
+        else if (args[i] === '--disabled') { enabled = false; }
+      }
+
+      if (!name) {
+        // Interactive prompt
+        const { createInterface } = await import('node:readline');
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        const ask = (q: string): Promise<string> => new Promise((resolve) => rl.question(q, resolve));
+        name = await ask('Job name: ');
+        if (!name.trim()) { console.error('ERROR: name is required.'); rl.close(); process.exit(1); }
+        const scheduleInput = await ask('Schedule (e.g. "5m", "1h", or cron expr): ');
+        scheduleExpr = scheduleInput.trim();
+        if (!scheduleExpr) { console.error('ERROR: schedule is required.'); rl.close(); process.exit(1); }
+        const promptInput = await ask('System prompt (optional, press Enter to skip): ');
+        systemPrompt = promptInput.trim();
+        rl.close();
+      }
+
+      // Parse schedule expression if interactive
+      if (scheduleExpr && !scheduleEveryMs && !scheduleCron) {
+        const parsed = parseHumanSchedule(scheduleExpr);
+        if (parsed) {
+          scheduleKind = 'every';
+          scheduleEveryMs = parsed.everyMs;
+        } else {
+          // Assume cron expression
+          scheduleKind = 'cron';
+          scheduleCron = scheduleExpr;
+        }
+      }
+
+      const schedule = scheduleKind === 'every'
+        ? { kind: 'every' as const, everyMs: scheduleEveryMs || 3600000 }
+        : { kind: 'cron' as const, expr: scheduleCron || '0 9 * * *' };
+
+      const body = { name: name || 'Unnamed job', schedule, systemPrompt: systemPrompt || '', enabled };
+      const result = await cronRequest(port, 'POST', '/internal/v1/cron/jobs', body);
+      const job = (result as Record<string, unknown>).job;
+      console.log('[OK] job created:', JSON.stringify(job, null, 2));
+      break;
+    }
+
+    case 'list': {
+      const result = await cronRequest(port, 'GET', '/internal/v1/cron/jobs');
+      const data = result as { ok: boolean; jobs: Array<Record<string, unknown>>; count: number };
+      if (data.jobs.length === 0) {
+        console.log('No cron jobs.');
+      } else {
+        console.log(`\n${'ID'.padEnd(24)} ${'NAME'.padEnd(20)} ${'SCHEDULE'.padEnd(24)} ${'STATE'.padEnd(10)} ${'LAST RUN'}`);
+        console.log('-'.repeat(100));
+        for (const j of data.jobs) {
+          const scheduleStr = typeof j.schedule === 'object' && j.schedule
+            ? ((j.schedule as Record<string, unknown>).kind === 'every'
+              ? `every ${(j.schedule as Record<string, unknown>).everyMs}ms`
+              : (j.schedule as Record<string, unknown>).expr)
+            : '?';
+          console.log(`${String(j.id).slice(0, 22).padEnd(24)} ${String(j.name).slice(0, 18).padEnd(20)} ${String(scheduleStr).slice(0, 22).padEnd(24)} ${String(j.state).padEnd(10)} ${String(j.lastRunAt ?? '-').slice(0, 19)}`);
+        }
+        console.log(`\n${data.count} job(s)`);
+      }
+      break;
+    }
+
+    case 'update': {
+      const jobId = args[0];
+      if (!jobId) { console.error('ERROR: job ID required. Usage: trilc cron update <id> [--enable|--disable] [--prompt ...] [--schedule ...]'); process.exit(1); }
+      const patch: Record<string, unknown> = {};
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === '--enable') { patch.enabled = true; }
+        else if (args[i] === '--disable') { patch.enabled = false; }
+        else if (args[i] === '--name' && args[i + 1]) { patch.name = args[++i]; }
+        else if (args[i] === '--prompt' && args[i + 1]) { patch.systemPrompt = args[++i]; }
+        else if (args[i] === '--every' && args[i + 1]) { patch.schedule = { kind: 'every', everyMs: parseInt(args[++i], 10) }; }
+        else if (args[i] === '--cron' && args[i + 1]) { patch.schedule = { kind: 'cron', expr: args[++i] }; }
+      }
+      if (Object.keys(patch).length === 0) { console.error('ERROR: no patch fields. Use --enable, --disable, --name, --prompt, --every, or --cron.'); process.exit(1); }
+      const result = await cronRequest(port, 'PATCH', `/internal/v1/cron/jobs/${encodeURIComponent(jobId)}`, patch);
+      console.log('[OK] job updated:', JSON.stringify((result as Record<string, unknown>).job, null, 2));
+      break;
+    }
+
+    case 'remove': {
+      const jobId = args[0];
+      if (!jobId) { console.error('ERROR: job ID required. Usage: trilc cron remove <id>'); process.exit(1); }
+      await cronRequest(port, 'DELETE', `/internal/v1/cron/jobs/${encodeURIComponent(jobId)}`);
+      console.log(`[OK] job removed: ${jobId}`);
+      break;
+    }
+
+    case 'run': {
+      const jobId = args[0];
+      if (!jobId) { console.error('ERROR: job ID required. Usage: trilc cron run <id> [--force]'); process.exit(1); }
+      const force = args.includes('--force');
+      const result = await cronRequest(port, 'POST', `/internal/v1/cron/jobs/${encodeURIComponent(jobId)}/run`, { force });
+      console.log(JSON.stringify(result, null, 2));
+      break;
+    }
+
+    case 'log': {
+      const jobId = args.find((a, i) => a === '--job' && args[i + 1]) ? args[args.indexOf('--job') + 1] : undefined;
+      const limit = args.includes('--limit') ? parseInt(args[args.indexOf('--limit') + 1] || '20', 10) : 20;
+      const queryString = jobId ? `?jobId=${encodeURIComponent(jobId)}&limit=${limit}` : `?limit=${limit}`;
+      const result = await cronRequest(port, 'GET', `/internal/v1/cron/log${queryString}`);
+      const data = result as { ok: boolean; logs: Array<Record<string, unknown>>; count: number };
+      if (data.logs.length === 0) {
+        console.log('No execution logs.');
+      } else {
+        console.log(`\n${'ID'.padEnd(6)} ${'JOB ID'.padEnd(24)} ${'STATUS'.padEnd(10)} ${'STARTED AT'.padEnd(22)} ${'DURATION'.padEnd(10)} ${'ERROR'}`);
+        console.log('-'.repeat(100));
+        for (const l of data.logs) {
+          const duration = typeof l.durationMs === 'number' ? `${l.durationMs}ms` : '-';
+          console.log(`${String(l.id).padEnd(6)} ${String(l.jobId).slice(0, 22).padEnd(24)} ${String(l.status).padEnd(10)} ${String(l.startedAt).slice(0, 20).padEnd(22)} ${duration.padEnd(10)} ${String(l.errorMessage ?? '-').slice(0, 30)}`);
+        }
+        console.log(`\n${data.count} log entry(s)`);
+      }
+      break;
+    }
+
+    default:
+      console.error(`[trilc] cron: unknown subcommand: ${subcommand}`);
+      console.error('Usage: trilc cron <add|list|update|remove|run|log>');
+      process.exit(1);
+  }
+}
+
+/** Parse human-readable schedule expressions like "5m", "1h", "30s" */
+function parseHumanSchedule(input: string): { kind: 'every'; everyMs: number } | null {
+  const match = input.match(/^(\d+)\s*(s|m|h|d)$/i);
+  if (!match) return null;
+  const value = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  const multipliers: Record<string, number> = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
+  return { kind: 'every', everyMs: value * (multipliers[unit] || 60000) };
+}
+
+async function cmdDaemon(subcommand: string, port: number): Promise<void> {
+  const { resolveDaemonService } = await import('./daemon/service.js');
+  const service = await resolveDaemonService();
+  const config = resolveDaemonConfig(port);
+
+  switch (subcommand) {
+    case 'install': {
+      console.log('[trilc] daemon: installing...');
+      await service.install(config);
+      console.log('[OK] daemon installed.');
+      break;
+    }
+    case 'uninstall': {
+      console.log('[trilc] daemon: uninstalling...');
+      await service.uninstall(config);
+      console.log('[OK] daemon uninstalled.');
+      break;
+    }
+    case 'stage': {
+      const path = await service.stage(config);
+      console.log(`[OK] daemon staged: ${path}`);
+      break;
+    }
+    case 'status': {
+      const state = await service.status(config);
+      console.log(JSON.stringify(state, null, 2));
+      break;
+    }
+    default:
+      console.error(`[trilc] daemon: unknown subcommand: ${subcommand}`);
+      console.error('Usage: trilc daemon <install|uninstall|stage|status>');
+      process.exit(1);
+  }
+}
+
 // ── Entry ──
 const { command, port, serviceName, displayName, agent, resume, listSessions } = parseArgs(process.argv.slice(2));
 
@@ -527,6 +760,9 @@ const { command, port, serviceName, displayName, agent, resume, listSessions } =
       break;
     case 'stop':
       await cmdStop(port);
+      break;
+    case 'restart':
+      await cmdRestart(port);
       break;
     case 'status':
       await cmdStatus(port);
@@ -552,6 +788,17 @@ const { command, port, serviceName, displayName, agent, resume, listSessions } =
     case 'uninstall-regrun':
       await cmdUninstallRegRun();
       break;
+    case 'daemon': {
+      const subcommand = process.argv[3] ?? 'status';
+      await cmdDaemon(subcommand, port);
+      break;
+    }
+    case 'cron': {
+      const subcommand = process.argv[3] ?? 'list';
+      const subArgs = process.argv.slice(4);
+      await cmdCron(subcommand, subArgs, port);
+      break;
+    }
     case 'help':
     case '--help':
     case '-h':
