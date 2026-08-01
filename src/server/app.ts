@@ -705,9 +705,16 @@ export function createTriLCApp(env: TriLCEnv) {
             daemon: {
               mode: process.platform === 'win32' ? 'schtasks' : process.platform === 'darwin' ? 'launchd' : 'systemd',
             },
+            heartbeat: {
+              enabled: heartbeatRunner.isRunning,
+              agentCount: 1, // default heartbeat agent
+            },
             cron: {
               enabled: cronEngine.isRunning,
               jobCount: cronEngine.jobCount,
+            },
+            sessionReaper: {
+              enabled: sessionReaper.isRunning(),
             },
           }));
           return;
@@ -732,7 +739,7 @@ export function createTriLCApp(env: TriLCEnv) {
         // ── GET /internal/v1/agents ──
         // Returns agents loaded from TriCompany .contract.yaml and/or builtin agents.
         // Supports ?scope=company|builtin|all (default: all).
-        //   company  — contract-resolver agents only (14 TriCompany employees)
+        //   company  — contract-resolver agents only (13 employee contracts + 1 registry)
         //   builtin  — hardcoded builtin agents only (code_explorer, test_runner, file_processor, code_reviewer)
         //   all      — both company and builtin agents merged
         const agentsUrlMatch = req.url?.match(/^\/internal\/v1\/agents(\?.*)?$/);
@@ -752,10 +759,12 @@ export function createTriLCApp(env: TriLCEnv) {
           }> = [];
 
           // Company agents (from contract resolver)
+          let tricompanyEnabled = false;
           if (scope === 'company' || scope === 'all') {
             try {
               const resolver = getContractResolver();
               const agentIds = resolver.listAgents();
+              tricompanyEnabled = agentIds.length > 0;
               for (const id of agentIds) {
                 const rights = resolver.getDecisionRights(id);
                 const tools = resolver.getToolControl(id);
@@ -785,7 +794,7 @@ export function createTriLCApp(env: TriLCEnv) {
           }
 
           res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ agents, count: agents.length, scope }));
+          res.end(JSON.stringify({ agents, count: agents.length, scope, tricompanyEnabled }));
           return;
         }
 

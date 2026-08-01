@@ -73,5 +73,9 @@ export function createSessionReaper(opts: { storePath: string }) {
     console.log(`${LOG_PREFIX} stopped`);
   }
 
-  return { sweep, start, stop };
+  function isRunning(): boolean {
+    return timer !== null;
+  }
+
+  return { sweep, start, stop, isRunning };
 }

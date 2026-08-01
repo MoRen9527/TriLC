@@ -40,6 +40,8 @@ interface AgentRuntimeState extends HeartbeatAgentConfig {
 }
 
 export interface TriLCHeartbeatRunner {
+  /** Whether the scheduling loop is active. */
+  readonly isRunning: boolean;
   /** Start the scheduling loop. No-op if already started. */
   start(): void;
   /** Stop the scheduling loop and clear all timers. */
@@ -154,6 +156,10 @@ export function createHeartbeatRunner(opts: {
   // ── Public API ──
 
   return {
+    get isRunning(): boolean {
+      return started;
+    },
+
     start(): void {
       if (started) return;
       started = true;
