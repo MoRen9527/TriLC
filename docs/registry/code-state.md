@@ -85,6 +85,14 @@
 - **★ Phase 1 新增**：`pusher.ts`（推送引擎）+ `types.ts`（类型契约）
 - 用于 TriLC → TriMC 云端会话数据镜像推送
 
+### Agent Contract Resolver（`src/config/contract-resolver.ts`）
+
+- Agent Contract V2 YAML 加载与五件套拼接，运行时根据 agent_id 注入对应身份
+- `loadAll()`：遍历 source-agents 子目录，加载所有 `*.contract.yaml`
+- `loadOne()`：解析单个 contract → 读取 soul / agent_body / agent_frontmatter / memory / colleagues / social → 组装 system prompt
+- `watchAndReload()`：监听文件变更并热重载
+- **2026-08-01 P0-1 修复**（colleagues_social schema 兼容）：Resolved 原本只识别 YAML paths 中独立 `colleagues` + `social` 字段；TriCompany V2 contract 部分使用合并字段 `colleagues_social`。`loadOne()` 新增归一化逻辑：若 paths 包含 `colleagues_social`，自动填充缺失的独立字段（`colleagues` / `social`），保持向后兼容两种格式。
+
 ### env var 变更
 
 | 变量 | 说明 |
@@ -99,6 +107,7 @@
 - `../../src/planner/`
 - `../../src/toolbus/`
 - `../../src/context-adapter/`
+- `../../src/config/contract-resolver.ts`
 - `../../src/config/key-cache.ts`
 - `../../src/mirror/`
 - `../../src/server/app.ts`

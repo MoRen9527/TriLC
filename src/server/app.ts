@@ -52,11 +52,60 @@ import { createHeartbeatWake } from '../heartbeat/heartbeat-wake.js';
 import { createHeartbeatRunner, type TriLCHeartbeatRunner, type HeartbeatAgentConfig } from '../heartbeat/heartbeat-runner.js';
 import { createSessionReaper } from '../cron/session-reaper.js';
 import { createMinimalCronEngine, type MinimalCronEngine } from '../cron/service.js';
+import { createUpdateCheckHandler, startUpdateCheckLoop } from '../update/update-check.js';
 
 // Cached roster of available sub-agents (built at daemon startup, injected
 // into system prompts so the model knows by name which agents it can invoke
 // with AgentTool — e.g. "let Xiao Jia check this" → AgentTool(agentType=ceo-chief-of-staff)).
 let cachedAgentRoster = '';
+
+// ── Builtin Agents ──
+// Hardcoded sub-agents that are not loaded from TriCompany contracts.
+// Exposed via GET /internal/v1/agents?scope=builtin (or scope=all).
+
+interface BuiltinAgent {
+  id: string;
+  displayName: string;
+  description: string;
+  hasSystemPrompt: boolean;
+  decisionRights: { approve: string[]; freeze: string[]; escalate: string[] };
+  tools: Record<string, unknown>;
+}
+
+const BUILTIN_AGENTS: BuiltinAgent[] = [
+  {
+    id: 'code_explorer',
+    displayName: 'Code Explorer',
+    description: 'Search and explore codebases — find symbols, trace dependencies, navigate project structure',
+    hasSystemPrompt: true,
+    decisionRights: { approve: [], freeze: ['write', 'delete'], escalate: [] },
+    tools: { name: 'Code Explorer', description: 'Structural codebase search and navigation agent' },
+  },
+  {
+    id: 'test_runner',
+    displayName: 'Test Runner',
+    description: 'Run tests and report results — execute test suites and surface failures',
+    hasSystemPrompt: true,
+    decisionRights: { approve: [], freeze: ['write', 'delete'], escalate: [] },
+    tools: { name: 'Test Runner', description: 'Test execution and result reporting agent' },
+  },
+  {
+    id: 'file_processor',
+    displayName: 'File Processor',
+    description: 'Transform and process files — batch file operations, format conversions, data extraction',
+    hasSystemPrompt: true,
+    decisionRights: { approve: [], freeze: ['delete'], escalate: ['write'] },
+    tools: { name: 'File Processor', description: 'File transformation and batch processing agent' },
+  },
+  {
+    id: 'code_reviewer',
+    displayName: 'Code Reviewer',
+    description: 'Review code for quality and issues — lint, security scan, style check, best-practice audit',
+    hasSystemPrompt: true,
+    decisionRights: { approve: [], freeze: ['write', 'delete'], escalate: [] },
+    tools: { name: 'Code Reviewer', description: 'Code quality review and audit agent' },
+  },
+];
 
 // ── P3: Interactive permission rules ──
 // Dangerous tools that trigger an interactive allow/deny/always prompt when
@@ -580,6 +629,12 @@ export function createTriLCApp(env: TriLCEnv) {
     if (event.type === 'node:degraded') mirrorPusher.onDegraded();
   });
 
+  // ── ACT2: Update check handler ──
+  const updateCheckHandler = createUpdateCheckHandler({
+    repo: process.env.TRILC_GITHUB_REPO ?? 'MoRen9527/TriLC',
+  });
+  let updateCheckLoop: { stop: () => void } | null = null;
+
   return {
     async start(): Promise<void> {
       daemonStartTime = Date.now();
@@ -601,6 +656,10 @@ export function createTriLCApp(env: TriLCEnv) {
       const { getContractResolver } = await import('../config/contract-resolver.js');
       const agentCount = await getContractResolver(env.tricompanySourcePath).loadAll();
       console.log(`[trilc] contract resolver: ${agentCount} agents loaded`);
+
+      // Phase 2.1: Load employee roster for display metadata
+      const rosterCount = getContractResolver().loadEmployeeRoster();
+      console.log(`[trilc] employee roster: ${rosterCount} employees loaded`);
 
       // Build assistant-facing agent roster (injected into system prompt).
       try {
@@ -671,29 +730,62 @@ export function createTriLCApp(env: TriLCEnv) {
         }
 
         // ── GET /internal/v1/agents ──
-        // Returns all agents loaded from TriCompany .contract.yaml
-        if (req.url === '/internal/v1/agents' && req.method === 'GET') {
-          try {
-            const resolver = getContractResolver();
-            const agentIds = resolver.listAgents();
-            const agents = agentIds.map((id) => {
-              const rights = resolver.getDecisionRights(id);
-              const tools = resolver.getToolControl(id);
-              return {
-                id,
-                  displayName: typeof tools?.name === 'string' ? tools.name : id,
+        // Returns agents loaded from TriCompany .contract.yaml and/or builtin agents.
+        // Supports ?scope=company|builtin|all (default: all).
+        //   company  — contract-resolver agents only (14 TriCompany employees)
+        //   builtin  — hardcoded builtin agents only (code_explorer, test_runner, file_processor, code_reviewer)
+        //   all      — both company and builtin agents merged
+        const agentsUrlMatch = req.url?.match(/^\/internal\/v1\/agents(\?.*)?$/);
+        if (agentsUrlMatch && req.method === 'GET') {
+          const urlObj = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+          const scope = urlObj.searchParams.get('scope') ?? 'all';
+
+          const agents: Array<{
+            id: string;
+            displayName: string;
+            role?: string;
+            supervisor?: string;
+            description?: string;
+            hasSystemPrompt: boolean;
+            decisionRights?: { approve: string[]; freeze: string[]; escalate: string[] };
+            tools?: Record<string, unknown>;
+          }> = [];
+
+          // Company agents (from contract resolver)
+          if (scope === 'company' || scope === 'all') {
+            try {
+              const resolver = getContractResolver();
+              const agentIds = resolver.listAgents();
+              for (const id of agentIds) {
+                const rights = resolver.getDecisionRights(id);
+                const tools = resolver.getToolControl(id);
+                const rosterInfo = resolver.getEmployeeInfo(id);
+                agents.push({
+                  id,
+                  displayName: rosterInfo?.displayName ??
+                    (typeof tools?.name === 'string' ? tools.name : id),
+                  role: rosterInfo?.role,
+                  supervisor: rosterInfo?.reportsTo,
                   description: typeof tools?.description === 'string' ? tools.description : undefined,
-                hasSystemPrompt: !!resolver.getSystemPrompt(id),
-                decisionRights: rights,
-                tools,
-              };
-            });
-            res.writeHead(200, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ agents, count: agents.length }));
-          } catch {
-            res.writeHead(500, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ error: 'contract resolver not initialized', agents: [], count: 0 }));
+                  hasSystemPrompt: !!resolver.getSystemPrompt(id),
+                  decisionRights: rights,
+                  tools,
+                });
+              }
+            } catch {
+              // Contract resolver not initialized: skip company agents
+            }
           }
+
+          // Builtin agents
+          if (scope === 'builtin' || scope === 'all') {
+            for (const ba of BUILTIN_AGENTS) {
+              agents.push({ ...ba });
+            }
+          }
+
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ agents, count: agents.length, scope }));
           return;
         }
 
@@ -2055,6 +2147,16 @@ export function createTriLCApp(env: TriLCEnv) {
           return;
         }
 
+        // ── GET /internal/v1/update/check ──
+        // ACT2: Returns update information comparing local version.json
+        // against the latest GitHub Release. TriPilot consumes this to show
+        // update notifications. Query: ?force=true to bypass cache.
+        if (req.url?.startsWith('/internal/v1/update/check') && req.method === 'GET') {
+          const urlObj = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
+          await updateCheckHandler(req, res, urlObj.searchParams);
+          return;
+        }
+
         // ── POST /shutdown ──
         // Graceful shutdown endpoint for Windows-compatible daemon stop.
         // On Windows, SIGTERM is a hard kill; this provides a clean alternative.
@@ -2113,6 +2215,12 @@ export function createTriLCApp(env: TriLCEnv) {
         console.warn("[trilc] cron engine start failed:", (err as Error).message);
       });
 
+      // ── ACT2: Update check loop ──
+      updateCheckLoop = startUpdateCheckLoop({
+        repo: process.env.TRILC_GITHUB_REPO ?? 'MoRen9527/TriLC',
+      });
+      console.log("[trilc] update check loop started");
+
       // ── Signal handling (Linux detached runtime) ──
       // On Linux, the CLI sends SIGTERM as fallback after graceful /shutdown.
       // Handle both SIGTERM and SIGINT for clean daemon shutdown.
@@ -2124,6 +2232,7 @@ export function createTriLCApp(env: TriLCEnv) {
         sessionReaper.stop();
         heartbeatRunner.stop();
         mirrorPusher.stop();
+        updateCheckLoop?.stop();
         if (server) {
           await new Promise<void>((res) => server!.close(() => res()));
           server = null;
@@ -2148,6 +2257,7 @@ export function createTriLCApp(env: TriLCEnv) {
       sessionReaper.stop();
       heartbeatRunner.stop();
       mirrorPusher.stop();
+      updateCheckLoop?.stop();
       connMgr.stopHealthCheckLoop();
       stopKeyCache();
       cancelAllShellProcesses();

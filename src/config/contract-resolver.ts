@@ -29,6 +29,30 @@ export interface AgentContract {
   toolControl: Record<string, unknown>;  // frontmatter 解析后的工具配置
 }
 
+/** Employee roster entry from TriCompany/docs/registry/employee-roster.json. */
+export interface EmployeeRosterEntry {
+  id: string;
+  displayName: string;
+  family: 'Role' | 'Registry';
+  role: string;
+  tier: string;
+  reportsTo: string;
+  supervises: string[];
+  onboardedAt: string;
+  status: string;
+}
+
+/** Full employee roster document shape. */
+export interface EmployeeRoster {
+  version: string;
+  company: string;
+  rosterDate: string;
+  totalEmployees: number;
+  employees: EmployeeRosterEntry[];
+  tiers: Record<string, number>;
+  families: Record<string, number>;
+}
+
 interface ContractYaml {
   contract: {
     agent_id: string;
@@ -49,6 +73,7 @@ class AgentContractResolver {
   private contracts = new Map<string, AgentContract>();
   private sourceRoot: string;
   private watcher: ReturnType<typeof watch> | null = null;
+  private employeeRoster: EmployeeRoster | null = null;
 
   constructor(sourceRoot: string) {
     this.sourceRoot = resolve(sourceRoot);
@@ -100,13 +125,29 @@ class AgentContractResolver {
       return null;
     }
 
-    // 读取五件套
-    const soul = this.readFileSafe(resolve(this.sourceRoot, parsed.paths.soul || ''));
-    const agentBody = this.readFileSafe(resolve(this.sourceRoot, parsed.paths.agent_body || ''));
-    const agentFrontmatter = this.readFileSafe(resolve(this.sourceRoot, parsed.paths.agent_frontmatter || ''));
-    const memory = this.readFileSafe(resolve(this.sourceRoot, parsed.paths.memory || ''));
-    const colleagues = this.readFileSafe(resolve(this.sourceRoot, parsed.paths.colleagues || ''));
-    const social = this.readFileSafe(resolve(this.sourceRoot, parsed.paths.social || ''));
+    // paths 兼容性归一化：colleagues_social（合并字段）→ colleagues + social
+    const rawPaths = parsed.paths;
+    if (rawPaths.colleagues_social) {
+      if (!rawPaths.colleagues) rawPaths.colleagues = rawPaths.colleagues_social;
+      if (!rawPaths.social) rawPaths.social = rawPaths.colleagues_social;
+    }
+    // 确保所有必填字段有默认值，避免 undefined 传入 resolve()
+    const paths: Required<AgentContract['paths']> = {
+      soul: rawPaths.soul || '',
+      agent_body: rawPaths.agent_body || '',
+      agent_frontmatter: rawPaths.agent_frontmatter || '',
+      memory: rawPaths.memory || '',
+      colleagues: rawPaths.colleagues || '',
+      social: rawPaths.social || '',
+    };
+
+    // 读取五件套（兼容 colleagues_social 合并字段）
+    const soul = this.readFileSafe(resolve(this.sourceRoot, paths.soul));
+    const agentBody = this.readFileSafe(resolve(this.sourceRoot, paths.agent_body));
+    const agentFrontmatter = this.readFileSafe(resolve(this.sourceRoot, paths.agent_frontmatter));
+    const memory = this.readFileSafe(resolve(this.sourceRoot, paths.memory));
+    const colleagues = this.readFileSafe(resolve(this.sourceRoot, paths.colleagues));
+    const social = this.readFileSafe(resolve(this.sourceRoot, paths.social));
 
     // 组装 system prompt: soul + agent body
     const systemPrompt = [soul, agentBody]
@@ -130,7 +171,7 @@ class AgentContractResolver {
     return {
       agentId,
       family,
-      paths: parsed.paths as AgentContract['paths'],
+      paths,
       decisionRights,
       systemPrompt,
       toolControl,
@@ -187,6 +228,52 @@ class AgentContractResolver {
   /** 列出所有已加载的 agent */
   listAgents(): string[] {
     return [...this.contracts.keys()];
+  }
+
+  /** 从 TriCompany 路径加载 employee-roster.json。
+   *
+   * 路径：``<sourceRoot>/docs/registry/employee-roster.json``
+   * 如果 roster 文件不存在或解析失败，roster 保持为 null。
+   * 返回已解析的 roster 条目数量，或 0（失败时）。
+   */
+  loadEmployeeRoster(): number {
+    const rosterPath = resolve(this.sourceRoot, 'docs', 'registry', 'employee-roster.json');
+    if (!existsSync(rosterPath)) {
+      console.warn(`[contract-resolver] employee roster not found: ${rosterPath}`);
+      return 0;
+    }
+    try {
+      const raw = readFileSync(rosterPath, 'utf-8');
+      const parsed = JSON.parse(raw) as EmployeeRoster;
+      if (!parsed.employees || !Array.isArray(parsed.employees)) {
+        console.warn('[contract-resolver] employee roster has no employees array');
+        return 0;
+      }
+      this.employeeRoster = parsed;
+      console.log(`[contract-resolver] loaded ${parsed.employees.length} employee roster entries`);
+      return parsed.employees.length;
+    } catch (err) {
+      console.warn(`[contract-resolver] failed to load employee roster:`, (err as Error).message);
+      return 0;
+    }
+  }
+
+  /** 获取员工在 roster 中的信息。
+   *
+   * 以 agentId 为键查找 employee roster。
+   * 返回 EmployeeRosterEntry，或 undefined（若 roster 未加载或该 agentId 不在 roster 中）。
+   */
+  getEmployeeInfo(agentId: string): EmployeeRosterEntry | undefined {
+    if (!this.employeeRoster) return undefined;
+    return this.employeeRoster.employees.find((e) => e.id === agentId);
+  }
+
+  /** 返回已加载的 employee roster 的所有条目。
+   *
+   * 若 roster 尚未加载，返回空数组。
+   */
+  listEmployees(): EmployeeRosterEntry[] {
+    return this.employeeRoster?.employees ?? [];
   }
 
   /** 监听文件变更并热重载 */

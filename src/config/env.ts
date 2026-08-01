@@ -14,6 +14,14 @@ export type TriLCEnv = {
   version: string;
   /** TriCompany source-agents root (for contract resolver) */
   tricompanySourcePath: string;
+  /**
+   * Project root directory for multi-project data isolation (Phase 3 pipe3-1).
+   * - Project-level data: {projectRoot}/.tricompany-cognition/
+   * - Operating records:  {projectRoot}/docs/execution/operating-records/
+   * - Defaults to cwd for backward compatibility.
+   * - Env: TRILC_PROJECT_ROOT
+   */
+  projectRoot: string;
 };
 
 import { hostname } from 'node:os';
@@ -45,6 +53,7 @@ function resolveFromWorkspace(): string {
 export function readEnv(): TriLCEnv {
   const nodeId = process.env.TRILC_NODE_ID ?? `${hostname()}-${process.pid}`;
   const dataDir = process.env.TRILC_DATA_DIR ?? `${process.env.LOCALAPPDATA ?? process.env.HOME ?? '/tmp'}/trilc`;
+  const projectRoot = process.env.TRILC_PROJECT_ROOT ?? process.cwd();
   return {
     nodeId,
     port: Number(process.env.TRILC_PORT ?? 8711),
@@ -56,5 +65,6 @@ export function readEnv(): TriLCEnv {
     dataDir,
     version: process.env.TRILC_VERSION ?? '0.1.0',
     tricompanySourcePath: process.env.TRICOMPANY_SOURCE_PATH ?? resolveFromWorkspace(),
+    projectRoot,
   };
 }
