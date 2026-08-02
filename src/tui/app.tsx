@@ -501,6 +501,27 @@ PR number: ${args.trim() || '(please list open PRs first)'}`;
             }
         })();
     }, [addSystemMessage]);
+    // ── w34-2: Cron engine status polling ──
+    const [cronDegraded, setCronDegraded] = useState(false);
+    const [cronFailures, setCronFailures] = useState(0);
+    useEffect(() => {
+        const TRILC_PORT = process.env.TRILC_PORT ?? '8711';
+        const poll = async () => {
+            try {
+                const r = await fetch(`http://localhost:${TRILC_PORT}/healthz`);
+                const j = await r.json();
+                const degraded = j?.cron?.degraded ?? false;
+                const failures = j?.cron?.consecutiveFailures ?? 0;
+                setCronDegraded(degraded);
+                setCronFailures(failures);
+            } catch {
+                // Daemon unreachable — keep previous state
+            }
+        };
+        poll();
+        const iv = setInterval(poll, 5000);
+        return () => clearInterval(iv);
+    }, []);
     const [resumeLoaded, setResumeLoaded] = useState(false);
     const { inputText, cursorOffset, clear } = useCursorInput({
         onSubmit: handleSend, onCommand: handleCommand, onBash: handleBash,
@@ -603,5 +624,7 @@ PR number: ${args.trim() || '(please list open PRs first)'}`;
         outputTokens,
         totalMessages: displayMsgs.length,
         maxContextMessages: 100,
+        cronDegraded,
+        cronFailures,
     }));
 }

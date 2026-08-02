@@ -29,6 +29,10 @@ export interface CronService {
   runJob(id: string, force?: boolean): Promise<{ ok: boolean; ran: boolean; reason?: string }>;
   getExecutionLogs(jobId: string, limit?: number): Promise<ExecutionLogEntry[]>;
   getRecentExecutionLogs(limit?: number): Promise<ExecutionLogEntry[]>;
+  /** Whether the cron engine has entered degraded state (3+ consecutive failures). */
+  isDegraded(): boolean;
+  /** Current number of consecutive failures (resets to 0 on success). */
+  readonly consecutiveFailures: number;
   readonly jobCount: number;
   readonly isRunning: boolean;
 }
@@ -73,6 +77,14 @@ export function createCronService(deps: CronServiceDeps): CronService {
 
     get isRunning(): boolean {
       return state.started;
+    },
+
+    get consecutiveFailures(): number {
+      return state.consecutiveFailures;
+    },
+
+    isDegraded(): boolean {
+      return state.degraded;
     },
 
     async start(): Promise<void> {

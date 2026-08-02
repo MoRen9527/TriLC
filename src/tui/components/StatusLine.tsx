@@ -1,6 +1,7 @@
-// ── StatusLine v2 (P2-Batch1-#4) ──
-// Displays model | git-branch | cwd | ctx% | input/output tokens
+// ── StatusLine v3 (w34-2) ──
+// Displays model | git-branch | cwd | ctx% | tokens | cron:degraded (if applicable)
 // P2-Batch1-#4: Added git branch detection and context percentage calculation
+// w34-2: Added cronDegraded / cronFailures props for cron engine status display
 import React from 'react';
 import { Box, Text } from '../fork.js';
 
@@ -12,6 +13,9 @@ interface Props {
   // P2-Batch1-#4: New props for git branch and context calculation
   totalMessages?: number;
   maxContextMessages?: number;
+  // w34-2: Cron engine status for StatusLine display
+  cronDegraded?: boolean;
+  cronFailures?: number;
 }
 
 // P2-Batch1-#4: Simple git branch detection (no external dependency)
@@ -39,6 +43,8 @@ export default function StatusLine({
   outputTokens,
   totalMessages = 0,
   maxContextMessages = 100, // Arbitrary baseline for 100% context
+  cronDegraded = false,
+  cronFailures = 0,
 }: Props) {
   const cwdShort = cwd.length > 30 ? '…' + cwd.slice(-29) : cwd;
 
@@ -56,9 +62,14 @@ export default function StatusLine({
     ? `${Math.round(estimatedTotalTokens / 1000)}k`
     : '0';
 
+  // w34-2: cron:degraded indicator — shown when cron engine has 3+ consecutive failures
+  const cronDegradedSegment = cronDegraded
+    ? `  │  ⚠ cron:degraded${cronFailures > 0 ? ` (${cronFailures} failures)` : ''}`
+    : '';
+
   return React.createElement(Box, { flexDirection: "row" },
     React.createElement(Text, { dimColor: true, wrap: "truncate" },
-      `${model}  │  ${cachedBranch}  │  ${cwdShort}  │  ctx:${ctxPercent}%  │  ${tokenDisplay} tokens`
+      `${model}  │  ${cachedBranch}  │  ${cwdShort}  │  ctx:${ctxPercent}%  │  ${tokenDisplay} tokens${cronDegradedSegment}`
     )
   );
 }

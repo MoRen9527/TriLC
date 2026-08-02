@@ -41,7 +41,8 @@ Commands:
   install-regrun     Register to Registry Run (no-admin) trilc install-regrun
   uninstall-regrun   Remove from Registry Run           trilc uninstall-regrun
   daemon             OS-level daemon management         trilc daemon <install|uninstall|stage|status>
-  cron               Cron job management                trilc cron <add|list|update|remove|run|log>
+  cron               Cron job management                trilc cron <add|list|update|remove|run|log|status>
+  watchdog           Start watchdog supervisor process   trilc watchdog [--port 8711] [--data-dir <path>]
 
 Options:
   --port <n>          Port for HTTP server (default: ${DEFAULT_PORT})
@@ -698,9 +699,25 @@ async function cmdCron(subcommand: string, args: string[], port: number): Promis
       break;
     }
 
+    case 'status': {
+      const result = await cronRequest(port, 'GET', '/internal/v1/cron/status');
+      const data = result as { ok: boolean; status: { running: boolean; degraded: boolean; consecutiveFailures: number; jobCount: number } };
+      if (!data.ok) {
+        console.error('[trilc] cron status: failed to retrieve status');
+        process.exit(1);
+      }
+      const s = data.status;
+      console.log(`Cron Engine Status:`);
+      console.log(`  Running:              ${s.running ? 'yes' : 'no'}`);
+      console.log(`  Degraded:             ${s.degraded ? 'YES (3+ consecutive failures)' : 'no'}`);
+      console.log(`  Consecutive Failures: ${s.consecutiveFailures}`);
+      console.log(`  Job Count:            ${s.jobCount}`);
+      break;
+    }
+
     default:
       console.error(`[trilc] cron: unknown subcommand: ${subcommand}`);
-      console.error('Usage: trilc cron <add|list|update|remove|run|log>');
+      console.error('Usage: trilc cron <add|list|update|remove|run|log|status>');
       process.exit(1);
   }
 }
@@ -797,6 +814,35 @@ const { command, port, serviceName, displayName, agent, resume, listSessions } =
       const subcommand = process.argv[3] ?? 'list';
       const subArgs = process.argv.slice(4);
       await cmdCron(subcommand, subArgs, port);
+      break;
+    }
+    case 'watchdog': {
+      const { resolveWatchdogConfig, createWatchdog } = await import('./daemon/watchdog.js');
+      const dataDir = process.env.TRILC_DATA_DIR ?? `${process.env.LOCALAPPDATA ?? process.env.HOME ?? '/tmp'}/trilc`;
+      const wdConfig = resolveWatchdogConfig(port, dataDir);
+      const watchdog = createWatchdog(wdConfig);
+
+      console.log(`[trilc] watchdog starting (port=${wdConfig.port}, dataDir=${wdConfig.dataDir})`);
+      console.log(`[trilc] watchdog will restart the daemon up to 5 times per 10-minute window`);
+      console.log(`[trilc] backoff: 1s→2s→4s→8s→16s→32s cap, reset after 60s stable uptime`);
+      console.log(`[trilc] child entry: ${wdConfig.entryScript}`);
+
+      // Handle parent process signals
+      const cleanup = () => {
+        watchdog.stop();
+        process.exit(0);
+      };
+      process.on('SIGTERM', cleanup);
+      process.on('SIGINT', cleanup);
+
+      const started = watchdog.start();
+      if (!started) {
+        console.error('[trilc] watchdog failed to start child process');
+        process.exit(1);
+      }
+
+      // Keep the watchdog process alive; it monitors the child via event handlers
+      // The process stays alive because child process events keep the event loop active
       break;
     }
     case 'help':

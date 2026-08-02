@@ -206,7 +206,7 @@ interface ConnectionManagerOptions {
 // ── ConnectionManager ──
 
 class ConnectionManager {
-  private state: ConnectionState = 'connected';
+  private state: ConnectionState = 'degraded';
   private consecutiveFailures = 0;
   private consecutiveSuccesses = 0;
   private readonly failThreshold = 3;
@@ -362,7 +362,6 @@ class ConnectionManager {
 
   // Replay pending events to TriMC after recovery from degraded state
   private async _performReplay(): Promise<void> {
-    const connectionId = ''; // Will be resolved from closure via setConnectionId
     // Use internal connectionId tracker set in createTriLCApp
     const cid = (this as unknown as { __connectionId: string }).__connectionId ?? '';
     const events = this._getPendingForReplay(cid);
@@ -712,6 +711,8 @@ export function createTriLCApp(env: TriLCEnv) {
             cron: {
               enabled: cronEngine.isRunning,
               jobCount: cronEngine.jobCount,
+              degraded: cronEngine.isDegraded(),
+              consecutiveFailures: cronEngine.consecutiveFailures,
             },
             sessionReaper: {
               enabled: sessionReaper.isRunning(),
@@ -2148,6 +2149,27 @@ export function createTriLCApp(env: TriLCEnv) {
               : await cronEngine.getRecentExecutionLogs(limit);
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ ok: true, logs, count: logs.length }));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: msg }));
+          }
+          return;
+        }
+
+        // ── GET /internal/v1/cron/status ──
+        if (req.url === '/internal/v1/cron/status' && req.method === 'GET') {
+          try {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: true,
+              status: {
+                running: cronEngine.isRunning,
+                degraded: cronEngine.isDegraded(),
+                consecutiveFailures: cronEngine.consecutiveFailures,
+                jobCount: cronEngine.jobCount,
+              },
+            }));
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             res.writeHead(500, { 'content-type': 'application/json' });

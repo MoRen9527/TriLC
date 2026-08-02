@@ -99,11 +99,15 @@ interface GitHubRelease {
   draft: boolean;
 }
 
+type FetchLatestResult =
+  | { ok: true; release: GitHubRelease }
+  | { ok: false; reason: 'api_error' | 'draft' | 'not_found' };
+
 async function fetchLatestRelease(
   repo: string,
   githubApiUrl: string,
   githubToken?: string,
-): Promise<GitHubRelease | null> {
+): Promise<FetchLatestResult> {
   const url = `${githubApiUrl}/repos/${repo}/releases/latest`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -123,24 +127,28 @@ async function fetchLatestRelease(
       headers,
     });
 
-    if (res.status === 403 || res.status === 404 || !res.ok) {
+    if (res.status === 404) {
+      console.warn(`[trilc:update] No releases found for ${repo}`);
+      return { ok: false, reason: 'not_found' };
+    }
+    if (res.status === 403 || !res.ok) {
       console.warn(`[trilc:update] GitHub API returned ${res.status} for ${repo}`);
-      return null;
+      return { ok: false, reason: 'api_error' };
     }
 
     const data = await res.json() as GitHubRelease;
     if (data.draft) {
       console.warn('[trilc:update] Latest release is a draft, skipping');
-      return null;
+      return { ok: false, reason: 'draft' };
     }
 
-    return data;
+    return { ok: true, release: data };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg !== 'The operation was aborted') {
       console.warn(`[trilc:update] Fetch failed: ${msg}`);
     }
-    return null;
+    return { ok: false, reason: 'api_error' };
   } finally {
     clearTimeout(timeout);
   }
@@ -173,12 +181,16 @@ function parseVersionSegments(version: string): number[] | null {
  *   -1 if a < b
  *    0 if a === b
  *    1 if a > b
- * Returns 0 if either version is unparseable.
+ * Returns 0 if either version is unparseable (with console warn).
  */
 function compareVersionSegments(a: string, b: string): number {
   const segsA = parseVersionSegments(a);
   const segsB = parseVersionSegments(b);
-  if (!segsA || !segsB) return 0;
+  if (!segsA || !segsB) {
+    if (!segsA) console.warn(`[trilc:update] Unparseable version: "${a}"`);
+    if (!segsB) console.warn(`[trilc:update] Unparseable version: "${b}"`);
+    return 0;
+  }
 
   const maxLen = Math.max(segsA.length, segsB.length);
   for (let i = 0; i < maxLen; i++) {
@@ -193,11 +205,25 @@ function compareVersionSegments(a: string, b: string): number {
 /**
  * Returns true if the release tag represents a newer version than localVersion.
  * Strips 'v' prefix from tags before comparing.
+ *
+ * Follows semver pre-release precedence:
+ *   Numeric segments compared first; if equal:
+ *   - A version without a pre-release suffix is newer than one with it
+ *     (1.2.3 > 1.2.3-beta.1)
+ *   - If both have pre-releases, they are compared as equal (simple mode).
  */
 function isNewerVersion(localVersion: string, releaseTag: string): boolean {
   const cleanTag = releaseTag.replace(/^v/, '');
   const cleanLocal = localVersion.replace(/^v/, '');
-  return compareVersionSegments(cleanTag, cleanLocal) > 0;
+  const cmp = compareVersionSegments(cleanTag, cleanLocal);
+  if (cmp !== 0) return cmp > 0;
+
+  // Numeric segments equal — check pre-release status per semver
+  const tagHasPre = cleanTag.includes('-');
+  const localHasPre = cleanLocal.includes('-');
+  if (!tagHasPre && localHasPre) return true;   // release > pre-release
+  if (tagHasPre && !localHasPre) return false;  // pre-release < release
+  return false; // both or neither have pre-release — treat as equal
 }
 
 // ── Cached update status ──
@@ -245,14 +271,20 @@ export async function getUpdateStatus(
   const githubApiUrl = options?.githubApiUrl ?? DEFAULT_GITHUB_API;
   const githubToken = options?.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.TRILC_GITHUB_TOKEN;
 
-  const release = await fetchLatestRelease(repo, githubApiUrl, githubToken);
+  const result = await fetchLatestRelease(repo, githubApiUrl, githubToken);
 
-  if (!release) {
-    info.error = 'Failed to fetch latest release from GitHub.';
+  if (!result.ok) {
+    info.error =
+      result.reason === 'draft'
+        ? 'Latest GitHub release is a draft (no stable release available).'
+        : result.reason === 'not_found'
+          ? 'No releases found for this repository.'
+          : 'Failed to fetch latest release from GitHub.';
     cachedStatus = { info, expiresAt: Date.now() + Math.min(intervalMs, 60 * 60 * 1000) };
     return info;
   }
 
+  const release = result.release;
   info.latestVersion = release.tag_name.replace(/^v/, '');
   info.latestTag = release.tag_name;
   info.releaseUrl = release.html_url;
