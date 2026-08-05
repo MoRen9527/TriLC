@@ -69,6 +69,15 @@ export async function runHeartbeatAgent(
     });
 
     let content = "";
+    // REQ-20260805-004: collect tool events (tool_call/tool_result) so the
+    // agent's tool feedback is visible in the session and downstream consumers.
+    const toolMessages: Array<{
+      role: "tool";
+      content: string;
+      toolCallId: string;
+      isError?: boolean;
+    }> = [];
+    let toolBlockedCount = 0;
 
     for await (const event of agentLoop({
       model,
@@ -84,14 +93,35 @@ export async function runHeartbeatAgent(
         content += event.delta;
       } else if (event.type === "assistant_message" && event.content) {
         if (!content) content = event.content;
+      } else if (event.type === "tool_result") {
+        toolMessages.push({
+          role: "tool",
+          content: event.content,
+          toolCallId: event.tool_call_id,
+          isError: event.is_error,
+        });
+      } else if (event.type === "tool_blocked") {
+        toolBlockedCount++;
+        toolMessages.push({
+          role: "tool",
+          content: `[blocked] ${event.tool_name}: ${event.reason}`,
+          toolCallId: `blocked_${toolBlockedCount}`,
+          isError: true,
+        });
       }
     }
 
-    // Persist the full conversation
-    sessionStore.saveMessages(sessionId, [
-      { role: "user", content: message },
-      { role: "assistant", content: content || "Heartbeat completed" },
-    ]);
+    // Persist the full conversation (user → tool results → assistant)
+    const persistMessages: Array<{
+      role: "user" | "assistant" | "tool";
+      content: string | null;
+      toolCallId?: string;
+    }> = [{ role: "user", content: message }];
+    for (const tm of toolMessages) {
+      persistMessages.push({ role: "tool", content: tm.content, toolCallId: tm.toolCallId });
+    }
+    persistMessages.push({ role: "assistant", content: content || "Heartbeat completed" });
+    sessionStore.saveMessages(sessionId, persistMessages);
     sessionStore.updateSessionStatus(sessionId, "completed");
 
     const durationMs = Date.now() - startTime;
