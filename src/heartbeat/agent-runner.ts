@@ -84,9 +84,8 @@ export async function runHeartbeatAgent(
       systemPrompt: prompt,
       messages: [{ role: "user", content: message }],
       maxTurns,
-      // tier 'heartbeat' is not yet in the AgentTier union; use 'subagent'
-      // as it provides the appropriate restricted permission set.
-      tier: "subagent",
+      // REQ-20260805-006: 'heartbeat' tier = read + write allowed, no shell.
+      tier: "heartbeat",
       cwd,
     })) {
       if (event.type === "content_delta") {
