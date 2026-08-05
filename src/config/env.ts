@@ -26,7 +26,7 @@ export type TriLCEnv = {
 
 import { hostname } from 'node:os';
 import { resolve, dirname } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 function resolveFromWorkspace(): string {
@@ -50,6 +50,35 @@ function resolveFromWorkspace(): string {
   return devContracts;
 }
 
+/**
+ * Resolve TriLC version from:
+ *  1. TRILC_VERSION env var (explicit override)
+ *  2. version.json at the TriLC root (relative to this module)
+ *  3. Hardcoded fallback '1.0.0'
+ *
+ * Path derivation: this module compiles to dist/config/env.js,
+ * so ../../version.json resolves to <trilc-root>/version.json for
+ * both dev workspaces and ZIP/MSI deployments.
+ */
+function resolveVersion(): string {
+  if (process.env.TRILC_VERSION) return process.env.TRILC_VERSION;
+
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const versionPath = resolve(scriptDir, '..', '..', 'version.json');
+
+  if (existsSync(versionPath)) {
+    try {
+      const raw = readFileSync(versionPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.version === 'string' && parsed.version) {
+        return parsed.version;
+      }
+    } catch { /* ignore parse errors, fall through */ }
+  }
+
+  return '1.0.0';
+}
+
 export function readEnv(): TriLCEnv {
   const nodeId = process.env.TRILC_NODE_ID ?? `${hostname()}-${process.pid}`;
   const dataDir = process.env.TRILC_DATA_DIR ?? `${process.env.LOCALAPPDATA ?? process.env.HOME ?? '/tmp'}/trilc`;
@@ -63,7 +92,7 @@ export function readEnv(): TriLCEnv {
     trimodelApiUrl: process.env.TRILC_TRIMODEL_API_URL ?? 'http://127.0.0.1:3333',
     cwd: process.env.TRILC_CWD ?? process.cwd(),
     dataDir,
-    version: process.env.TRILC_VERSION ?? '0.1.0',
+    version: resolveVersion(),
     tricompanySourcePath: process.env.TRICOMPANY_SOURCE_PATH ?? resolveFromWorkspace(),
     projectRoot,
   };
