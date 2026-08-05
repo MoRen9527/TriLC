@@ -50,6 +50,8 @@ import {
 } from './interactions.js';
 import { createHeartbeatWake } from '../heartbeat/heartbeat-wake.js';
 import { createHeartbeatRunner, type TriLCHeartbeatRunner, type HeartbeatAgentConfig } from '../heartbeat/heartbeat-runner.js';
+import { CompanyInitState } from '../company/init-state.js';
+import { buildOnboardingAgent } from '../company/onboarding.js';
 import { createSessionReaper } from '../cron/session-reaper.js';
 import { createMinimalCronEngine, type MinimalCronEngine } from '../cron/service.js';
 import { createUpdateCheckHandler, startUpdateCheckLoop } from '../update/update-check.js';
@@ -696,6 +698,7 @@ export function createTriLCApp(env: TriLCEnv) {
           res.end(JSON.stringify({
             ok: true,
             service: 'trilc',
+            serverTime: new Date().toISOString(),
             trimc: triMcOnline ? 'connected' : 'degraded',
             uptime,
             activeTasks,
@@ -2223,7 +2226,7 @@ export function createTriLCApp(env: TriLCEnv) {
       // S7: Start mirror pusher (event-driven + 30s heartbeat)
       mirrorPusher.start();
 
-      // ── Heartbeat Runner: default heartbeat agent ──
+      // ── Heartbeat Runner: default heartbeat agent + onboarding (REQ-001) ──
       const DEFAULT_HEARTBEAT_AGENT: HeartbeatAgentConfig = {
         agentId: "default-heartbeat",
         intervalMs: 30 * 60 * 1000,
@@ -2232,10 +2235,26 @@ export function createTriLCApp(env: TriLCEnv) {
         systemPrompt: "You are a system heartbeat agent. Report current status concisely.",
         userMessage: "Periodic heartbeat check. Confirm all systems nominal.",
       };
-      heartbeatRunner.updateAgents([DEFAULT_HEARTBEAT_AGENT]);
+
+      // REQ-20260805-001: if TriCompany uninitialized, register onboarding agent
+      // (auto-pushes greet → ask CEO name → role list → select+name → assemble).
+      const companyInit = new CompanyInitState(env.dataDir);
+      const agents: HeartbeatAgentConfig[] = [DEFAULT_HEARTBEAT_AGENT];
+      try {
+        if (await companyInit.isOnboardingPending()) {
+          agents.push(buildOnboardingAgent(env.cwd, getKeyCache()?.defaultModel ?? "deepseek-v4-flash"));
+          console.log("[trilc] TriCompany uninitialized — onboarding agent registered");
+        } else {
+          console.log("[trilc] TriCompany initialized — onboarding skipped");
+        }
+      } catch (err) {
+        console.warn("[trilc] company init check failed:", (err as Error).message);
+      }
+
+      heartbeatRunner.updateAgents(agents);
       heartbeatRunner.start();
       publish({ type: "heartbeat:sent", nodeId: env.nodeId });
-      console.log("[trilc] heartbeat runner started (1 agent)");
+      console.log(`[trilc] heartbeat runner started (${agents.length} agent${agents.length > 1 ? "s" : ""})`);
 
       // ── Session Reaper: hourly sweep ──
       sessionReaper.start();
