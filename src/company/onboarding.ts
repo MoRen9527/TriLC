@@ -29,7 +29,7 @@ export const ROLE_CATALOG: Array<{ role: string; label: string }> = [
 ];
 
 /** Build the onboarding agent's system prompt (per playbook §1.2). */
-export function buildOnboardingSystemPrompt(workspaceRoot: string): string {
+export function buildOnboardingSystemPrompt(workspaceRoot: string, statePath?: string): string {
   const roleList = ROLE_CATALOG.map((r, i) => `  [${i + 1}] ${r.label} (${r.role})`).join("\n");
 
   return `你是 TriCade 的安装初始化引导 Agent。公司尚未开张，你的任务是按实施手册引导 CEO 完成公司开张。
@@ -73,9 +73,9 @@ Step 5: 装配公司骨架
 - 例如：你在 Step 2 问了名字，CEO 回复任何内容（除了明确说"跳过"），都视为 CEO 的名字，进入 Step 3——不要再次问名字
 
 断点续接规则（REQ-016，最重要）:
-- 每轮开始前，先用 Read 工具读取 ${workspaceRoot}/docs/registry/company-state.json（或 state.json）
+- 每轮开始前，先用 Read 工具读取状态文件 ${statePath}
   检查 progress 字段——如果有 progress 且 step 已完成，直接从 progress.step 的下一步继续，不要从头开始
-- 每完成一步，用 Write/Edit 更新 state.json 的 progress 字段:
+- 每完成一步，用 Write/Edit 更新状态文件 ${statePath} 的 progress 字段:
   progress: { step: "greeted" | "name" | "roles" | "naming" | "confirm" | "assembling" | "done",
               ceoName: "<CEO名字>", selectedRoles: [...], employeeNames: {...} }
 - 例如: 上次已问过名字并得到"磨人"，progress.step="name"，本次直接从 Step 3（岗位列表）继续
@@ -90,13 +90,13 @@ Step 5: 装配公司骨架
 }
 
 /** Build the onboarding heartbeat agent config (short interval while pending). */
-export function buildOnboardingAgent(workspaceRoot: string, model: string): HeartbeatAgentConfig {
+export function buildOnboardingAgent(workspaceRoot: string, model: string, statePath?: string): HeartbeatAgentConfig {
   return {
     agentId: "company-onboarding",
     intervalMs: 60 * 1000, // check every 60s while uninitialized
     model,
     maxTurns: 20,
-    systemPrompt: buildOnboardingSystemPrompt(workspaceRoot),
+    systemPrompt: buildOnboardingSystemPrompt(workspaceRoot, statePath),
     userMessage:
       "公司尚未开张。检查当前 onboarding 进度：如果 CEO 已回复，继续引导下一步；如果骨架已装配完成，将公司状态更新为 initialized。",
     // REQ-014b: tools must run in the onboarding workspace, not daemon cwd

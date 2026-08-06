@@ -13,6 +13,7 @@
 import { createServer, type Server, type ServerResponse } from 'node:http';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
+import { join } from 'node:path';
 import type { TriLCEnv } from '../config/env.js';
 import { agentLoop, register as registerTool, canUseTool } from '@trimetaverse/agent-core';
 import type { AgentEvent, AgentLoopOptions, AgentLoopDeps } from '@trimetaverse/agent-core';
@@ -2243,7 +2244,9 @@ export function createTriLCApp(env: TriLCEnv) {
       try {
         if (await companyInit.isOnboardingPending()) {
           // REQ-014b: onboarding workspace = projectRoot (TRILC_PROJECT_ROOT), not daemon cwd
-          agents.push(buildOnboardingAgent(env.projectRoot ?? env.cwd, getKeyCache()?.defaultModel ?? "deepseek-v4-flash"));
+          // REQ-016: statePath so the agent reads the real progress file (dataDir), not workspace copies
+          const companyStatePath = join(env.dataDir, 'company', 'state.json');
+          agents.push(buildOnboardingAgent(env.projectRoot ?? env.cwd, getKeyCache()?.defaultModel ?? "deepseek-v4-flash", companyStatePath));
           console.log("[trilc] TriCompany uninitialized — onboarding agent registered");
         } else {
           console.log("[trilc] TriCompany initialized — onboarding skipped");
