@@ -921,6 +921,20 @@ const { command, port, serviceName, displayName, agent, resume, listSessions } =
             console.log(`[trilc] skeleton cleaned: ${p}`);
           } catch { /* best-effort */ }
         }
+
+        // Prune empty skeleton dirs (deepest first). NEVER touch non-empty dirs —
+        // they may hold project assets.
+        const { readdir } = await import('node:fs/promises');
+        for (const dir of [join('docs', 'registry'), '.claude', 'docs']) {
+          const p = join(target, dir);
+          try {
+            const entries = await readdir(p);
+            if (entries.length === 0) {
+              await rm(p, { recursive: true, force: true });
+              console.log(`[trilc] pruned empty dir: ${p}`);
+            }
+          } catch { /* dir may not exist */ }
+        }
         console.log(`[trilc] company skeleton reset — .git preserved for audit/rollback`);
       } else {
         console.error('Usage: trilc company reset');
