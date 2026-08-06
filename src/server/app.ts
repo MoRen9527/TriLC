@@ -2242,7 +2242,8 @@ export function createTriLCApp(env: TriLCEnv) {
       const agents: HeartbeatAgentConfig[] = [DEFAULT_HEARTBEAT_AGENT];
       try {
         if (await companyInit.isOnboardingPending()) {
-          agents.push(buildOnboardingAgent(env.cwd, getKeyCache()?.defaultModel ?? "deepseek-v4-flash"));
+          // REQ-014b: onboarding workspace = projectRoot (TRILC_PROJECT_ROOT), not daemon cwd
+          agents.push(buildOnboardingAgent(env.projectRoot ?? env.cwd, getKeyCache()?.defaultModel ?? "deepseek-v4-flash"));
           console.log("[trilc] TriCompany uninitialized — onboarding agent registered");
         } else {
           console.log("[trilc] TriCompany initialized — onboarding skipped");

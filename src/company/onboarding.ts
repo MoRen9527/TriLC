@@ -77,5 +77,7 @@ export function buildOnboardingAgent(workspaceRoot: string, model: string): Hear
     systemPrompt: buildOnboardingSystemPrompt(workspaceRoot),
     userMessage:
       "公司尚未开张。检查当前 onboarding 进度：如果 CEO 已回复，继续引导下一步；如果骨架已装配完成，将公司状态更新为 initialized。",
+    // REQ-014b: tools must run in the onboarding workspace, not daemon cwd
+    cwd: workspaceRoot,
   };
 }

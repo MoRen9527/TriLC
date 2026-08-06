@@ -32,6 +32,8 @@ export interface HeartbeatAgentConfig {
   systemPrompt?: string;
   /** User message override. */
   userMessage?: string;
+  /** Working directory for tool execution (REQ-014b: per-agent cwd). */
+  cwd?: string;
 }
 
 interface AgentRuntimeState extends HeartbeatAgentConfig {
@@ -128,7 +130,8 @@ export function createHeartbeatRunner(opts: {
         const result = await runHeartbeatAgent({
           agentId: id,
           sessionStore,
-          cwd,
+          // REQ-014b: per-agent cwd (onboarding workspace) overrides global cwd
+          cwd: agent.cwd ?? cwd,
           model: agent.model,
           maxTurns: agent.maxTurns,
           systemPrompt: agent.systemPrompt,
