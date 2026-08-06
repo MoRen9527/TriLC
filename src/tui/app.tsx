@@ -546,10 +546,11 @@ PR number: ${args.trim() || '(please list open PRs first)'}`;
             setResumeLoaded(true);
             return;
         }
-        if (resume.messages && resume.messages.length > 0) {
-            setResumeLoaded(true);
-        }
-        else if (resume.sessionId) {
+        // REQ-013: whenever a sessionId exists, loadSession() must run —
+        // it fetches the session's systemPrompt (onboarding persona) and
+        // setSystemPrompt()s it into useChat. The display layer keeps using
+        // resume.messages (same daemon source as loadSession's return).
+        if (resume.sessionId) {
             loadSession(resume.sessionId).then(() => setResumeLoaded(true)).catch(() => setResumeLoaded(true));
         }
         else {

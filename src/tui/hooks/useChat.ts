@@ -71,6 +71,8 @@ export function useChat() {
   const [requestState, setRequestState] = useState<RequestState>('idle');
   const [error, setError] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  // REQ-013: resumed session's systemPrompt (onboarding persona etc.)
+  const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
   const [inputTokens, setInputTokens] = useState(0);
   const [outputTokens, setOutputTokens] = useState(0);
   const [model, setModelState] = useState<string>(DEFAULT_MODEL);
@@ -120,7 +122,8 @@ export function useChat() {
       endpoint: ENDPOINT,
       // P3: interactive:true opts this client into AskUserQuestion waiting
       // and permission prompts via the daemon interaction bridge.
-      body: { model, max_tokens: 4096, messages: apiMessages, stream: true, interactive: true },
+      // REQ-013: carry resumed session's systemPrompt (onboarding persona).
+      body: { model, max_tokens: 4096, messages: apiMessages, stream: true, interactive: true, system: systemPrompt ?? undefined },
 
       // ── REGR-005: onContentBlockStart — append new block to streaming message ──
       onContentBlockStart: (blockType, index) => {
@@ -274,13 +277,19 @@ export function useChat() {
     abortRef.current = cancel;
     // Include `model` so switching via /model doesn't leave the SSE body
     // pointing at the previous model (stale closure off-by-one).
-  }, [requestState, model]);
+    // REQ-013: include `systemPrompt` too — without it send() captured a
+    // stale closure and `system: systemPrompt ?? undefined` was always
+    // undefined (resumed onboarding persona never reached the API).
+  }, [requestState, model, systemPrompt]);
 
   // ── Load session for resume ──
-  const loadSession = useCallback(async (sid: string): Promise<{ messages: Message[]; sessionId: string } | null> => {
+  // REQ-20260805-013: also load session.systemPrompt so resumed chats
+  // (e.g. company-onboarding) continue with the right agent persona,
+  // not the default assistant.
+  const loadSession = useCallback(async (sid: string): Promise<{ messages: Message[]; sessionId: string; systemPrompt?: string } | null> => {
     try {
       const res = await fetch(`http://localhost:8711/internal/v1/sessions/${sid}`);
-      const json = await res.json() as { ok: boolean; session?: { id: string; model: string }; messages?: Array<{ role: string; content: string | null }> };
+      const json = await res.json() as { ok: boolean; session?: { id: string; model: string; systemPrompt?: string }; messages?: Array<{ role: string; content: string | null }> };
       if (!json.ok || !json.messages) return null;
       const msgs: Message[] = json.messages
         .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content)
@@ -289,7 +298,8 @@ export function useChat() {
           content: m.content!,
           isStreaming: false,
         }));
-      return { messages: msgs, sessionId: sid };
+      setSystemPrompt(json.session?.systemPrompt ?? null);
+      return { messages: msgs, sessionId: sid, systemPrompt: json.session?.systemPrompt };
     } catch {
       return null;
     }

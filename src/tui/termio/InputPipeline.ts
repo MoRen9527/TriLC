@@ -53,6 +53,14 @@ export class InputPipeline {
       this.stdin.removeListener('readable', this.handleReadable)
       this.stdin.setRawMode(false as any)
     }
+    // NOTE: do NOT removeAllListeners here. stop() is driven by the
+    // raw-mode refcount (useInput's setRawMode(false) on blur/teardown),
+    // and removing listeners kills every 'input' subscription while the
+    // subscribing useEffects' deps are stable and never re-run — the
+    // keyboard stays dead. Full listener/timer teardown lives in dispose().
+  }
+
+  dispose(): void {
     this.emitter_.removeAllListeners()
     if (this.incompleteTimer) {
       clearTimeout(this.incompleteTimer)

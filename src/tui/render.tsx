@@ -19,6 +19,8 @@ const SIGINT_RESET_MS = 1000;
 export interface TUIResumeOptions {
   sessionId?: string;
   messages?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  // REQ-013: onboarding persona etc. — carried on auto-resume (cli.ts)
+  systemPrompt?: string;
 }
 
 export async function startTUI(resume?: TUIResumeOptions): Promise<{ unmount: () => void; waitUntilExit: () => Promise<void> }> {
@@ -99,7 +101,10 @@ export async function startTUI(resume?: TUIResumeOptions): Promise<{ unmount: ()
   return {
     unmount: () => {
       process.off('SIGINT', handleSigint);
-      pipeline?.stop();
+      // dispose() drops all 'input' subscriptions + timers (full teardown).
+      // stop() alone would be wrong here: stop() is also driven by the
+      // raw-mode refcount and must NOT remove listeners (REQ-014).
+      pipeline?.dispose();
       unmount();
     },
     waitUntilExit: () => Promise.race([inkWait(), exitPromise]),

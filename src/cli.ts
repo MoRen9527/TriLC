@@ -333,7 +333,7 @@ async function cmdChat(port: number, agent?: string, resume?: string): Promise<v
   }
 
   // Step 5: if resume, fetch session from daemon
-  let resumeOpts: { sessionId?: string; messages?: Array<{ role: 'user' | 'assistant'; content: string }> } | undefined;
+  let resumeOpts: { sessionId?: string; messages?: Array<{ role: 'user' | 'assistant'; content: string }>; systemPrompt?: string } | undefined;
   if (resume) {
     try {
       const fetchUrl = `http://127.0.0.1:${port}/internal/v1/sessions/${resume}`;
@@ -352,6 +352,37 @@ async function cmdChat(port: number, agent?: string, resume?: string): Promise<v
     } catch (err) {
       console.error(`[trilc] failed to fetch session ${resume}:`, (err as Error).message);
       process.exit(1);
+    }
+  }
+
+  // REQ-20260805-005 (part 1): auto-resume pending onboarding session.
+  // If TriCompany is uninitialized and user opens chat without --resume,
+  // resume the latest company-onboarding heartbeat session so the CEO
+  // sees the agent's guidance immediately (no manual resume needed).
+  if (!resume && !resumeOpts) {
+    try {
+      const listUrl = `http://127.0.0.1:${port}/internal/v1/sessions`;
+      const res = await fetch(listUrl);
+      const json = await res.json() as { ok: boolean; sessions?: Array<{ id: string; title?: string }> };
+      if (json.ok && json.sessions) {
+        const onboarding = json.sessions.find((s) => s.id.startsWith('hb_company-onboarding_'));
+        if (onboarding) {
+          const fetchUrl = `http://127.0.0.1:${port}/internal/v1/sessions/${onboarding.id}`;
+          const res2 = await fetch(fetchUrl);
+          const json2 = await res2.json() as { ok: boolean; session?: { id: string; model: string; systemPrompt?: string }; messages?: Array<{ role: string; content: string | null }> };
+          if (json2.ok && json2.messages) {
+            const msgs = json2.messages
+              .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content)
+              .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content! }));
+            // REQ-013: carry the session's systemPrompt (onboarding persona)
+            // through the resume path.
+            resumeOpts = { sessionId: onboarding.id, messages: msgs, systemPrompt: json2.session?.systemPrompt };
+            console.log(`[trilc] onboarding pending — auto-resumed ${onboarding.id} (${msgs.length} messages)`);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[trilc] onboarding auto-resume failed:', (err as Error).message);
     }
   }
 
