@@ -90,7 +90,9 @@ export function readEnv(): TriLCEnv {
     openclawGatewayUrl: process.env.OPENCLOW_GATEWAY_URL ?? 'ws://127.0.0.1:8822',
     vscodiumGlueBaseUrl: process.env.VSCODIUM_GLUE_BASE_URL ?? 'http://127.0.0.1:8730',
     trimodelApiUrl: process.env.TRILC_TRIMODEL_API_URL ?? 'http://127.0.0.1:3333',
-    cwd: process.env.TRILC_CWD ?? process.cwd(),
+    // REQ-014b: default to projectRoot when TRILC_CWD unset — chat agents must
+    // operate in the project workspace, not the daemon launch dir (e.g. System32).
+    cwd: process.env.TRILC_CWD ?? process.env.TRILC_PROJECT_ROOT ?? process.cwd(),
     dataDir,
     version: resolveVersion(),
     tricompanySourcePath: process.env.TRICOMPANY_SOURCE_PATH ?? resolveFromWorkspace(),
