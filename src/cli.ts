@@ -893,21 +893,35 @@ const { command, port, serviceName, displayName, agent, resume, listSessions } =
         await init.reset();
         console.log('[trilc] company state reset — re-onboarding will start');
 
-        // Also clean onboarding-assembled skeleton in the workspace (back to git-only).
-        // Onboarding artifacts: .claude/agents, docs/registry/company-state.json,
-        // docs/registry/business-state.md, AGENTS.md — everything except .git.
+        // Clean onboarding-assembled skeleton in the workspace — PRECISE boundary.
+        // Only company-skeleton artifacts are removed; project assets (docs/product,
+        // docs/engineering, etc.) must be preserved (CTO review: reset boundary bug).
         const wsRoot = process.env.TRILC_PROJECT_ROOT ?? process.env.TRILC_CWD ?? process.cwd();
         const { rm } = await import('node:fs/promises');
         const { join, resolve } = await import('node:path');
         const target = resolve(wsRoot);
-        for (const entry of ['.claude', 'docs', 'AGENTS.md']) {
-          const p = join(target, entry);
+
+        // Safety: never operate on system dirs or Program Files.
+        const sysGuard = /^[A-Za-z]:[\\/]windows(?:[\\/]|$)|^[A-Za-z]:[\\/]program files(?:[\\/]|$)/i;
+        if (sysGuard.test(target) || target === 'C:\\Windows\\System32' || target.endsWith('\\System32')) {
+          console.error(`[trilc] REFUSED: refusing to reset workspace ${target} (system directory)`);
+          process.exit(1);
+        }
+
+        const artifacts = [
+          join('.claude', 'agents'),
+          join('docs', 'registry', 'company-state.json'),
+          join('docs', 'registry', 'business-state.md'),
+          'AGENTS.md',
+        ];
+        for (const rel of artifacts) {
+          const p = join(target, rel);
           try {
             await rm(p, { recursive: true, force: true });
-            console.log(`[trilc] workspace cleaned: ${p}`);
+            console.log(`[trilc] skeleton cleaned: ${p}`);
           } catch { /* best-effort */ }
         }
-        console.log(`[trilc] workspace ${target} reset to git-only`);
+        console.log(`[trilc] company skeleton reset — .git preserved for audit/rollback`);
       } else {
         console.error('Usage: trilc company reset');
         process.exit(1);
