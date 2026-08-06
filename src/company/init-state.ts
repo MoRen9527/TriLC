@@ -52,9 +52,11 @@ const DEFAULT_STATE: CompanyStateFile = {
 export class CompanyInitState {
   private statePath: string;
   private cache: CompanyStateFile | null = null;
+  private workspaceRoot?: string;
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, workspaceRoot?: string) {
     this.statePath = resolve(dataDir, "company", "state.json");
+    this.workspaceRoot = workspaceRoot;
   }
 
   /** Load (and cache) current state file. Missing file = uninitialized. */
@@ -86,6 +88,20 @@ export class CompanyInitState {
     await writeFile(this.statePath, JSON.stringify(next, null, 2), "utf-8");
     await import("node:fs/promises").then(({ unlink }) => unlink(tmp).catch(() => {}));
     this.cache = next;
+
+    // REQ-019: baseline commit when onboarding completes (deterministic, CLI-side).
+    // Preserves .git audit trail; agent heartbeat tier has no shell so this runs
+    // in the daemon instead of the agent.
+    if (next.state === 'initialized' && this.workspaceRoot) {
+      try {
+        const { execSync } = await import('node:child_process');
+        execSync('git add -A && git commit -m "onboarding: company skeleton"', {
+          cwd: this.workspaceRoot,
+          stdio: 'ignore',
+        });
+      } catch { /* best-effort — workspace may lack git */ }
+    }
+
     return next;
   }
 

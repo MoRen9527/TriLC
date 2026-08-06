@@ -2239,7 +2239,7 @@ export function createTriLCApp(env: TriLCEnv) {
 
       // REQ-20260805-001: if TriCompany uninitialized, register onboarding agent
       // (auto-pushes greet → ask CEO name → role list → select+name → assemble).
-      const companyInit = new CompanyInitState(env.dataDir);
+      const companyInit = new CompanyInitState(env.dataDir, env.projectRoot ?? env.cwd);
       const agents: HeartbeatAgentConfig[] = [DEFAULT_HEARTBEAT_AGENT];
       try {
         if (await companyInit.isOnboardingPending()) {
