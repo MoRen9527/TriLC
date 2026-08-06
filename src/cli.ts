@@ -821,6 +821,21 @@ const { command, port, serviceName, displayName, agent, resume, listSessions } =
     case 'chat':
       await cmdChat(port, agent, resume);
       break;
+    case 'company': {
+      // REQ-017: debug reset — wipe company state for re-onboarding
+      const sub = process.argv[3];
+      if (sub === 'reset') {
+        const { CompanyInitState } = await import('./company/init-state.js');
+        const dataDir = process.env.TRILC_DATA_DIR ?? `${process.env.LOCALAPPDATA ?? process.env.HOME ?? '/tmp'}/trilc`;
+        const init = new CompanyInitState(dataDir);
+        await init.reset();
+        console.log('[trilc] company state reset — re-onboarding will start');
+      } else {
+        console.error('Usage: trilc company reset');
+        process.exit(1);
+      }
+      break;
+    }
     case 'list-sessions':
       await cmdListSessions(port);
       break;

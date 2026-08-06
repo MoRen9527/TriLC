@@ -9,7 +9,8 @@
 //     "companyName": string | null,
 //     "ceoName": string | null,
 //     "employees": Array<{ role: string; name: string }>,
-//     "onboardedAt": string | null
+//     "onboardedAt": string | null,
+//     "progress": { step, ceoName?, selectedRoles?, employeeNames? }  // REQ-016 断点续接
 //   }
 
 import { mkdir, readFile, writeFile, access } from "node:fs/promises";
@@ -22,12 +23,22 @@ export interface CompanyEmployee {
   name: string;
 }
 
+/** Onboarding progress for resume (REQ-016: step continuity). */
+export interface OnboardingProgress {
+  step: string;                 // greeted | name | roles | naming | confirm | assembling | done
+  ceoName?: string;
+  selectedRoles?: string[];
+  employeeNames?: Record<string, string>;
+  updatedAt?: string;
+}
+
 export interface CompanyStateFile {
   state: CompanyState;
   companyName: string | null;
   ceoName: string | null;
   employees: CompanyEmployee[];
   onboardedAt: string | null;
+  progress?: OnboardingProgress;
 }
 
 const DEFAULT_STATE: CompanyStateFile = {
@@ -82,5 +93,15 @@ export class CompanyInitState {
   async isOnboardingPending(): Promise<boolean> {
     const s = await this.getState();
     return s === "uninitialized" || s === "onboarding";
+  }
+
+  /** Debug reset (REQ-017): wipe state → back to uninitialized for re-onboarding. */
+  async reset(): Promise<void> {
+    this.cache = { ...DEFAULT_STATE };
+    try {
+      const { unlink } = await import("node:fs/promises");
+      await unlink(this.statePath).catch(() => {});
+      await unlink(`${this.statePath}.tmp`).catch(() => {});
+    } catch { /* best-effort */ }
   }
 }

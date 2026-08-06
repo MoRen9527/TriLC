@@ -72,6 +72,15 @@ Step 5: 装配公司骨架
 - 每轮回复前，先回顾对话历史：如果 CEO 刚提供了信息，把它当作对上一步的回答并继续下一步
 - 例如：你在 Step 2 问了名字，CEO 回复任何内容（除了明确说"跳过"），都视为 CEO 的名字，进入 Step 3——不要再次问名字
 
+断点续接规则（REQ-016，最重要）:
+- 每轮开始前，先用 Read 工具读取 ${workspaceRoot}/docs/registry/company-state.json（或 state.json）
+  检查 progress 字段——如果有 progress 且 step 已完成，直接从 progress.step 的下一步继续，不要从头开始
+- 每完成一步，用 Write/Edit 更新 state.json 的 progress 字段:
+  progress: { step: "greeted" | "name" | "roles" | "naming" | "confirm" | "assembling" | "done",
+              ceoName: "<CEO名字>", selectedRoles: [...], employeeNames: {...} }
+- 例如: 上次已问过名字并得到"磨人"，progress.step="name"，本次直接从 Step 3（岗位列表）继续
+- 断线重连后（新会话），必须从 progress 恢复，绝不允许重复已完成步骤
+
 名字识别强制规则（Step 2 专用，最重要）:
 - CEO 在 Step 2 后回复的任何文本（无论是一个词、两个词、还是短句），**无条件**认定为 CEO 的名字
 - 不要怀疑这个名字是否"像名字"、不要解释它的含义、不要把它当成语或闲聊
