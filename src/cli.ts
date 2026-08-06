@@ -3,20 +3,18 @@
 // Provides start/stop/status/run commands for the TriLC daemon.
 // CTO-008-P P.1: CLI entry point for PC desktop packaging.
 
-import { spawn, execSync, type ChildProcess } from 'node:child_process';
-import { readFile, writeFile, unlink, access, mkdir } from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir, platform } from 'node:os';
+import { platform } from 'node:os';
 import type { TriLCDaemonServiceConfig } from './daemon/service.js';
+// REQ-018: PID management lives in pidfile.ts (shared with the daemon).
+import { findProcessByPort, isProcessAlive, readPid, removePidFile, waitProcessExit } from './pidfile.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ── Config ──
 const DEFAULT_PORT = 8711;
-const PID_DIR = resolve(homedir(), '.trimetaverse');
-const PID_FILE = resolve(PID_DIR, 'trilc.pid');
 const HEALTHZ_TIMEOUT_MS = 3000;
 const DEFAULT_SERVICE_NAME = 'TriLC';
 const REGRUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
@@ -87,45 +85,13 @@ function parseArgs(args: string[]): { command: string; port: number; serviceName
   return { command, port, serviceName, displayName, agent, resume, listSessions };
 }
 
-// ── PID file management ──
-async function ensurePidDir(): Promise<void> {
-  try {
-    await access(PID_DIR, constants.F_OK);
-  } catch {
-    const { mkdir } = await import('node:fs/promises');
-    await mkdir(PID_DIR, { recursive: true });
-  }
-}
-
-async function readPid(): Promise<number | null> {
-  try {
-    const content = await readFile(PID_FILE, 'utf-8');
-    return parseInt(content.trim(), 10);
-  } catch {
-    return null;
-  }
-}
-
-async function writePid(pid: number): Promise<void> {
-  await ensurePidDir();
-  await writeFile(PID_FILE, String(pid), 'utf-8');
-}
-
-async function removePidFile(): Promise<void> {
-  try {
-    await unlink(PID_FILE);
-  } catch {
-    // ignore — file may not exist
-  }
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+// ── Process identity (REQ-018) ──
+// A "running trilc" is a PID that is alive AND answers healthz on the port.
+// A bare alive PID could be an unrelated process that reused the PID slot.
+async function isPidTrilc(pid: number, port: number): Promise<boolean> {
+  if (!isProcessAlive(pid)) return false;
+  const health = await healthCheck(port);
+  return health.ok;
 }
 
 // ── HTTP health check ──
@@ -157,20 +123,34 @@ async function healthCheck(port: number): Promise<{ ok: boolean; data?: unknown 
 // ── Commands ──
 
 async function cmdStart(port: number): Promise<void> {
+  // Existing PID file → healthy daemon → already running.
+  // REQ-018 identity check: PID alive AND healthz ok.
   const existingPid = await readPid();
-  if (existingPid && isProcessAlive(existingPid)) {
+  if (existingPid !== null && await isPidTrilc(existingPid, port)) {
     console.log(`[trilc] daemon already running (pid=${existingPid})`);
     return;
   }
 
-  // Port-in-use guard: if daemon was started by another path (nssm service, tricade),
-  // the PID file won't match but the port is already occupied.
+  // Port-in-use guard: if daemon was started by another path (nssm service, tricade,
+  // pre-REQ-018 foreground run), the PID file may be missing while the port is taken.
   if (await isPortInUse(port)) {
-    console.log(`[trilc] daemon already running on port ${port}.`);
-    return;
+    const health = await healthCheck(port);
+    if (health.ok) {
+      console.log(`[trilc] daemon already running on port ${port}.`);
+      return;
+    }
+    // Occupied but unhealthy — identify the owner instead of guessing.
+    const owner = await findProcessByPort(port);
+    if (owner) {
+      console.error(`[trilc] port ${port} occupied by pid ${owner.pid} — not a healthy trilc daemon.`);
+      console.error('[trilc] stop that process (or run trilc stop) before starting.');
+    } else {
+      console.error(`[trilc] port ${port} already in use by another process.`);
+    }
+    process.exit(1);
   }
 
-  // Clean up stale PID file
+  // Clean up stale PID file (the daemon self-registers on startup — REQ-018)
   await removePidFile();
 
   const entryPoint = resolve(__dirname, 'index.js');
@@ -191,43 +171,111 @@ async function cmdStart(port: number): Promise<void> {
     process.exit(1);
   }
 
-  await writePid(child.pid);
-  console.log(`[trilc] daemon started (pid=${child.pid} port=${port})`);
+  // Wait for the daemon to self-register its PID (REQ-018: daemon owns PID file)
+  const deadline = Date.now() + 10000;
+  let registered = false;
+  while (Date.now() < deadline) {
+    const registeredPid = await readPid();
+    if (registeredPid === child.pid) { registered = true; break; }
+    if (!isProcessAlive(child.pid)) break; // spawn died before registering
+    await new Promise((r) => setTimeout(r, 200));
+  }
 
-  // Give it a moment to bind
-  await new Promise((r) => setTimeout(r, 500));
+  const ready = await healthCheck(port);
+  if (!ready.ok) {
+    console.error(`[trilc] daemon failed to start (pid=${child.pid}) — port ${port} not healthy.`);
+    process.exit(1);
+  }
+
+  if (!registered) {
+    console.warn('[trilc] daemon healthy but PID file not registered (check ~/.trimetaverse permissions)');
+  }
+  console.log(`[trilc] daemon started (pid=${child.pid} port=${port})`);
 }
 
 async function cmdStop(port: number = DEFAULT_PORT): Promise<void> {
   const pid = await readPid();
-  if (!pid) {
-    console.log('[trilc] no daemon running (no PID file)');
-    return;
-  }
 
-  if (!isProcessAlive(pid)) {
+  // ── Case A: PID file present ──
+  if (pid !== null) {
+    if (isProcessAlive(pid)) {
+      // Graceful HTTP shutdown first (Windows-compatible), then confirm exit.
+      const shutdownOk = await gracefulShutdown(port);
+      if (shutdownOk) {
+        const exited = await waitProcessExit(pid);
+        if (exited) {
+          console.log(`[trilc] daemon stopped gracefully (pid=${pid})`);
+          await removePidFile();
+          return;
+        }
+        // Shutdown endpoint accepted but the process is still alive — escalate.
+        console.warn(`[trilc] graceful shutdown accepted but pid ${pid} still alive, sending SIGTERM...`);
+      } else {
+        console.log(`[trilc] shutdown endpoint unavailable, sending SIGTERM (pid=${pid})...`);
+      }
+
+      // Fallback: SIGTERM (Linux) / TerminateProcess (Windows)
+      try {
+        process.kill(pid, 'SIGTERM');
+      } catch (err) {
+        console.error(`[trilc] failed to signal daemon (pid=${pid}):`, (err as Error).message);
+      }
+      const exited = await waitProcessExit(pid);
+      if (exited) {
+        console.log(`[trilc] daemon stopped via signal (pid=${pid})`);
+      } else {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+        await waitProcessExit(pid, 3000);
+        console.log(`[trilc] daemon force-killed (pid=${pid})`);
+      }
+      await removePidFile();
+      return;
+    }
+
+    // Stale PID file — clean it and fall through to the port-based check.
     console.log(`[trilc] daemon not running (stale pid=${pid})`);
     await removePidFile();
+  }
+
+  // ── Case B: no PID file — locate the daemon by port (REQ-018 fallback) ──
+  const owner = await findProcessByPort(port);
+  if (!owner) {
+    console.log('[trilc] no daemon running');
     return;
   }
 
-  // Try graceful HTTP shutdown first (Windows-compatible)
+  const health = await healthCheck(port);
+  if (!health.ok) {
+    console.log(`[trilc] port ${port} occupied by pid ${owner.pid} — not a healthy trilc daemon; not killing it.`);
+    return;
+  }
+
+  // Healthy trilc with no PID record (foreground run / foreign path): stop it.
   const shutdownOk = await gracefulShutdown(port);
   if (shutdownOk) {
-    console.log(`[trilc] daemon stopped gracefully (pid=${pid})`);
-    await removePidFile();
-    return;
+    const exited = await waitProcessExit(owner.pid);
+    if (exited) {
+      console.log(`[trilc] daemon stopped via port lookup (pid=${owner.pid})`);
+      return;
+    }
+    console.warn(`[trilc] graceful shutdown accepted but pid ${owner.pid} still alive, sending SIGTERM...`);
+  } else {
+    console.log(`[trilc] shutdown endpoint unavailable, sending SIGTERM (pid=${owner.pid})...`);
   }
 
-  // Fallback: SIGTERM (Linux) / TerminateProcess (Windows)
   try {
-    process.kill(pid, 'SIGTERM');
-    console.log(`[trilc] daemon stopped via signal (pid=${pid})`);
+    process.kill(owner.pid, 'SIGTERM');
   } catch (err) {
-    console.error(`[trilc] failed to stop daemon (pid=${pid}):`, (err as Error).message);
+    console.error(`[trilc] failed to signal pid ${owner.pid}:`, (err as Error).message);
   }
-
-  await removePidFile();
+  const exited = await waitProcessExit(owner.pid);
+  if (exited) {
+    console.log(`[trilc] daemon stopped via signal (pid=${owner.pid})`);
+  } else {
+    try { process.kill(owner.pid, 'SIGKILL'); } catch { /* already gone */ }
+    await waitProcessExit(owner.pid, 3000);
+    console.log(`[trilc] daemon force-killed (pid=${owner.pid})`);
+  }
 }
 
 async function gracefulShutdown(port: number): Promise<boolean> {
@@ -261,12 +309,20 @@ async function cmdRestart(port: number): Promise<void> {
 
 async function cmdStatus(port: number): Promise<void> {
   const pid = await readPid();
-  const alive = pid ? isProcessAlive(pid) : false;
-  const health = alive ? await healthCheck(port) : { ok: false };
+  const health = await healthCheck(port);
+  const pidAlive = pid !== null && isProcessAlive(pid);
+
+  // PID file may be missing while a healthy daemon owns the port
+  // (foreground run / foreign start path) — fall back to port discovery.
+  let effectivePid: number | null = pid;
+  if (!pidAlive && health.ok) {
+    const owner = await findProcessByPort(port);
+    effectivePid = owner?.pid ?? pid;
+  }
 
   const status = {
-    running: alive,
-    pid: pid ?? null,
+    running: health.ok,
+    pid: effectivePid,
     port,
     healthz: health.ok,
     healthData: health.data ?? null,
@@ -298,12 +354,18 @@ async function cmdChat(port: number, agent?: string, resume?: string): Promise<v
 
   if (!health.ok) {
     console.log('[trilc] daemon not running, auto-starting...');
-    // Kill any stale daemon occupying the port but not responding
+    // Kill any stale daemon occupying the port but not responding.
+    // REQ-018: confirm the process actually exited (poll) before removing
+    // the PID file; escalate to SIGKILL only after the wait timeout.
     const existingPid = await readPid();
-    if (existingPid && isProcessAlive(existingPid)) {
+    if (existingPid !== null && isProcessAlive(existingPid)) {
       console.log(`[trilc] stale daemon detected (pid=${existingPid}), killing...`);
       try { process.kill(existingPid, 'SIGTERM'); } catch {}
-      await new Promise((r) => setTimeout(r, 1000));
+      const exited = await waitProcessExit(existingPid, 5000);
+      if (!exited) {
+        try { process.kill(existingPid, 'SIGKILL'); } catch { /* already gone */ }
+        await waitProcessExit(existingPid, 3000);
+      }
       await removePidFile();
     }
   }

@@ -131,10 +131,10 @@ async function readTaskRuntime(config?: TriLCDaemonServiceConfig): Promise<{
   status: "running" | "stopped" | "unknown";
   pid?: number;
 }> {
-  // Try the PID file first (created by CLI's cmdStart)
+  // Try the PID file first (now self-registered by the daemon — REQ-018)
   if (config) {
-    const { homedir } = await import("node:os");
-    const pidFile = path.join(homedir(), ".trimetaverse", "trilc.pid");
+    const { PID_FILE } = await import("../paths.js");
+    const pidFile = PID_FILE;
     try {
       const content = await fs.readFile(pidFile, "utf-8");
       const pid = parseInt(content.trim(), 10);

@@ -1,6 +1,10 @@
+import { readFileSync, unlinkSync } from 'node:fs';
 import { readEnv } from './config/env.js';
 import { LocalRuntimeDaemon } from './runtime/daemon.js';
 import { createTriLCApp } from './server/app.js';
+import { PID_FILE } from './paths.js';
+// REQ-018: daemon owns its PID file — register after listen, unregister on exit.
+import { registerPid, unregisterPid } from './pidfile.js';
 
 // ── Tool registration (CC-equivalent tools) ──
 // Register before daemon starts accepting agent traffic.
@@ -122,7 +126,16 @@ async function main(): Promise<void> {
   const app = createTriLCApp(env);
   await app.start();
 
-  console.log(`[trilc] ready — node=${env.nodeId} port=${app.port}`);
+  // REQ-018: the daemon registers its own PID after the server is listening.
+  // The CLI no longer writes the PID file on spawn — this is the single
+  // source of truth for "where is the daemon" (works for `trilc run` too).
+  try {
+    await registerPid();
+  } catch (err) {
+    console.warn('[trilc] PID registration failed (continue):', (err as Error).message);
+  }
+
+  console.log(`[trilc] ready — node=${env.nodeId} port=${app.port} pid=${process.pid}`);
 
   // ── Graceful shutdown (Windows + Linux compatible) ──
   // On Windows, SIGTERM from process.kill() maps to TerminateProcess.
@@ -133,6 +146,7 @@ async function main(): Promise<void> {
     try {
       await app.stop();
       await daemon.stop();
+      await unregisterPid();
       console.log('[trilc] shutdown complete');
     } catch (err) {
       console.error('[trilc] shutdown error:', err instanceof Error ? err.message : String(err));
@@ -142,6 +156,20 @@ async function main(): Promise<void> {
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+
+  // Synchronous fallback so the PID file is cleaned even if shutdown()
+  // above never runs to completion (e.g. uncaught error path exits).
+  // SIGKILL cannot be caught — the CLI's stale-pid logic covers that case.
+  process.on('exit', () => {
+    try {
+      const content = readFileSync(PID_FILE, 'utf-8');
+      if (parseInt(content.trim(), 10) === process.pid) {
+        unlinkSync(PID_FILE);
+      }
+    } catch {
+      // no PID file or it names another process — leave it alone
+    }
+  });
 }
 
 try {
