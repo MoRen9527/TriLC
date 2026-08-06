@@ -4,7 +4,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve, isAbsolute, dirname } from 'node:path';
-import { register as registerTool } from '@trimetaverse/agent-core';
+import { register as registerTool, type ToolContext } from '@trimetaverse/agent-core';
 
 // ── Quote normalization (A级复制 from CC FileEditTool/utils.ts) ──
 // CC's fuzzy match: when exact old_string match fails, normalize curly quotes
@@ -60,7 +60,7 @@ export function registerEditTool(): void {
         },
       },
     },
-    async (args: Record<string, unknown>) => {
+    async (args: Record<string, unknown>, ctx?: ToolContext) => {
       const filePath = args.file_path as string;
       const oldString = args.old_string as string;
       const newString = args.new_string as string;
@@ -69,9 +69,19 @@ export function registerEditTool(): void {
       if (!filePath) return JSON.stringify({ error: 'file_path is required' });
       if (oldString === undefined || oldString === null) return JSON.stringify({ error: 'old_string is required' });
 
+      const base = ctx?.cwd ?? process.cwd();
       const absolutePath = isAbsolute(filePath)
         ? filePath
-        : resolve(process.cwd(), filePath);
+        : resolve(base, filePath);
+
+      // REQ-014b defense: edits must stay within the agent workspace
+      const workspaceRoot = resolve(base);
+      const normalizedTarget = resolve(absolutePath);
+      if (!normalizedTarget.startsWith(workspaceRoot + '\\') && normalizedTarget !== workspaceRoot) {
+        return JSON.stringify({
+          error: `edit path outside workspace: ${normalizedTarget} (workspace: ${workspaceRoot})`,
+        });
+      }
 
       try {
         // Read existing file

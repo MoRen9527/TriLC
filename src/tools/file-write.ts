@@ -4,7 +4,7 @@
 
 import { writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { resolve, isAbsolute, dirname } from 'node:path';
-import { register as registerTool } from '@trimetaverse/agent-core';
+import { register as registerTool, type ToolContext } from '@trimetaverse/agent-core';
 
 export function registerWriteTool(): void {
   registerTool(
@@ -35,15 +35,26 @@ export function registerWriteTool(): void {
         },
       },
     },
-    async (args: Record<string, unknown>) => {
+    async (args: Record<string, unknown>, ctx?: ToolContext) => {
       const filePath = args.file_path as string;
       const content = args.content as string;
 
       if (!filePath) return JSON.stringify({ error: 'file_path is required' });
 
+      const base = ctx?.cwd ?? process.cwd();
       const absolutePath = isAbsolute(filePath)
         ? filePath
-        : resolve(process.cwd(), filePath);
+        : resolve(base, filePath);
+
+      // REQ-014b+defense: write path must stay within the agent workspace.
+      // Prevents the agent from writing outside its cwd (e.g. System32).
+      const workspaceRoot = resolve(base);
+      const normalizedTarget = resolve(absolutePath);
+      if (!normalizedTarget.startsWith(workspaceRoot + '\\') && normalizedTarget !== workspaceRoot) {
+        return JSON.stringify({
+          error: `write path outside workspace: ${normalizedTarget} (workspace: ${workspaceRoot})`,
+        });
+      }
 
       try {
         let isNew = false;
