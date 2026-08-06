@@ -884,7 +884,7 @@ const { command, port, serviceName, displayName, agent, resume, listSessions } =
       await cmdChat(port, agent, resume);
       break;
     case 'company': {
-      // REQ-017: debug reset — wipe company state for re-onboarding
+      // REQ-017: debug reset — wipe company state + workspace skeleton for re-onboarding
       const sub = process.argv[3];
       if (sub === 'reset') {
         const { CompanyInitState } = await import('./company/init-state.js');
@@ -892,6 +892,22 @@ const { command, port, serviceName, displayName, agent, resume, listSessions } =
         const init = new CompanyInitState(dataDir);
         await init.reset();
         console.log('[trilc] company state reset — re-onboarding will start');
+
+        // Also clean onboarding-assembled skeleton in the workspace (back to git-only).
+        // Onboarding artifacts: .claude/agents, docs/registry/company-state.json,
+        // docs/registry/business-state.md, AGENTS.md — everything except .git.
+        const wsRoot = process.env.TRILC_PROJECT_ROOT ?? process.env.TRILC_CWD ?? process.cwd();
+        const { rm } = await import('node:fs/promises');
+        const { join, resolve } = await import('node:path');
+        const target = resolve(wsRoot);
+        for (const entry of ['.claude', 'docs', 'AGENTS.md']) {
+          const p = join(target, entry);
+          try {
+            await rm(p, { recursive: true, force: true });
+            console.log(`[trilc] workspace cleaned: ${p}`);
+          } catch { /* best-effort */ }
+        }
+        console.log(`[trilc] workspace ${target} reset to git-only`);
       } else {
         console.error('Usage: trilc company reset');
         process.exit(1);
