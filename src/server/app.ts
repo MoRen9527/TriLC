@@ -2030,7 +2030,10 @@ export function createTriLCApp(env: TriLCEnv) {
             return;
           }
           try {
-            const job = await cronEngine.addJob(body as any);
+            const job = await cronEngine.addJob({
+              ...(body as Record<string, unknown>),
+              systemPrompt: (body.systemPrompt as string) ?? '',
+            } as never);
             res.writeHead(201, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ ok: true, job }));
           } catch (err) {
