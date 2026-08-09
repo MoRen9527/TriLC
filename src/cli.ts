@@ -394,6 +394,20 @@ async function cmdChat(port: number, agent?: string, resume?: string): Promise<v
     process.exit(1);
   }
 
+  // Step 4.5: fetch notifications (REQ-021) — show unread before TUI
+  try {
+    const notifUrl = `http://127.0.0.1:${port}/internal/v1/notifications`;
+    const notifRes = await fetch(notifUrl);
+    const notifJson = await notifRes.json() as { ok?: boolean; notifications?: Array<{ title: string; body?: string }> };
+    if (notifJson.ok && notifJson.notifications?.length) {
+      console.log(`[trilc] ${notifJson.notifications.length} 条未读通知:`);
+      for (const n of notifJson.notifications) {
+        console.log(`  📬 ${n.title}${n.body ? ': ' + n.body.slice(0, 100) : ''}`);
+      }
+      console.log('');
+    }
+  } catch { /* notifications are best-effort */ }
+
   // Step 5: if resume, fetch session from daemon
   let resumeOpts: { sessionId?: string; messages?: Array<{ role: 'user' | 'assistant'; content: string }>; systemPrompt?: string } | undefined;
   if (resume) {
