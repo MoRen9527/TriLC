@@ -9,6 +9,7 @@ import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import fs from "node:fs";
 import type { CronJob, CronJobCreate, CronJobPatch, ExecutionLogEntry, ExecutionLogStatus } from "./types.js";
+import { parseCronSchedule } from "./scheduler.js";
 
 const LOG_PREFIX = "[trilc:cron]";
 
@@ -278,6 +279,13 @@ export function createCronStore(dbPath: string) {
         setClauses.push("schedule_tz = ?");
         values.push(null);
       }
+      // Recompute nextRunAt so the timer picks up the new schedule immediately.
+      try {
+        const sched = parseCronSchedule(patch.schedule as never);
+        const next = sched.nextRunMs();
+        setClauses.push("next_run_at = ?");
+        values.push(next ? new Date(next).toISOString() : null);
+      } catch { /* keep previous nextRunAt on parse failure */ }
     }
     if (patch.systemPrompt !== undefined) {
       setClauses.push("system_prompt = ?");
