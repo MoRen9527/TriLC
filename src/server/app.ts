@@ -14,6 +14,7 @@ import { createServer, type Server, type ServerResponse } from 'node:http';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { join } from 'node:path';
+import { writeFile } from 'node:fs/promises';
 import type { TriLCEnv } from '../config/env.js';
 import { agentLoop, register as registerTool, canUseTool } from '@trimetaverse/agent-core';
 import type { AgentEvent, AgentLoopOptions, AgentLoopDeps } from '@trimetaverse/agent-core';
@@ -530,6 +531,19 @@ export function createTriLCApp(env: TriLCEnv) {
     dbPath: `${env.dataDir}/event-queue.db`,
   });
   const sessionStore = createSessionStore(`${env.dataDir}/sessions.db`);
+
+  // ── Notifications (REQ-021) ──
+  // In-memory + persisted to {dataDir}/notifications.json for client pulls.
+  const noticeFile = join(env.dataDir, 'notifications.json');
+  const notices: Array<{ id: string; title: string; body: string; context: string; createdAt: string; read: boolean }> = [];
+  (async () => {
+    try {
+      const { readFile } = await import('node:fs/promises');
+      const raw = await readFile(noticeFile, 'utf-8');
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) notices.push(...arr);
+    } catch { /* no file yet */ }
+  })();
 
   // ── Heartbeat Runner ──
   const heartbeatRunner: TriLCHeartbeatRunner = createHeartbeatRunner({
@@ -2192,6 +2206,39 @@ export function createTriLCApp(env: TriLCEnv) {
         if (req.url?.startsWith('/internal/v1/update/check') && req.method === 'GET') {
           const urlObj = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
           await updateCheckHandler(req, res, urlObj.searchParams);
+          return;
+        }
+
+        // ── GET/POST /internal/v1/notifications ──
+        // REQ-021: system notifications for clients (TriPilot / trilc chat).
+        // POST: external scripts (e.g. weekly_plane_shift) push completion notices.
+        // GET: clients pull unread notifications; ?ack=1 marks read.
+        if (req.url === '/internal/v1/notifications' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) { chunks.push(chunk); }
+          let body: Record<string, unknown> = {};
+          try { body = JSON.parse(Buffer.concat(chunks).toString('utf-8')); } catch { /* ignore */ }
+          const notice = {
+            id: `ntf_${Date.now().toString(36)}`,
+            title: String(body.title ?? '通知'),
+            body: String(body.body ?? ''),
+            context: String(body.context ?? 'system'),
+            createdAt: new Date().toISOString(),
+            read: false,
+          };
+          notices.push(notice);
+          if (notices.length > 100) notices.shift(); // cap
+          try { await writeFile(noticeFile, JSON.stringify(notices, null, 2), 'utf-8'); } catch { /* best-effort */ }
+          res.writeHead(201, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, notification: notice }));
+          return;
+        }
+        if (req.url?.startsWith('/internal/v1/notifications') && req.method === 'GET') {
+          const urlObj = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
+          const ack = urlObj.searchParams.get('ack') === '1';
+          if (ack) { for (const n of notices) n.read = true; try { await writeFile(noticeFile, JSON.stringify(notices, null, 2), 'utf-8'); } catch {} }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, notifications: notices.filter((n) => !n.read || ack), count: notices.filter((n) => !n.read).length }));
           return;
         }
 
