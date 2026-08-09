@@ -394,17 +394,18 @@ async function cmdChat(port: number, agent?: string, resume?: string): Promise<v
     process.exit(1);
   }
 
-  // Step 4.5: fetch notifications (REQ-021) — show unread before TUI
+  // Step 4.5: fetch notifications (REQ-021) — pass via TUI options (no console.log
+  // before TUI; Ink needs clean terminal state for first paint).
+  const notificationMessages: Array<{ role: 'assistant'; content: string }> = [];
   try {
     const notifUrl = `http://127.0.0.1:${port}/internal/v1/notifications`;
     const notifRes = await fetch(notifUrl);
     const notifJson = await notifRes.json() as { ok?: boolean; notifications?: Array<{ title: string; body?: string }> };
     if (notifJson.ok && notifJson.notifications?.length) {
-      console.log(`[trilc] ${notifJson.notifications.length} 条未读通知:`);
       for (const n of notifJson.notifications) {
-        console.log(`  📬 ${n.title}${n.body ? ': ' + n.body.slice(0, 100) : ''}`);
+        const line = `📬 ${n.title}${n.body ? ': ' + n.body.slice(0, 120) : ''}`;
+        notificationMessages.push({ role: 'assistant', content: line });
       }
-      console.log('');
     }
   } catch { /* notifications are best-effort */ }
 
@@ -466,7 +467,12 @@ async function cmdChat(port: number, agent?: string, resume?: string): Promise<v
   if (agent) console.log(`[trilc] agent: ${agent}`);
   try {
     const { startTUI } = await import('./tui/render.js');
-    const root = await startTUI(resumeOpts);
+    // REQ-021: pass notifications as initial assistant messages (clean terminal,
+    // no console.log before Ink's first paint)
+    const opts = resumeOpts
+      ? { ...resumeOpts, messages: [...notificationMessages, ...(resumeOpts.messages ?? [])] }
+      : { messages: notificationMessages };
+    const root = await startTUI(opts);
     await root.waitUntilExit();
     console.log('[trilc] TUI closed.');
   } catch (err) {
