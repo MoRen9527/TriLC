@@ -669,7 +669,7 @@ async function cmdCron(subcommand: string, args: string[], port: number): Promis
       let command = '';
       let enabled = true;
 
-      // Parse flags
+      // Parse flags; first positional arg (if --name not given) is the job name
       for (let i = 0; i < args.length; i++) {
         if (args[i] === '--name' && args[i + 1]) { name = args[++i]; }
         else if (args[i] === '--every' && args[i + 1]) { scheduleKind = 'every'; scheduleEveryMs = parseInt(args[++i], 10); }
@@ -677,6 +677,7 @@ async function cmdCron(subcommand: string, args: string[], port: number): Promis
         else if (args[i] === '--prompt' && args[i + 1]) { systemPrompt = args[++i]; }
         else if (args[i] === '--command' && args[i + 1]) { command = args[++i]; }
         else if (args[i] === '--disabled') { enabled = false; }
+        else if (!args[i].startsWith('-') && !name) { name = args[i]; }
       }
 
       if (!name) {
