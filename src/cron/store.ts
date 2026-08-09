@@ -283,6 +283,10 @@ export function createCronStore(dbPath: string) {
       setClauses.push("system_prompt = ?");
       values.push(patch.systemPrompt);
     }
+    if (patch.command !== undefined) {
+      setClauses.push("command = ?");
+      values.push(patch.command ?? null);
+    }
     if (patch.enabled !== undefined) {
       setClauses.push("enabled = ?");
       values.push(patch.enabled ? 1 : 0);

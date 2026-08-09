@@ -53,6 +53,7 @@ export interface CronJobPatch {
   name?: string;
   schedule?: CronSchedule;
   systemPrompt?: string;
+  command?: string;
   enabled?: boolean;
 }
 
