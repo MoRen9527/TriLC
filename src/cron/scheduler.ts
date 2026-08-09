@@ -26,7 +26,18 @@ export function parseCronSchedule(
       throw new Error(`${LOG_PREFIX} interval too small: ${ms}ms (minimum 1s)`);
     }
     const seconds = Math.round(ms / 1000);
-    const pattern = `*/${seconds} * * * * *`; // croner supports 6-field (with seconds)
+    // croner 6-field: sec min hour dom mon dow. Steps must not exceed field max
+    // (sec≤59, min≤59, hour≤23). Scale large intervals up.
+    let pattern: string;
+    if (seconds >= 3600) {
+      const hours = Math.round(seconds / 3600);
+      pattern = `0 0 */${hours} * * *`;
+    } else if (seconds >= 60) {
+      const minutes = Math.round(seconds / 60);
+      pattern = `0 */${minutes} * * * *`;
+    } else {
+      pattern = `*/${seconds} * * * * *`;
+    }
     cronInstance = new Cron(pattern);
     return {
       nextRunMs: () => {
