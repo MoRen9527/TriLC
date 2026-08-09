@@ -749,6 +749,7 @@ async function cmdCron(subcommand: string, args: string[], port: number): Promis
         else if (args[i] === '--disable') { patch.enabled = false; }
         else if (args[i] === '--name' && args[i + 1]) { patch.name = args[++i]; }
         else if (args[i] === '--prompt' && args[i + 1]) { patch.systemPrompt = args[++i]; }
+        else if (args[i] === '--command' && args[i + 1]) { patch.command = args[++i]; }
         else if (args[i] === '--every' && args[i + 1]) { patch.schedule = { kind: 'every', everyMs: parseInt(args[++i], 10) }; }
         else if (args[i] === '--cron' && args[i + 1]) { patch.schedule = { kind: 'cron', expr: args[++i] }; }
       }
