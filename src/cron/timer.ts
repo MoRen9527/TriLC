@@ -215,12 +215,59 @@ async function executeJobScheduled(state: CronTimerState, deps: CronTimerDeps, j
 interface JobExecutionResult { status: "ok" | "error" | "timeout"; error?: string; }
 
 async function executeJobCore(deps: CronTimerDeps, job: CronJob): Promise<JobExecutionResult> {
+  // REQ-20260806-019: deterministic command execution (no LLM).
+  // Weekly-plane shift etc. run as shell commands via child_process, bypassing
+  // the agent loop entirely (heartbeat tier has no shell anyway).
+  if (job.command) {
+    return executeCommand(job.command, deps.cwd);
+  }
+
   const result = await runHeartbeatAgent({
     agentId: `cron-${job.id}`, sessionStore: deps.sessionStore, cwd: deps.cwd,
     model: "deepseek-v4-flash", maxTurns: 10, systemPrompt: job.systemPrompt,
     userMessage: `Cron job "${job.name}" triggered. Execute your task.`,
   });
   return result.status === "ran" ? { status: "ok" } : { status: "error", error: result.reason };
+}
+
+/** Spawn a deterministic shell command, capturing output. */
+async function executeCommand(command: string, cwd: string): Promise<JobExecutionResult> {
+  const { spawn } = await import("node:child_process");
+  const { platform: osPlatform } = await import("node:os");
+  const isWin = osPlatform() === "win32";
+  const shell = isWin ? "cmd.exe" : "/bin/sh";
+  const shellArgs = isWin ? ["/d", "/s", "/c", command] : ["-c", command];
+
+  return new Promise((resolve) => {
+    let out = "";
+    let err = "";
+    let settled = false;
+    const child = spawn(shell, shellArgs, { cwd, windowsHide: true });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      resolve({ status: "timeout", error: `command timed out (${DEFAULT_JOB_TIMEOUT_MS}ms): ${err || out}` });
+    }, DEFAULT_JOB_TIMEOUT_MS);
+    child.stdout.on("data", (d) => { out += d.toString(); });
+    child.stderr.on("data", (d) => { err += d.toString(); });
+    child.on("error", (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status: "error", error: e.message });
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve({ status: "ok", error: undefined });
+      } else {
+        resolve({ status: "error", error: `exit=${code} stderr=${err.slice(0, 500)} stdout=${out.slice(0, 500)}` });
+      }
+    });
+  });
 }
 
 export async function executeJobCoreWithTimeout(

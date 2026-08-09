@@ -666,6 +666,7 @@ async function cmdCron(subcommand: string, args: string[], port: number): Promis
       let scheduleEveryMs = 0;
       let scheduleCron = '';
       let systemPrompt = '';
+      let command = '';
       let enabled = true;
 
       // Parse flags
@@ -674,6 +675,7 @@ async function cmdCron(subcommand: string, args: string[], port: number): Promis
         else if (args[i] === '--every' && args[i + 1]) { scheduleKind = 'every'; scheduleEveryMs = parseInt(args[++i], 10); }
         else if (args[i] === '--cron' && args[i + 1]) { scheduleKind = 'cron'; scheduleCron = args[++i]; }
         else if (args[i] === '--prompt' && args[i + 1]) { systemPrompt = args[++i]; }
+        else if (args[i] === '--command' && args[i + 1]) { command = args[++i]; }
         else if (args[i] === '--disabled') { enabled = false; }
       }
 
@@ -709,7 +711,7 @@ async function cmdCron(subcommand: string, args: string[], port: number): Promis
         ? { kind: 'every' as const, everyMs: scheduleEveryMs || 3600000 }
         : { kind: 'cron' as const, expr: scheduleCron || '0 9 * * *' };
 
-      const body = { name: name || 'Unnamed job', schedule, systemPrompt: systemPrompt || '', enabled };
+      const body = { name: name || 'Unnamed job', schedule, systemPrompt: systemPrompt || '', command: command || undefined, enabled };
       const result = await cronRequest(port, 'POST', '/internal/v1/cron/jobs', body);
       const job = (result as Record<string, unknown>).job;
       console.log('[OK] job created:', JSON.stringify(job, null, 2));

@@ -22,6 +22,7 @@ const CREATE_JOBS_TABLE_SQL = `
     schedule_value  TEXT NOT NULL,
     schedule_tz     TEXT,
     system_prompt   TEXT NOT NULL DEFAULT '',
+    command         TEXT,
     enabled         INTEGER NOT NULL DEFAULT 1,
     state           TEXT NOT NULL DEFAULT 'idle' CHECK(state IN ('idle','running','failed')),
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -59,6 +60,7 @@ interface CronJobRow {
   schedule_value: string;
   schedule_tz: string | null;
   system_prompt: string;
+  command: string | null;
   enabled: number;
   state: string;
   created_at: string;
@@ -90,6 +92,7 @@ function rowToJob(row: CronJobRow): CronJob {
         ? { kind: "every", everyMs: parseInt(row.schedule_value, 10) }
         : { kind: "cron", expr: row.schedule_value, ...(row.schedule_tz ? { tz: row.schedule_tz } : {}) },
     systemPrompt: row.system_prompt,
+    command: row.command ?? undefined,
     enabled: row.enabled === 1,
     state: row.state as CronJob["state"],
     createdAt: row.created_at,
@@ -128,6 +131,14 @@ export function createCronStore(dbPath: string) {
   db.exec(CREATE_JOBS_TABLE_SQL);
   db.exec(CREATE_EXECUTION_LOG_TABLE_SQL);
   db.exec(CREATE_EXECUTION_LOG_INDEX_SQL);
+
+  // REQ-019: migration — add command column to pre-existing cron.db
+  try {
+    const cols = db.prepare("PRAGMA table_info(cron_jobs)").all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "command")) {
+      db.exec("ALTER TABLE cron_jobs ADD COLUMN command TEXT");
+    }
+  } catch { /* best-effort */ }
 
   // ── In-memory cache ──
   let jobs: CronJob[] = [];
@@ -204,12 +215,12 @@ export function createCronStore(dbPath: string) {
 
     const stmt = db.prepare(`
       INSERT INTO cron_jobs (id, name, schedule_kind, schedule_value, schedule_tz,
-        system_prompt, enabled, state, created_at, updated_at, run_count, error_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, 0, 0)
+        system_prompt, command, enabled, state, created_at, updated_at, run_count, error_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, 0, 0)
     `);
     stmt.run(
       id, input.name, scheduleKind, scheduleValue, scheduleTz,
-      input.systemPrompt, input.enabled ? 1 : 0, now, now,
+      input.systemPrompt, input.command ?? null, input.enabled ? 1 : 0, now, now,
     );
 
     const row = db.prepare("SELECT * FROM cron_jobs WHERE id = ?").get(id) as unknown as CronJobRow;

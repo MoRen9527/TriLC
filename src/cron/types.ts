@@ -29,6 +29,8 @@ export interface CronJob {
   name: string;
   schedule: CronSchedule;
   systemPrompt: string;
+  /** REQ-20260806-019: deterministic command execution (no LLM). Mutually exclusive with systemPrompt usage. */
+  command?: string;
   enabled: boolean;
   state: CronJobState;
   createdAt: string;
