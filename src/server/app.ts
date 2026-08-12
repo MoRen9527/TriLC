@@ -2185,9 +2185,9 @@ export function createTriLCApp(env: TriLCEnv) {
 
             const { compactConversation } = await import('../services/compact/compact.js');
             const triLcMessages = messages
-              .filter((m): m is { role: 'user' | 'assistant'; content: string } =>
+              .filter((m) =>
                 (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.length > 0)
-              .map((m) => ({ role: m.role, content: m.content! }));
+              .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content as string }));
 
             const result = await compactConversation(triLcMessages, body.instructions);
 
