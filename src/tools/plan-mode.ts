@@ -11,6 +11,30 @@
 //   planModeActive (module-level flag) → checked by permission rules
 //   EnterPlanMode sets it, ExitPlanMode clears it
 //   Tool restriction: enforced via system prompt + permission gating
+//
+// C8: DUAL PROTECTION with `plan` permission mode
+// ─────────────────────────────────────────────
+// TriLC now has TWO plan-mode enforcement layers:
+//   1. `plan` permission mode (agent-core decision pipeline Step 7):
+//      Blocks all write/mutate tools at the permission engine level.
+//      Deterministic, non-interactive, applies to the entire session.
+//   2. This EnterPlanMode/ExitPlanMode tool pair (module-level flag):
+//      Blocks tools at the `deps.checkToolPermission` callback level
+//      (see buildPlanModeDeps() in app.ts). Model-driven — the AI
+//      decides when to enter/exit.
+//
+// Retention decision: KEEP both layers as defense-in-depth.
+// - The `plan` permission mode is a CLI-level session guard (user says
+//   "--permission-mode plan" → no writes possible regardless of AI behavior).
+// - The EnterPlanMode/ExitPlanMode tools are an AI-driven planning workflow
+//   (AI can self-impose read-only mode during planning, exit when approved).
+// - Together they provide double-lock: even if the AI exits plan mode early,
+//   the CLI-level `plan` permission mode STILL blocks writes.
+//
+// Risk: if `plan` permission mode AND EnterPlanMode are BOTH active,
+// redundant tool_blocked events are possible (permission engine blocks
+// first, then buildPlanModeDeps blocks second). This is intentional
+// defense-in-depth, not a bug.
 
 import { register as registerTool } from '@trimetaverse/agent-core';
 

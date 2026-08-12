@@ -32,7 +32,7 @@ Commands:
   restart            Restart daemon (stop → start)    trilc restart [--port 8711]
   status             Show daemon status               trilc status [--port 8711]
   run                Run daemon in foreground         trilc run [--port 8711]
-  chat               Start TUI chat (auto-starts daemon) trilc chat [--port 8711] [--agent &lt;id&gt;] [--resume &lt;id&gt;] [--list-sessions]
+  chat               Start TUI chat (auto-starts daemon) trilc chat [--port 8711] [--agent &lt;id&gt;] [--resume &lt;id&gt;] [--permission-mode &lt;mode&gt;]
   list-sessions      List all saved sessions            trilc list-sessions [--port 8711]
   install-service    Register as Windows Service       trilc install-service [--name TriLC] [--displayName "..."]
   uninstall-service  Unregister Windows Service        trilc uninstall-service [--name TriLC]
@@ -48,11 +48,13 @@ Options:
   --displayName <s>   Windows Service display name
   --agent <id>        Agent contract ID for chat (e.g. ceo-chief-of-staff)
   --resume <id>       Resume a previous session by ID
-  --list-sessions     List all saved sessions`);
+  --list-sessions     List all saved sessions
+  --permission-mode <mode>  Permission mode (default/acceptEdits/auto/dontAsk/bypass/plan)
+                            default: bypass (backward compatible)`);
 }
 
 // ── Argument parsing ──
-function parseArgs(args: string[]): { command: string; port: number; serviceName: string; displayName: string; agent?: string; resume?: string; listSessions?: boolean } {
+function parseArgs(args: string[]): { command: string; port: number; serviceName: string; displayName: string; agent?: string; resume?: string; listSessions?: boolean; permissionMode?: string } {
   const command = args[0] ?? 'help';
   let port = DEFAULT_PORT;
   let serviceName = DEFAULT_SERVICE_NAME;
@@ -60,6 +62,7 @@ function parseArgs(args: string[]): { command: string; port: number; serviceName
   let agent: string | undefined;
   let resume: string | undefined;
   let listSessions = false;
+  let permissionMode: string | undefined;
 
   for (let i = 1; i < args.length; i++) {
     if (args[i] === '--port' && args[i + 1]) {
@@ -77,12 +80,24 @@ function parseArgs(args: string[]): { command: string; port: number; serviceName
     } else if (args[i] === '--resume' && args[i + 1]) {
       resume = args[i + 1];
       i++;
+    } else if (args[i] === '--permission-mode' && args[i + 1]) {
+      permissionMode = args[i + 1];
+      i++;
     } else if (args[i] === '--list-sessions') {
       listSessions = true;
     }
   }
 
-  return { command, port, serviceName, displayName, agent, resume, listSessions };
+  // C8: Validate permission-mode value (CLI-level early check)
+  if (permissionMode !== undefined) {
+    const validModes = ['default', 'acceptEdits', 'auto', 'dontAsk', 'bypass', 'plan'];
+    if (!validModes.includes(permissionMode)) {
+      console.error(`[trilc] invalid permission mode: "${permissionMode}". Valid: ${validModes.join(', ')}`);
+      process.exit(1);
+    }
+  }
+
+  return { command, port, serviceName, displayName, agent, resume, listSessions, permissionMode };
 }
 
 // ── Process identity (REQ-018) ──
@@ -122,7 +137,7 @@ async function healthCheck(port: number): Promise<{ ok: boolean; data?: unknown 
 
 // ── Commands ──
 
-async function cmdStart(port: number): Promise<void> {
+async function cmdStart(port: number, permissionMode?: string): Promise<void> {
   // Existing PID file → healthy daemon → already running.
   // REQ-018 identity check: PID alive AND healthz ok.
   const existingPid = await readPid();
@@ -160,7 +175,11 @@ async function cmdStart(port: number): Promise<void> {
     {
       detached: true,
       stdio: 'ignore',
-      env: { ...process.env, TRILC_PORT: String(port) },
+      env: {
+        ...process.env,
+        TRILC_PORT: String(port),
+        ...(permissionMode ? { TRILC_PERMISSION_MODE: permissionMode } : {}),
+      },
     },
   );
 
@@ -331,7 +350,7 @@ async function cmdStatus(port: number): Promise<void> {
   console.log(JSON.stringify(status, null, 2));
 }
 
-async function cmdRun(port: number): Promise<void> {
+async function cmdRun(port: number, permissionMode?: string): Promise<void> {
   // Port-in-use guard: if another daemon (nssm service / tricade / previous cmdStart)
   // is already listening, exit cleanly instead of conflicting.
   if (await isPortInUse(port)) {
@@ -341,6 +360,7 @@ async function cmdRun(port: number): Promise<void> {
 
   // Foreground mode: set env port and run main
   process.env.TRILC_PORT = String(port);
+  if (permissionMode) process.env.TRILC_PERMISSION_MODE = permissionMode;
 
   // index.ts runs main() at top level when imported
   await import('./index.js');
@@ -348,7 +368,7 @@ async function cmdRun(port: number): Promise<void> {
 
 // ── TUI Chat command ──
 
-async function cmdChat(port: number, agent?: string, resume?: string): Promise<void> {
+async function cmdChat(port: number, agent?: string, resume?: string, permissionMode?: string): Promise<void> {
   // Step 1: healthz check
   const health = await healthCheck(port);
 
@@ -371,7 +391,7 @@ async function cmdChat(port: number, agent?: string, resume?: string): Promise<v
   }
 
   // Step 2: ensure daemon is running
-  await cmdStart(port);
+  await cmdStart(port, permissionMode);
 
   // Step 3: wait for daemon to be ready (poll up to 30s)
   const startTime = Date.now();
@@ -885,12 +905,12 @@ async function cmdDaemon(subcommand: string, port: number): Promise<void> {
 }
 
 // ── Entry ──
-const { command, port, serviceName, displayName, agent, resume, listSessions } = parseArgs(process.argv.slice(2));
+const { command, port, serviceName, displayName, agent, resume, listSessions, permissionMode } = parseArgs(process.argv.slice(2));
 
 (async () => {
   switch (command) {
     case 'start':
-      await cmdStart(port);
+      await cmdStart(port, permissionMode);
       break;
     case 'stop':
       await cmdStop(port);
@@ -902,10 +922,10 @@ const { command, port, serviceName, displayName, agent, resume, listSessions } =
       await cmdStatus(port);
       break;
     case 'run':
-      await cmdRun(port);
+      await cmdRun(port, permissionMode);
       break;
     case 'chat':
-      await cmdChat(port, agent, resume);
+      await cmdChat(port, agent, resume, permissionMode);
       break;
     case 'company': {
       // REQ-017: debug reset — wipe company state + workspace skeleton for re-onboarding

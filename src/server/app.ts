@@ -662,6 +662,12 @@ export function createTriLCApp(env: TriLCEnv) {
       // Step 2: Set TriModel API URL for HTTP-priority model fetching
       setTrimodelApiUrl(env.trimodelApiUrl);
 
+      // C8: Read default permission mode from CLI/env (backward-compat: bypassPermissions)
+      if (process.env.TRILC_PERMISSION_MODE) {
+        _defaultPermissionMode = resolvePermissionMode(process.env.TRILC_PERMISSION_MODE);
+        console.log(`[trilc] permission mode: ${_defaultPermissionMode} (from TRILC_PERMISSION_MODE)`);
+      }
+
       // Step 2b: Initialize provider credentials before accepting model traffic.
       onKeyCacheUpdated(applyKeyCacheToEnvironment);
       await initKeyCache(env.trimodelApiUrl, env.dataDir, process.env.TRIMODEL_API_TOKEN);
@@ -936,6 +942,8 @@ export function createTriLCApp(env: TriLCEnv) {
             toolNames.push(tool.function.name);
           }
 
+          const effectivePermissionMode = resolvePermissionMode(parsed.permission_mode) as PermissionMode;
+
           const loopOptions: AgentLoopOptions = {
             model,
             systemPrompt: parsed.system || defaultSystemPrompt(),
@@ -943,6 +951,8 @@ export function createTriLCApp(env: TriLCEnv) {
             maxTurns,
             tier: 'main',
             cwd: env.cwd,
+            // C8: Use resolved permission mode (from request body or env default)
+            permissionMode: effectivePermissionMode,
             // P3: interactive requests get the dangerous-tool ask rules plus
             // the TUI permission bridge; non-interactive clients unchanged.
             ...(isInteractive
@@ -1326,6 +1336,8 @@ export function createTriLCApp(env: TriLCEnv) {
             toolNames.push(tool.function.name);
           }
 
+          const oaiPermissionMode = resolvePermissionMode(parsed.permission_mode) as PermissionMode;
+
           const loopOptions: AgentLoopOptions = {
             model,
             systemPrompt: oaiSystem || defaultSystemPrompt(),
@@ -1333,6 +1345,8 @@ export function createTriLCApp(env: TriLCEnv) {
             maxTurns,
             tier: 'main',
             cwd: env.cwd,
+            // C8: Use resolved permission mode
+            permissionMode: oaiPermissionMode,
             // P7: Plan mode tool gating via deps.checkToolPermission
             deps: buildPlanModeDeps(),
           };
@@ -1834,6 +1848,7 @@ export function createTriLCApp(env: TriLCEnv) {
               maxTurns: 25,
               tier: 'main',
               cwd,
+              permissionMode: _defaultPermissionMode as PermissionMode,
             })) {
               // C13: Stop processing if we already sent a terminal error.
               // W30 lesson: never send task_done after task_error.
@@ -2445,6 +2460,8 @@ interface AnthropicRequest {
   tools?: AnthropicTool[];
   /** P3: opt-in interactive mode — enables TUI question/permission prompts. */
   interactive?: boolean;
+  /** C8: Permission mode override (default/acceptEdits/auto/dontAsk/bypass/plan). */
+  permission_mode?: string;
 }
 
 interface AnthropicMessage {
@@ -2478,6 +2495,8 @@ interface OpenAIRequest {
   stream?: boolean;
   max_tokens?: number;
   tools?: OpenAIToolDef[];
+  /** C8: Permission mode override (default/acceptEdits/auto/dontAsk/bypass/plan). */
+  permission_mode?: string;
 }
 
 interface OpenAIMessage {
@@ -2590,6 +2609,20 @@ function validateModelRegistry(): void {
 let _modelClient: ReturnType<typeof createModelClient> | null = null;
 let _modelCache: { models: ModelInfo[]; expiresAt: number } | null = null;
 const MODEL_CACHE_TTL_MS = 60_000; // 1 minute
+
+// C8: Default permission mode — set from env TRILC_PERMISSION_MODE at startup,
+// overridable per-request via permission_mode body field. Backward-compat: bypassPermissions.
+let _defaultPermissionMode: string = 'bypassPermissions';
+
+/** C8: Resolve the effective permission mode for a request. */
+function resolvePermissionMode(requestOverride?: string): string {
+  if (requestOverride) {
+    // Accept shorthand 'bypass' → 'bypassPermissions'
+    if (requestOverride === 'bypass') return 'bypassPermissions';
+    return requestOverride;
+  }
+  return _defaultPermissionMode;
+}
 
 // TriModel configuration-plane API URL for HTTP-priority model fetching
 let _trimodelApiUrl = 'http://127.0.0.1:3333';
