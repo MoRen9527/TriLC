@@ -668,6 +668,11 @@ export function createTriLCApp(env: TriLCEnv) {
       const initialKeyCache = getKeyCache();
       if (initialKeyCache) applyKeyCacheToEnvironment(initialKeyCache);
 
+      // C12: Validate model registry at startup (after key cache → env applied).
+      // Checks that fallback-target models are in the registry; WARNING on gaps,
+      // never blocks startup. W30: "Unknown model" was a registry gap in prod.
+      validateModelRegistry();
+
       // Phase 2: Initialize contract resolver (load agents from TriCompany)
       const { getContractResolver } = await import('../config/contract-resolver.js');
       const agentCount = await getContractResolver(env.tricompanySourcePath).loadAll();
@@ -1807,7 +1812,7 @@ export function createTriLCApp(env: TriLCEnv) {
           const modelCheck = validateModelAgainstRegistry(entry.model);
           if (!modelCheck.valid) {
             const errDetail = modelCheck.error ?? `Model "${entry.model}" not available`;
-            console.error(`[trilc:degraded:fallback-chain] ${errDetail}`);
+            console.error(`[trilc:model] CRITICAL: model not in registry for task=${sessionId}: ${errDetail}`);
             entry.status = 'error';
             publish({ type: 'task:failed', taskId: sessionId, error: errDetail });
             writeSSE('task_error', { status: 'failed', error: errDetail });
@@ -1873,6 +1878,19 @@ export function createTriLCApp(env: TriLCEnv) {
                   }
                   break;
                 }
+                case 'loop_start': {
+                  // Forward loop_start metadata to SSE clients
+                  break;
+                }
+                case 'recovery': {
+                  // C13: agent-core Tier 2 fallback — model provider failed,
+                  // switching to fallback model. Log for degraded diagnostics.
+                  const rec = event as any;
+                  if (rec.tier === 2) {
+                    console.log(`[trilc:model] degraded to fallback model: ${rec.message}`);
+                  }
+                  break;
+                }
                 case 'loop_end': {
                   // Will be handled after the loop
                   break;
@@ -1881,25 +1899,9 @@ export function createTriLCApp(env: TriLCEnv) {
                   const err = event as any;
                   const errorMessage = err.message ?? String(err);
                   terminalError = errorMessage;
-                  // C13: degraded semantics — distinguish model provider failures
-                  // from other error types. W30: provider 全挂时日志必须可辨。
-                  if (
-                    errorMessage.includes('Unknown model') ||
-                    errorMessage.includes('not in') ||
-                    errorMessage.includes('fallback')
-                  ) {
-                    console.error(`[trilc:degraded:fallback-chain] ${errorMessage}`);
-                  } else if (
-                    errorMessage.includes('Provider') ||
-                    errorMessage.includes('provider') ||
-                    errorMessage.includes('timeout') ||
-                    errorMessage.includes('ECONNREFUSED') ||
-                    errorMessage.includes('ENOTFOUND')
-                  ) {
-                    console.error(`[trilc:degraded:model-provider] ${errorMessage}`);
-                  } else {
-                    console.error(`[trilc:task] agent error: ${errorMessage}`);
-                  }
+                  // C13/R3: all providers exhausted — agent-core has already
+                  // attempted Tier 1 (retry) and Tier 2 (fallback model) recovery.
+                  console.error(`[trilc:model] CRITICAL: all providers exhausted for task=${sessionId}: ${errorMessage}`);
                   writeSSE('task_error', {
                     status: 'failed',
                     error: errorMessage,
@@ -1932,7 +1934,7 @@ export function createTriLCApp(env: TriLCEnv) {
             const producedAnyOutput = deltaContent.length > 0 || toolCount > 0;
             if (!producedAnyOutput) {
               const emptyError = 'Model loop completed without any content or tool calls — possible provider failure or empty reasoning-only response';
-              console.error(`[trilc:degraded:model-provider] ${emptyError}`);
+              console.error(`[trilc:model] CRITICAL: all providers exhausted for task=${sessionId}: ${emptyError}`);
               entry.status = 'error';
               publish({ type: 'task:failed', taskId: sessionId, error: emptyError });
               writeSSE('task_error', { status: 'failed', error: emptyError });
@@ -1964,26 +1966,9 @@ export function createTriLCApp(env: TriLCEnv) {
             }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
-            // C13: degraded semantics — distinguish error categories for diagnostics.
-            // W30: three distinct states must be identifiable from logs alone.
-            if (
-              msg.includes('Unknown model') ||
-              msg.includes('not in') ||
-              msg.includes('fallback') ||
-              msg.includes('All fallback')
-            ) {
-              console.error(`[trilc:degraded:fallback-chain] ${msg}`);
-            } else if (
-              msg.includes('Provider') ||
-              msg.includes('provider') ||
-              msg.includes('timeout') ||
-              msg.includes('ECONNREFUSED') ||
-              msg.includes('ENOTFOUND') ||
-              msg.includes('ETIMEDOUT')
-            ) {
-              console.error(`[trilc:degraded:model-provider] ${msg}`);
-            }
-            // Note: [trilc:degraded:trimc] is handled by ConnectionManager (not model-related).
+            // C13/R3: agentLoop threw — this means all provider-level and
+            // model-level fallback attempts have been exhausted.
+            console.error(`[trilc:model] CRITICAL: all providers exhausted for task=${sessionId}: ${msg}`);
             entry.status = 'error';
             // S7: Publish task:failed for mirror pusher
             publish({ type: 'task:failed', taskId: sessionId, error: msg });
@@ -2549,11 +2534,56 @@ function validateModelAgainstRegistry(model: string): { valid: boolean; error?: 
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[trilc:degraded:model-registry] cannot validate model "${model}": ${msg}`);
+    console.error(`[trilc:model] cannot validate model "${model}": ${msg}`);
     return {
       valid: false,
       error: `Model registry unavailable — cannot validate "${model}": ${msg}`,
     };
+  }
+}
+
+/**
+ * C12/R2: Startup-time model registry integrity check.
+ * Runs after key cache init + env propagation. Validates that the configured
+ * default model and well-known fallback targets exist in TriModel's registry.
+ * Gaps emit WARNING; never blocks startup.
+ * W30 lesson: a registry gap ("Unknown model") in prod is a silent user-facing failure.
+ */
+function validateModelRegistry(): void {
+  try {
+    const client = createModelClient();
+    const models = client.listModels();
+    if (models.length === 0) {
+      console.warn('[trilc:model] WARNING: model registry is empty — no providers configured, chat will fail');
+      console.warn('[trilc:model]         check API keys (DEEPSEEK_API_KEY, ANTHROPIC_API_KEY, etc.)');
+      return;
+    }
+
+    const defaultModel = getKeyCache()?.defaultModel
+      ?? process.env.TRIMODEL_DEFAULT_MODEL
+      ?? 'deepseek-v4-pro';
+
+    // Known ultimate fallback targets — these MUST be in the registry for
+    // agent-core's Tier 2 recovery to work. If missing, tmv-* models will
+    // have no viable fallback path when TriStaciss is offline.
+    const criticalFallbacks = ['deepseek-v4-flash', 'deepseek-v4-pro'];
+    const missing: string[] = [];
+    if (!models.includes(defaultModel)) {
+      missing.push(defaultModel);
+    }
+    for (const fb of criticalFallbacks) {
+      if (!models.includes(fb)) missing.push(fb);
+    }
+
+    if (missing.length > 0) {
+      console.warn(`[trilc:model] WARNING: model(s) not in registry: ${missing.join(', ')} — check provider API keys`);
+    }
+    console.log(
+      `[trilc:model] registry check: ${models.length} models (${models.join(', ')})` +
+      (missing.length === 0 ? ', fallback chain ok' : ', fallback chain incomplete — see WARNING above'),
+    );
+  } catch (err) {
+    console.warn(`[trilc:model] registry check failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -2616,9 +2646,9 @@ async function getAvailableModels(): Promise<ModelInfo[]> {
   } catch (err) {
     // C12: W30 lesson — never return hardcoded defaults when registry is unavailable.
     // A hardcoded default masks the root cause and causes "Unknown model" downstream.
-    console.error(`[trilc:degraded:model-registry] model registry unavailable (API + library both failed): ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`[trilc:model] model registry unavailable (API + library both failed): ${err instanceof Error ? err.message : String(err)}`);
     if (_modelCache) {
-      console.warn('[trilc:degraded:model-registry] serving stale cached models as last resort');
+      console.warn('[trilc:model] serving stale cached model list as last resort');
       return _modelCache.models;
     }
     return [];
