@@ -2156,6 +2156,65 @@ export function createTriLCApp(env: TriLCEnv) {
           return;
         }
 
+        // ── C15: POST /internal/v1/sessions/{id}/compact ──
+        // Manual compaction: reads session messages, calls compactConversation(),
+        // returns summary + tokensRemoved. Optionally persists compacted messages.
+        const compactMatch = req.url?.match(/^\/internal\/v1\/sessions\/([^/]+)\/compact$/);
+        if (compactMatch && req.method === 'POST') {
+          try {
+            const sessionId = compactMatch[1];
+            const session = sessionStore.getSession(sessionId);
+            if (!session) {
+              res.writeHead(404, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'not_found', message: `Session ${sessionId} not found` }));
+              return;
+            }
+
+            const messages = sessionStore.getMessages(sessionId);
+            if (messages.length < 3) {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'not_enough_messages', message: 'Need at least 3 messages to compact' }));
+              return;
+            }
+
+            // Parse optional body for custom instructions
+            const chunks: Buffer[] = [];
+            for await (const chunk of req) chunks.push(chunk);
+            let body: { instructions?: string; persist?: boolean } = {};
+            try { body = JSON.parse(Buffer.concat(chunks).toString('utf-8')); } catch { /* empty body OK */ }
+
+            const { compactConversation } = await import('../services/compact/compact.js');
+            const triLcMessages = messages
+              .filter((m): m is { role: 'user' | 'assistant'; content: string } =>
+                (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.length > 0)
+              .map((m) => ({ role: m.role, content: m.content! }));
+
+            const result = await compactConversation(triLcMessages, body.instructions);
+
+            // Optionally persist the compacted summary
+            if (body.persist !== false) {
+              sessionStore.saveMessages(sessionId, [
+                { role: 'assistant', content: `[Compacted conversation summary]\n${result.summary}` },
+              ]);
+            }
+
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: true,
+              sessionId,
+              summaryLength: result.summary.length,
+              summary: result.summary,
+              tokensRemoved: result.tokensRemoved,
+              originalMessageCount: messages.length,
+            }));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'compact_failed', message: msg }));
+          }
+          return;
+        }
+
         // ── POST /internal/v1/cron/jobs ──
         // Add a new cron job. Body: CronJobCreate JSON.
         if (req.url === '/internal/v1/cron/jobs' && req.method === 'POST') {

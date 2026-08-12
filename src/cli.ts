@@ -34,6 +34,7 @@ Commands:
   run                Run daemon in foreground         trilc run [--port 8711]
   chat               Start TUI chat (auto-starts daemon) trilc chat [--port 8711] [--agent &lt;id&gt;] [--resume &lt;id&gt;] [--permission-mode &lt;mode&gt;]
   list-sessions      List all saved sessions            trilc list-sessions [--port 8711]
+  session compact    Compact a session's messages         trilc session compact <id>
   install-service    Register as Windows Service       trilc install-service [--name TriLC] [--displayName "..."]
   uninstall-service  Unregister Windows Service        trilc uninstall-service [--name TriLC]
   install-regrun     Register to Registry Run (no-admin) trilc install-regrun
@@ -1219,6 +1220,32 @@ const { command, port, serviceName, displayName, agent, resume, listSessions, pe
         console.log(`[trilc] company skeleton reset — .git preserved for audit/rollback`);
       } else {
         console.error('Usage: trilc company reset');
+        process.exit(1);
+      }
+      break;
+    }
+    case 'session': {
+      const sub = process.argv[3];
+      if (sub === 'compact' && process.argv[4]) {
+        const sessionId = process.argv[4];
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/internal/v1/sessions/${sessionId}/compact`, { method: 'POST' });
+          const json = await res.json() as { ok?: boolean; error?: string; message?: string; summary?: string; tokensRemoved?: number; originalMessageCount?: number };
+          if (json.ok) {
+            console.log(`[OK] Session ${sessionId} compacted:`);
+            console.log(`     Original messages: ${json.originalMessageCount}`);
+            console.log(`     Tokens removed: ~${json.tokensRemoved}`);
+            console.log(`     Summary length: ${json.summary?.length ?? 0} chars`);
+          } else {
+            console.error(`[trilc] compact failed: ${json.message ?? json.error ?? 'unknown'}`);
+            process.exit(1);
+          }
+        } catch (err) {
+          console.error(`[trilc] compact failed: ${(err as Error).message}`);
+          process.exit(1);
+        }
+      } else {
+        console.error('Usage: trilc session compact <id>');
         process.exit(1);
       }
       break;
