@@ -813,6 +813,24 @@ export function createTriLCApp(env: TriLCEnv) {
       // P4.2: Register shell_exec tool backed by ProcessSupervisor
       registerShellExecTool({ supervisor: getDefaultSupervisor() });
 
+      // 2.1/2.2: Post task result back to TriMC when connected
+      const postTaskResultToTriMC = async (
+        sessionId: string, status: 'success' | 'failed', result?: string, error?: string,
+      ): Promise<void> => {
+        if (connMgr.currentState !== 'connected') return;
+        try {
+          const resultUrl = `${env.trimcBaseUrl}/internal/v1/tasks/result`;
+          await fetch(resultUrl, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId, status, result, error }),
+          });
+          console.log(`[trilc:task] result posted to TriMC: ${sessionId} status=${status}`);
+        } catch (err) {
+          console.warn(`[trilc:task] failed to post result to TriMC: ${(err as Error).message}`);
+        }
+      };
+
       // Step 2: Set TriModel API URL for HTTP-priority model fetching
       setTrimodelApiUrl(env.trimodelApiUrl);
 
@@ -2194,6 +2212,9 @@ export function createTriLCApp(env: TriLCEnv) {
                 : 'Task completed',
             });
 
+            // 2.1/2.2: Post result back to TriMC
+            postTaskResultToTriMC(sessionId, 'success', deltaContent || undefined).catch(() => {});
+
             // Persist session as completed
             try {
               sessionStore.saveMessages(sessionId, [
@@ -2206,13 +2227,12 @@ export function createTriLCApp(env: TriLCEnv) {
             }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
-            // C13/R3: agentLoop threw — this means all provider-level and
-            // model-level fallback attempts have been exhausted.
             console.error(`[trilc:model] CRITICAL: all providers exhausted for task=${sessionId}: ${msg}`);
             entry.status = 'error';
-            // S7: Publish task:failed for mirror pusher
             publish({ type: 'task:failed', taskId: sessionId, error: msg });
             writeSSE('task_error', { status: 'failed', error: msg });
+            // 2.1/2.2: Post failure result back to TriMC
+            postTaskResultToTriMC(sessionId, 'failed', undefined, msg).catch(() => {});
 
             try {
               sessionStore.updateSessionStatus(sessionId, 'error');
