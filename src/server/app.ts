@@ -813,14 +813,15 @@ export function createTriLCApp(env: TriLCEnv) {
       // P4.2: Register shell_exec tool backed by ProcessSupervisor
       registerShellExecTool({ supervisor: getDefaultSupervisor() });
 
-      // 2.1/2.2: Post task result back to TriMC when connected
+      // 2.1/2.2: Post task result back to TriMC when connected or callback URL configured
       const postTaskResultToTriMC = async (
         sessionId: string, status: 'success' | 'failed', result?: string, error?: string,
       ): Promise<void> => {
-        if (connMgr.currentState !== 'connected') return;
+        const callbackUrl = process.env.TRILC_TRIMC_CALLBACK_URL
+          ?? (connMgr.currentState === 'connected' ? `${env.trimcBaseUrl}/internal/v1/tasks/result` : null);
+        if (!callbackUrl) return;
         try {
-          const resultUrl = `${env.trimcBaseUrl}/internal/v1/tasks/result`;
-          await fetch(resultUrl, {
+          await fetch(callbackUrl, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ sessionId, status, result, error }),
