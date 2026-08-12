@@ -134,11 +134,12 @@ function summarizeToolArgs(toolName: string, args: Record<string, unknown>): str
   return JSON.stringify(args).slice(0, 200);
 }
 
-// ── P7: Plan mode tool gating ──
-// Injects deps.checkToolPermission into every AgentLoopOptions so that
-// EnterPlanMode→ExitPlanMode brackets are enforced at tool-execution time.
-// The callback runs AFTER permissionEngine (P3) and BEFORE actual execution.
-function buildPlanModeDeps(): AgentLoopDeps {
+// ── P7: Plan mode tool gating + C15: Auto-compaction ──
+// Injects deps.checkToolPermission + deps.compactConversation into every
+// AgentLoopOptions so that EnterPlanMode→ExitPlanMode brackets are enforced
+// at tool-execution time, and conversations are auto-compacted when approaching
+// the context window limit.
+function buildAgentDeps(): AgentLoopDeps {
   return {
     checkToolPermission: (toolName, tier) => {
       // First tier check (agent-core native tier gating)
@@ -157,6 +158,22 @@ function buildPlanModeDeps(): AgentLoopDeps {
       }
 
       return { allowed: true };
+    },
+
+    // C15: Auto-compaction callback — called by agent loop when prompt tokens
+    // exceed the compaction threshold (default: 80% of 128K context ~102400 tokens).
+    compactConversation: async (messages) => {
+      const { compactConversation: doCompact } = await import('../services/compact/compact.js');
+      // Convert agent-core Message[] to compact service TriLCMessage[]
+      const triLcMessages = messages
+        .filter((m): m is { role: 'user' | 'assistant'; content: string } =>
+          (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+        .map((m) => ({ role: m.role, content: m.content as string }));
+      if (triLcMessages.length < 3) {
+        throw new Error('Not enough messages to compact (need >= 3)');
+      }
+      const result = await doCompact(triLcMessages);
+      return { summary: result.summary, tokensRemoved: result.tokensRemoved };
     },
   };
 }
@@ -1004,7 +1021,7 @@ export function createTriLCApp(env: TriLCEnv) {
               ? { onPermissionAsk: askPermissionViaTui }
               : {}),
             // P7: Plan mode tool gating via deps.checkToolPermission
-            deps: buildPlanModeDeps(),
+            deps: buildAgentDeps(),
           };
           const wantsStream = parsed.stream !== false;
 
@@ -1265,7 +1282,7 @@ export function createTriLCApp(env: TriLCEnv) {
             permissionMode: parsed.permissionMode,
             permissionRules: parsed.permissionRules,
             // P7: Plan mode tool gating via deps.checkToolPermission
-            deps: buildPlanModeDeps(),
+            deps: buildAgentDeps(),
           };
 
           const wantsSSE =
@@ -1394,7 +1411,7 @@ export function createTriLCApp(env: TriLCEnv) {
             // C9: Additional directories from CLI --add-dir
             additionalDirectories: _cliAdditionalDirs.length > 0 ? _cliAdditionalDirs : undefined,
             // P7: Plan mode tool gating via deps.checkToolPermission
-            deps: buildPlanModeDeps(),
+            deps: buildAgentDeps(),
           };
 
           const wantsStream = parsed.stream !== false;

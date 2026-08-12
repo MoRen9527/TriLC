@@ -20,7 +20,7 @@
 //      Deterministic, non-interactive, applies to the entire session.
 //   2. This EnterPlanMode/ExitPlanMode tool pair (module-level flag):
 //      Blocks tools at the `deps.checkToolPermission` callback level
-//      (see buildPlanModeDeps() in app.ts). Model-driven — the AI
+//      (see buildAgentDeps() in app.ts). Model-driven — the AI
 //      decides when to enter/exit.
 //
 // Retention decision: KEEP both layers as defense-in-depth.
@@ -33,7 +33,7 @@
 //
 // Risk: if `plan` permission mode AND EnterPlanMode are BOTH active,
 // redundant tool_blocked events are possible (permission engine blocks
-// first, then buildPlanModeDeps blocks second). This is intentional
+// first, then buildAgentDeps blocks second). This is intentional
 // defense-in-depth, not a bug.
 
 import { register as registerTool } from '@trimetaverse/agent-core';
