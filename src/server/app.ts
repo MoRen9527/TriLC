@@ -668,6 +668,41 @@ export function createTriLCApp(env: TriLCEnv) {
         console.log(`[trilc] permission mode: ${_defaultPermissionMode} (from TRILC_PERMISSION_MODE)`);
       }
 
+      // C9: Read CLI allow/deny rules, additional dirs, and print mode from env
+      _cliAllowRulePatterns = parseRuleListEnv(process.env.TRILC_ALLOW_RULES);
+      _cliDenyRulePatterns = parseRuleListEnv(process.env.TRILC_DENY_RULES);
+      _cliAdditionalDirs = parseStringListEnv(process.env.TRILC_ADD_DIRS);
+      _printMode = process.env.TRILC_PRINT_MODE === '1';
+
+      if (_cliAllowRulePatterns.length > 0 || _cliDenyRulePatterns.length > 0) {
+        console.log(`[trilc] CLI rules: ${_cliAllowRulePatterns.length} allow, ${_cliDenyRulePatterns.length} deny`);
+      }
+      if (_cliAdditionalDirs.length > 0) {
+        console.log(`[trilc] additional dirs: ${_cliAdditionalDirs.join(', ')}`);
+      }
+      if (_printMode) {
+        console.log('[trilc] print mode: non-interactive (-p), ask→deny enforced');
+        // C9: -p forces non-interactive — if mode is bypass, must switch to default.
+        // This is a safety enforcement: bypass mode requires user interaction for
+        // safety-flagged tools, which is impossible in print mode.
+        if (_defaultPermissionMode === 'bypassPermissions') {
+          console.warn('[trilc] print mode: overriding bypassPermissions → default (bypass incompatible with -p)');
+          _defaultPermissionMode = 'default';
+        }
+      }
+
+      // C9: Load persisted permission rules from disk (both allow and deny)
+      // and merge with CLI rules. CLI rules take precedence (checked first).
+      try {
+        const { loadPersistedRules } = await import('../services/permissions/PermissionStore.js');
+        _persistedPermissionRules = loadPersistedRules();
+        if (_persistedPermissionRules.length > 0) {
+          console.log(`[trilc] loaded ${_persistedPermissionRules.length} persisted permission rules from disk`);
+        }
+      } catch (err) {
+        console.warn('[trilc] failed to load persisted permission rules:', (err as Error).message);
+      }
+
       // Step 2b: Initialize provider credentials before accepting model traffic.
       onKeyCacheUpdated(applyKeyCacheToEnvironment);
       await initKeyCache(env.trimodelApiUrl, env.dataDir, process.env.TRIMODEL_API_TOKEN);
@@ -943,6 +978,13 @@ export function createTriLCApp(env: TriLCEnv) {
           }
 
           const effectivePermissionMode = resolvePermissionMode(parsed.permission_mode) as PermissionMode;
+          // C9: Build combined permission rules (CLI + persisted + interactive)
+          const sessionRules = buildSessionPermissionRules();
+          const mergedPermissionRules: PermissionRule[] = [
+            ...sessionRules,
+            // P3: interactive requests inject ask rules for dangerous tools
+            ...(isInteractive && !_printMode ? INTERACTIVE_ASK_RULES : []),
+          ];
 
           const loopOptions: AgentLoopOptions = {
             model,
@@ -953,13 +995,13 @@ export function createTriLCApp(env: TriLCEnv) {
             cwd: env.cwd,
             // C8: Use resolved permission mode (from request body or env default)
             permissionMode: effectivePermissionMode,
-            // P3: interactive requests get the dangerous-tool ask rules plus
-            // the TUI permission bridge; non-interactive clients unchanged.
-            ...(isInteractive
-              ? {
-                  permissionRules: INTERACTIVE_ASK_RULES,
-                  onPermissionAsk: askPermissionViaTui,
-                }
+            permissionRules: mergedPermissionRules.length > 0 ? mergedPermissionRules : undefined,
+            // C9: Additional directories from CLI --add-dir
+            additionalDirectories: _cliAdditionalDirs.length > 0 ? _cliAdditionalDirs : undefined,
+            // P3: interactive requests get the TUI permission bridge;
+            // C9: print mode (-p) disables onPermissionAsk (non-interactive — ask→deny).
+            ...(isInteractive && !_printMode
+              ? { onPermissionAsk: askPermissionViaTui }
               : {}),
             // P7: Plan mode tool gating via deps.checkToolPermission
             deps: buildPlanModeDeps(),
@@ -1337,6 +1379,7 @@ export function createTriLCApp(env: TriLCEnv) {
           }
 
           const oaiPermissionMode = resolvePermissionMode(parsed.permission_mode) as PermissionMode;
+          const oaiSessionRules = buildSessionPermissionRules();
 
           const loopOptions: AgentLoopOptions = {
             model,
@@ -1347,6 +1390,9 @@ export function createTriLCApp(env: TriLCEnv) {
             cwd: env.cwd,
             // C8: Use resolved permission mode
             permissionMode: oaiPermissionMode,
+            permissionRules: oaiSessionRules.length > 0 ? oaiSessionRules : undefined,
+            // C9: Additional directories from CLI --add-dir
+            additionalDirectories: _cliAdditionalDirs.length > 0 ? _cliAdditionalDirs : undefined,
             // P7: Plan mode tool gating via deps.checkToolPermission
             deps: buildPlanModeDeps(),
           };
@@ -1841,6 +1887,7 @@ export function createTriLCApp(env: TriLCEnv) {
             let deltaContent = '';
             let terminalError: string | undefined;
 
+            const taskSessionRules = buildSessionPermissionRules();
             for await (const event of agentLoop({
               model: entry.model,
               systemPrompt,
@@ -1849,6 +1896,10 @@ export function createTriLCApp(env: TriLCEnv) {
               tier: 'main',
               cwd,
               permissionMode: _defaultPermissionMode as PermissionMode,
+              permissionRules: taskSessionRules.length > 0 ? taskSessionRules : undefined,
+              additionalDirectories: _cliAdditionalDirs.length > 0 ? _cliAdditionalDirs : undefined,
+              // C9: -p print mode: no onPermissionAsk (non-interactive — ask→deny)
+              ...(_printMode ? {} : {}),
             })) {
               // C13: Stop processing if we already sent a terminal error.
               // W30 lesson: never send task_done after task_error.
@@ -2613,6 +2664,93 @@ const MODEL_CACHE_TTL_MS = 60_000; // 1 minute
 // C8: Default permission mode — set from env TRILC_PERMISSION_MODE at startup,
 // overridable per-request via permission_mode body field. Backward-compat: bypassPermissions.
 let _defaultPermissionMode: string = 'bypassPermissions';
+
+// C9: CLI rule patterns, additional dirs, and print mode (loaded from env at startup)
+let _cliAllowRulePatterns: string[] = [];
+let _cliDenyRulePatterns: string[] = [];
+let _cliAdditionalDirs: string[] = [];
+let _printMode = false;
+let _persistedPermissionRules: Array<{ toolName: string; behavior: 'allow' | 'deny'; source: 'userSettings' }> = [];
+
+/** C9: Parse a JSON string array from env (e.g. '["Read","Glob(git)"]'). */
+function parseRuleListEnv(raw: string | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === 'string') : [];
+  } catch { return []; }
+}
+
+/** C9: Parse a JSON string array of paths from env. */
+function parseStringListEnv(raw: string | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === 'string') : [];
+  } catch { return []; }
+}
+
+/** C9: Parse a CLI rule pattern "ToolName" or "ToolName(content)" into PermissionRule. */
+function parseCliRulePattern(pattern: string, behavior: 'allow' | 'deny'): { toolName: string; content?: string } | null {
+  const match = pattern.match(/^([^(]+)(?:\((.+)\))?$/);
+  if (!match) return null;
+  const toolName = match[1].trim();
+  const content = match[2]?.trim();
+  if (!toolName) return null;
+  return { toolName, content: content || undefined };
+}
+
+/**
+ * C9: Build the complete permission rules array for the current session.
+ * Merges CLI rules (highest priority) + persisted rules from disk.
+ * CLI rules are source='cliArg', persisted rules are source='userSettings'.
+ * Deny rules come before allow rules (pipeline step 1 vs step 6).
+ */
+function buildSessionPermissionRules(): PermissionRule[] {
+  const rules: PermissionRule[] = [];
+
+  // 1. CLI deny rules (highest priority)
+  for (const pattern of _cliDenyRulePatterns) {
+    const parsed = parseCliRulePattern(pattern, 'deny');
+    if (parsed) {
+      rules.push({
+        toolName: parsed.toolName,
+        ...(parsed.content ? { content: parsed.content } : {}),
+        behavior: 'deny',
+        source: 'cliArg',
+      });
+    }
+  }
+
+  // 2. Persisted deny rules from disk
+  for (const pr of _persistedPermissionRules) {
+    if (pr.behavior === 'deny') {
+      rules.push({ toolName: pr.toolName, behavior: 'deny', source: 'userSettings' });
+    }
+  }
+
+  // 3. CLI allow rules
+  for (const pattern of _cliAllowRulePatterns) {
+    const parsed = parseCliRulePattern(pattern, 'allow');
+    if (parsed) {
+      rules.push({
+        toolName: parsed.toolName,
+        ...(parsed.content ? { content: parsed.content } : {}),
+        behavior: 'allow',
+        source: 'cliArg',
+      });
+    }
+  }
+
+  // 4. Persisted allow rules from disk
+  for (const pr of _persistedPermissionRules) {
+    if (pr.behavior === 'allow') {
+      rules.push({ toolName: pr.toolName, behavior: 'allow', source: 'userSettings' });
+    }
+  }
+
+  return rules;
+}
 
 /** C8: Resolve the effective permission mode for a request. */
 function resolvePermissionMode(requestOverride?: string): string {

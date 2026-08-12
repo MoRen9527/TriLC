@@ -50,11 +50,15 @@ Options:
   --resume <id>       Resume a previous session by ID
   --list-sessions     List all saved sessions
   --permission-mode <mode>  Permission mode (default/acceptEdits/auto/dontAsk/bypass/plan)
-                            default: bypass (backward compatible)`);
+                            default: bypass (backward compatible)
+  --allow <rule>        Allow a tool (repeatable). Format: \"ToolName\" or \"ToolName(content)\"
+  --deny <rule>         Deny a tool (repeatable). Format: \"ToolName\" or \"ToolName(content)\"
+  --add-dir <path>      Additional allowed directory (repeatable, e.g. sibling repos)
+  -p, --print           Non-interactive print mode: ask→deny, no TUI, requires --allow/--deny`);
 }
 
 // ── Argument parsing ──
-function parseArgs(args: string[]): { command: string; port: number; serviceName: string; displayName: string; agent?: string; resume?: string; listSessions?: boolean; permissionMode?: string } {
+function parseArgs(args: string[]): { command: string; port: number; serviceName: string; displayName: string; agent?: string; resume?: string; listSessions?: boolean; permissionMode?: string; allowRules?: string[]; denyRules?: string[]; addDirs?: string[]; printMode?: boolean } {
   const command = args[0] ?? 'help';
   let port = DEFAULT_PORT;
   let serviceName = DEFAULT_SERVICE_NAME;
@@ -63,6 +67,10 @@ function parseArgs(args: string[]): { command: string; port: number; serviceName
   let resume: string | undefined;
   let listSessions = false;
   let permissionMode: string | undefined;
+  const allowRules: string[] = [];
+  const denyRules: string[] = [];
+  const addDirs: string[] = [];
+  let printMode = false;
 
   for (let i = 1; i < args.length; i++) {
     if (args[i] === '--port' && args[i + 1]) {
@@ -83,6 +91,17 @@ function parseArgs(args: string[]): { command: string; port: number; serviceName
     } else if (args[i] === '--permission-mode' && args[i + 1]) {
       permissionMode = args[i + 1];
       i++;
+    } else if (args[i] === '--allow' && args[i + 1]) {
+      allowRules.push(args[i + 1]);
+      i++;
+    } else if (args[i] === '--deny' && args[i + 1]) {
+      denyRules.push(args[i + 1]);
+      i++;
+    } else if (args[i] === '--add-dir' && args[i + 1]) {
+      addDirs.push(args[i + 1]);
+      i++;
+    } else if (args[i] === '--print' || args[i] === '-p') {
+      printMode = true;
     } else if (args[i] === '--list-sessions') {
       listSessions = true;
     }
@@ -97,7 +116,18 @@ function parseArgs(args: string[]): { command: string; port: number; serviceName
     }
   }
 
-  return { command, port, serviceName, displayName, agent, resume, listSessions, permissionMode };
+  // C9: -p implies non-interactive: force default permission mode,
+  // override bypass to default (bypass is interactive and unsafe for -p).
+  if (printMode && !permissionMode) {
+    permissionMode = 'default';
+    console.log('[trilc] -p mode: permission mode defaulting to "default" (non-interactive)');
+  }
+  if (printMode && (permissionMode === 'bypass' || permissionMode === 'bypassPermissions')) {
+    console.error('[trilc] -p mode: permission mode "bypass" is not allowed in non-interactive mode. Use "default" or "dontAsk".');
+    process.exit(1);
+  }
+
+  return { command, port, serviceName, displayName, agent, resume, listSessions, permissionMode, allowRules, denyRules, addDirs, printMode };
 }
 
 // ── Process identity (REQ-018) ──
@@ -137,7 +167,7 @@ async function healthCheck(port: number): Promise<{ ok: boolean; data?: unknown 
 
 // ── Commands ──
 
-async function cmdStart(port: number, permissionMode?: string): Promise<void> {
+async function cmdStart(port: number, permissionMode?: string, allowRules?: string[], denyRules?: string[], addDirs?: string[], printMode?: boolean): Promise<void> {
   // Existing PID file → healthy daemon → already running.
   // REQ-018 identity check: PID alive AND healthz ok.
   const existingPid = await readPid();
@@ -179,6 +209,10 @@ async function cmdStart(port: number, permissionMode?: string): Promise<void> {
         ...process.env,
         TRILC_PORT: String(port),
         ...(permissionMode ? { TRILC_PERMISSION_MODE: permissionMode } : {}),
+        ...(allowRules && allowRules.length > 0 ? { TRILC_ALLOW_RULES: JSON.stringify(allowRules) } : {}),
+        ...(denyRules && denyRules.length > 0 ? { TRILC_DENY_RULES: JSON.stringify(denyRules) } : {}),
+        ...(addDirs && addDirs.length > 0 ? { TRILC_ADD_DIRS: JSON.stringify(addDirs) } : {}),
+        ...(printMode ? { TRILC_PRINT_MODE: '1' } : {}),
       },
     },
   );
@@ -350,7 +384,7 @@ async function cmdStatus(port: number): Promise<void> {
   console.log(JSON.stringify(status, null, 2));
 }
 
-async function cmdRun(port: number, permissionMode?: string): Promise<void> {
+async function cmdRun(port: number, permissionMode?: string, allowRules?: string[], denyRules?: string[], addDirs?: string[], printMode?: boolean): Promise<void> {
   // Port-in-use guard: if another daemon (nssm service / tricade / previous cmdStart)
   // is already listening, exit cleanly instead of conflicting.
   if (await isPortInUse(port)) {
@@ -358,9 +392,13 @@ async function cmdRun(port: number, permissionMode?: string): Promise<void> {
     return;
   }
 
-  // Foreground mode: set env port and run main
+  // Foreground mode: set env port and permission config
   process.env.TRILC_PORT = String(port);
   if (permissionMode) process.env.TRILC_PERMISSION_MODE = permissionMode;
+  if (allowRules && allowRules.length > 0) process.env.TRILC_ALLOW_RULES = JSON.stringify(allowRules);
+  if (denyRules && denyRules.length > 0) process.env.TRILC_DENY_RULES = JSON.stringify(denyRules);
+  if (addDirs && addDirs.length > 0) process.env.TRILC_ADD_DIRS = JSON.stringify(addDirs);
+  if (printMode) process.env.TRILC_PRINT_MODE = '1';
 
   // index.ts runs main() at top level when imported
   await import('./index.js');
@@ -368,7 +406,7 @@ async function cmdRun(port: number, permissionMode?: string): Promise<void> {
 
 // ── TUI Chat command ──
 
-async function cmdChat(port: number, agent?: string, resume?: string, permissionMode?: string): Promise<void> {
+async function cmdChat(port: number, agent?: string, resume?: string, permissionMode?: string, allowRules?: string[], denyRules?: string[], addDirs?: string[], printMode?: boolean): Promise<void> {
   // Step 1: healthz check
   const health = await healthCheck(port);
 
@@ -391,7 +429,7 @@ async function cmdChat(port: number, agent?: string, resume?: string, permission
   }
 
   // Step 2: ensure daemon is running
-  await cmdStart(port, permissionMode);
+  await cmdStart(port, permissionMode, allowRules, denyRules, addDirs, printMode);
 
   // Step 3: wait for daemon to be ready (poll up to 30s)
   const startTime = Date.now();
@@ -905,12 +943,12 @@ async function cmdDaemon(subcommand: string, port: number): Promise<void> {
 }
 
 // ── Entry ──
-const { command, port, serviceName, displayName, agent, resume, listSessions, permissionMode } = parseArgs(process.argv.slice(2));
+const { command, port, serviceName, displayName, agent, resume, listSessions, permissionMode, allowRules, denyRules, addDirs, printMode } = parseArgs(process.argv.slice(2));
 
 (async () => {
   switch (command) {
     case 'start':
-      await cmdStart(port, permissionMode);
+      await cmdStart(port, permissionMode, allowRules, denyRules, addDirs, printMode);
       break;
     case 'stop':
       await cmdStop(port);
@@ -922,10 +960,10 @@ const { command, port, serviceName, displayName, agent, resume, listSessions, pe
       await cmdStatus(port);
       break;
     case 'run':
-      await cmdRun(port, permissionMode);
+      await cmdRun(port, permissionMode, allowRules, denyRules, addDirs, printMode);
       break;
     case 'chat':
-      await cmdChat(port, agent, resume, permissionMode);
+      await cmdChat(port, agent, resume, permissionMode, allowRules, denyRules, addDirs, printMode);
       break;
     case 'company': {
       // REQ-017: debug reset — wipe company state + workspace skeleton for re-onboarding
