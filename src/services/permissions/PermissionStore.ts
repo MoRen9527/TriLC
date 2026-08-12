@@ -72,12 +72,12 @@ function readPermissionFile(): PermissionFile {
 
     // v2 format
     if (parsed.version === 2 && Array.isArray(parsed.rules)) {
-      return parsed as PermissionFileV2;
+      return parsed as unknown as PermissionFileV2;
     }
 
     // v1 auto-migration
-    if (parsed.version === 1 && Array.isArray((parsed as PermissionFileV1).allow)) {
-      const v1 = parsed as PermissionFileV1;
+    if (parsed.version === 1 && Array.isArray((parsed as unknown as PermissionFileV1).allow)) {
+      const v1 = parsed as unknown as PermissionFileV1;
       const rules: PersistedPermissionRule[] = v1.allow.map((r) => ({
         toolName: r.toolName,
         behavior: r.behavior,

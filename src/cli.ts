@@ -40,6 +40,7 @@ Commands:
   uninstall-regrun   Remove from Registry Run           trilc uninstall-regrun
   daemon             OS-level daemon management         trilc daemon <install|uninstall|stage|status>
   cron               Cron job management                trilc cron <add|list|update|remove|run|log|status>
+  mcp                MCP server management               trilc mcp <add|remove|list|status>
   watchdog           Start watchdog supervisor process   trilc watchdog [--port 8711] [--data-dir <path>]
 
 Options:
@@ -942,6 +943,204 @@ async function cmdDaemon(subcommand: string, port: number): Promise<void> {
   }
 }
 
+// ── MCP Server Management (C10) ──
+
+async function cmdMcp(subcommand: string, args: string[], port: number): Promise<void> {
+  const cwd = process.cwd();
+
+  switch (subcommand) {
+    case 'add': {
+      // trilc mcp add <name> <command> [args...] [--type stdio|sse] [--url <url>] [--env KEY=VALUE] [--project]
+      const serverName = args[0];
+      if (!serverName) {
+        console.error('Usage: trilc mcp add <name> <command> [args...] [--type stdio|sse] [--url <url>] [--env KEY=VALUE] [--project]');
+        process.exit(1);
+      }
+
+      let command: string | undefined;
+      const serverArgs: string[] = [];
+      let type: string = 'stdio';
+      let url: string | undefined;
+      const env: Record<string, string> = {};
+      let project = false;
+      let parsingCommand = true;
+
+      for (let i = 1; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--type' && args[i + 1]) {
+          type = args[i + 1];
+          i++;
+          parsingCommand = false;
+        } else if (arg === '--url' && args[i + 1]) {
+          url = args[i + 1];
+          i++;
+          parsingCommand = false;
+        } else if (arg === '--env' && args[i + 1]) {
+          const kv = args[i + 1];
+          const eqIdx = kv.indexOf('=');
+          if (eqIdx > 0) {
+            env[kv.slice(0, eqIdx)] = kv.slice(eqIdx + 1);
+          }
+          i++;
+          parsingCommand = false;
+        } else if (arg === '--project') {
+          project = true;
+          parsingCommand = false;
+        } else if (parsingCommand) {
+          if (!command) {
+            command = arg;
+          } else {
+            serverArgs.push(arg);
+          }
+        }
+      }
+
+      if (type === 'sse') {
+        // SSE servers require --url, not command
+        if (!url) {
+          console.error('[trilc] SSE MCP server requires --url');
+          process.exit(1);
+        }
+      } else {
+        // stdio requires a command
+        if (!command) {
+          console.error('[trilc] stdio MCP server requires a command');
+          process.exit(1);
+        }
+      }
+
+      const { addMCPServerConfig } = await import('./mcp/mcp-config.js');
+
+      // Validate type
+      const validType = type === 'sse' || type === 'streamableHttp' ? type : 'stdio';
+      if (type !== 'stdio' && type !== 'sse' && type !== 'streamableHttp') {
+        console.warn(`[trilc] unknown MCP type "${type}", defaulting to "stdio"`);
+      }
+
+      addMCPServerConfig({
+        name: serverName,
+        type: validType as 'stdio' | 'sse' | 'streamableHttp',
+        command,
+        args: serverArgs.length > 0 ? serverArgs : undefined,
+        env: Object.keys(env).length > 0 ? env : undefined,
+        url,
+      }, cwd, project);
+
+      const targetFile = project ? '.claude/mcp.json' : '.trilc/mcp.json';
+      console.log(`[OK] MCP server "${serverName}" added to ${targetFile}`);
+      break;
+    }
+
+    case 'remove': {
+      const serverName = args[0];
+      if (!serverName) {
+        console.error('Usage: trilc mcp remove <name>');
+        process.exit(1);
+      }
+
+      const { removeMCPServerConfig } = await import('./mcp/mcp-config.js');
+      const removed = removeMCPServerConfig(serverName, cwd);
+      if (removed) {
+        console.log(`[OK] MCP server "${serverName}" removed`);
+      } else {
+        console.error(`[trilc] MCP server "${serverName}" not found in .trilc/mcp.json or .claude/mcp.json`);
+        process.exit(1);
+      }
+      break;
+    }
+
+    case 'list': {
+      const json = args.includes('--json');
+
+      const { listProjectMCPServers } = await import('./mcp/mcp-config.js');
+      const servers = listProjectMCPServers(cwd);
+
+      if (json) {
+        console.log(JSON.stringify({ servers, count: servers.length }, null, 2));
+        break;
+      }
+
+      if (servers.length === 0) {
+        console.log('No MCP servers configured.');
+        console.log('Add one: trilc mcp add <name> <command>');
+        break;
+      }
+
+      // Try to get live connection status from daemon
+      let connectedNames: string[] = [];
+      try {
+        const health = await healthCheck(port);
+        if (health.ok) {
+          const res = await fetch(`http://127.0.0.1:${port}/internal/v1/mcp/servers`);
+          if (res.ok) {
+            const data = await res.json() as { servers?: Array<{ name: string; connected: boolean }> };
+            connectedNames = (data.servers ?? []).filter(s => s.connected).map(s => s.name);
+          }
+        }
+      } catch { /* daemon not running — show config-only */ }
+
+      console.log(`MCP Servers (${servers.length}):`);
+      for (const s of servers) {
+        const status = s.disabled ? 'disabled' : connectedNames.includes(s.name) ? 'connected' : 'disconnected';
+        const marker = status === 'connected' ? '●' : status === 'disabled' ? '✕' : '○';
+        const shortPath = s.source.replace(cwd, '.').replace(/\\/g, '/');
+        console.log(`  ${marker} ${s.name} (${s.type}, ${status}) [${shortPath}]`);
+      }
+      break;
+    }
+
+    case 'status': {
+      const serverName = args[0];
+      if (!serverName) {
+        console.error('Usage: trilc mcp status <name>');
+        process.exit(1);
+      }
+
+      const { listProjectMCPServers } = await import('./mcp/mcp-config.js');
+      const servers = listProjectMCPServers(cwd);
+      const server = servers.find(s => s.name === serverName);
+
+      if (!server) {
+        console.error(`[trilc] MCP server "${serverName}" not configured`);
+        process.exit(1);
+      }
+
+      // Try to get live details from daemon
+      let liveInfo: { toolCount?: number; resourceCount?: number; promptCount?: number; connected?: boolean } = {};
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/internal/v1/mcp/servers/${encodeURIComponent(serverName)}`);
+        if (res.ok) {
+          liveInfo = await res.json() as typeof liveInfo;
+        }
+      } catch { /* daemon not running */ }
+
+      console.log(`Name:        ${server.name}`);
+      console.log(`Type:        ${server.type}`);
+      if (server.command) {
+        console.log(`Command:     ${server.command} ${(server.args ?? []).join(' ')}`);
+      }
+      if (server.url) console.log(`URL:         ${server.url}`);
+      if (server.env && Object.keys(server.env).length > 0) {
+        console.log('Environment:');
+        for (const [k, v] of Object.entries(server.env)) {
+          console.log(`  ${k}=${v}`);
+        }
+      }
+      console.log(`Status:      ${server.disabled ? 'disabled' : liveInfo.connected ? 'connected' : 'disconnected'}`);
+      if (liveInfo.toolCount !== undefined) console.log(`Tools:       ${liveInfo.toolCount}`);
+      if (liveInfo.resourceCount !== undefined) console.log(`Resources:   ${liveInfo.resourceCount}`);
+      if (liveInfo.promptCount !== undefined) console.log(`Prompts:     ${liveInfo.promptCount}`);
+      console.log(`Config:      ${server.source.replace(cwd, '.').replace(/\\/g, '/')}`);
+      break;
+    }
+
+    default:
+      console.error(`[trilc] mcp: unknown subcommand: ${subcommand}`);
+      console.error('Usage: trilc mcp <add|remove|list|status>');
+      process.exit(1);
+  }
+}
+
 // ── Entry ──
 const { command, port, serviceName, displayName, agent, resume, listSessions, permissionMode, allowRules, denyRules, addDirs, printMode } = parseArgs(process.argv.slice(2));
 
@@ -1048,6 +1247,12 @@ const { command, port, serviceName, displayName, agent, resume, listSessions, pe
       const subcommand = process.argv[3] ?? 'list';
       const subArgs = process.argv.slice(4);
       await cmdCron(subcommand, subArgs, port);
+      break;
+    }
+    case 'mcp': {
+      const subcommand = process.argv[3] ?? 'list';
+      const subArgs = process.argv.slice(4);
+      await cmdMcp(subcommand, subArgs, port);
       break;
     }
     case 'watchdog': {

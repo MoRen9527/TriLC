@@ -15,8 +15,8 @@
 //   }
 // }
 
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 
 export type MCPServerType = 'stdio' | 'sse' | 'streamableHttp';
@@ -102,4 +102,117 @@ export function loadMCPServerConfigs(cwd?: string): MCPServerConfig[] {
   }
 
   return configs;
+}
+
+// ── Config Write Functions (C10) ──
+
+/**
+ * Read the raw MCP config file, returning { mcpServers: {...} } or empty.
+ * Does NOT merge multiple sources — reads a single file for write-modify-write.
+ */
+function readRawConfigFile(filepath: string): McpConfigFile {
+  try {
+    if (!existsSync(filepath)) return { mcpServers: {} };
+    const raw = readFileSync(filepath, 'utf-8');
+    const parsed = JSON.parse(raw) as McpConfigFile;
+    if (!parsed.mcpServers) parsed.mcpServers = {};
+    return parsed;
+  } catch {
+    return { mcpServers: {} };
+  }
+}
+
+/** Write the raw MCP config file, creating parent dirs as needed. */
+function writeRawConfigFile(filepath: string, config: McpConfigFile): void {
+  const dir = dirname(filepath);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(filepath, JSON.stringify(config, null, 2), { encoding: 'utf-8', mode: 0o644 });
+}
+
+/**
+ * Add or update an MCP server config.
+ * Writes to .trilc/mcp.json (TriLC-specific, highest priority) by default,
+ * or .claude/mcp.json project-local when `project` is true.
+ */
+export function addMCPServerConfig(
+  server: MCPServerConfig,
+  cwd: string,
+  project = false,
+): void {
+  const filepath = project
+    ? join(cwd, '.claude', 'mcp.json')
+    : join(cwd, '.trilc', 'mcp.json');
+
+  const config = readRawConfigFile(filepath);
+  config.mcpServers = config.mcpServers ?? {};
+
+  config.mcpServers[server.name] = {
+    type: server.type === 'sse' || server.type === 'streamableHttp' ? server.type : 'stdio',
+    ...(server.command ? { command: server.command } : {}),
+    ...(server.args && server.args.length > 0 ? { args: server.args } : {}),
+    ...(server.env && Object.keys(server.env).length > 0 ? { env: server.env } : {}),
+    ...(server.url ? { url: server.url } : {}),
+    ...(server.cwd ? { cwd: server.cwd } : {}),
+    ...(server.disabled ? { disabled: true } : {}),
+  };
+
+  writeRawConfigFile(filepath, config);
+}
+
+/**
+ * Remove an MCP server config by name.
+ * Searches .trilc/mcp.json first, then .claude/mcp.json project-local.
+ */
+export function removeMCPServerConfig(name: string, cwd: string): boolean {
+  const paths = [
+    join(cwd, '.trilc', 'mcp.json'),
+    join(cwd, '.claude', 'mcp.json'),
+  ];
+
+  for (const filepath of paths) {
+    const config = readRawConfigFile(filepath);
+    if (config.mcpServers?.[name]) {
+      delete config.mcpServers[name];
+      writeRawConfigFile(filepath, config);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * List all configured MCP servers from the project-local config files.
+ * Returns configs with their source file path for diagnostics.
+ */
+export function listProjectMCPServers(cwd: string): Array<MCPServerConfig & { source: string }> {
+  const results: Array<MCPServerConfig & { source: string }> = [];
+  const seen = new Set<string>();
+
+  const paths = [
+    join(cwd, '.trilc', 'mcp.json'),
+    join(cwd, '.claude', 'mcp.json'),
+  ];
+
+  for (const filepath of paths) {
+    const config = readRawConfigFile(filepath);
+    if (!config.mcpServers) continue;
+    for (const [name, serverDef] of Object.entries(config.mcpServers)) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const sd = serverDef as Record<string, unknown>;
+      results.push({
+        name,
+        type: normalizeType(sd.type as string | undefined),
+        command: sd.command as string | undefined,
+        args: sd.args as string[] | undefined,
+        env: sd.env as Record<string, string> | undefined,
+        url: sd.url as string | undefined,
+        cwd: sd.cwd as string | undefined,
+        disabled: sd.disabled as boolean | undefined,
+        source: filepath,
+      });
+    }
+  }
+
+  return results;
 }
