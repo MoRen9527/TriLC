@@ -216,3 +216,11 @@ export function listProjectMCPServers(cwd: string): Array<MCPServerConfig & { so
 
   return results;
 }
+
+/**
+ * C10: Reload MCP server configs from disk.
+ * Convenience wrapper for daemon refresh endpoint.
+ */
+export function reloadMCPServerConfigs(cwd?: string): MCPServerConfig[] {
+  return loadMCPServerConfigs(cwd);
+}

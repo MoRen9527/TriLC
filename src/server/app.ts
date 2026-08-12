@@ -2381,6 +2381,166 @@ export function createTriLCApp(env: TriLCEnv) {
           return;
         }
 
+        // ── C10: MCP Server Management Endpoints ──
+
+        // GET /internal/v1/mcp/servers — list all configured + connected servers
+        if (req.url === '/internal/v1/mcp/servers' && req.method === 'GET') {
+          try {
+            const { getMcpClientManager } = await import('../tools/mcp-tool.js');
+            const { listProjectMCPServers } = await import('../mcp/mcp-config.js');
+            const mcp = getMcpClientManager();
+            const connected = mcp?.listServers() ?? [];
+            const connectedNames = new Set(connected.map(s => s.name));
+            const configured = listProjectMCPServers(env.cwd);
+
+            const servers = configured.map(c => {
+              const live = connected.find(s => s.name === c.name);
+              return {
+                name: c.name,
+                type: c.type,
+                status: c.disabled ? 'disabled' : live ? 'connected' : 'disconnected',
+                toolCount: live?.toolCount ?? 0,
+                resourceCount: live?.resourceCount ?? 0,
+                promptCount: live?.promptCount ?? 0,
+                source: c.source.replace(env.cwd, '.').replace(/\\/g, '/'),
+              };
+            });
+
+            // Add connected-but-not-in-config servers
+            for (const live of connected) {
+              if (!configured.some(c => c.name === live.name)) {
+                servers.push({
+                  name: live.name,
+                  type: live.type,
+                  status: 'connected',
+                  toolCount: live.toolCount,
+                  resourceCount: live.resourceCount,
+                  promptCount: live.promptCount,
+                  source: '(runtime)',
+                } as typeof servers[number]);
+              }
+            }
+
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ servers, count: servers.length }));
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'mcp_error', message: (err as Error).message }));
+          }
+          return;
+        }
+
+        // GET /internal/v1/mcp/servers/{name} — single server status
+        const mcpServerMatch = req.url?.match(/^\/internal\/v1\/mcp\/servers\/([^/]+)$/);
+        if (mcpServerMatch && req.method === 'GET') {
+          try {
+            const serverName = decodeURIComponent(mcpServerMatch[1]);
+            const { getMcpClientManager } = await import('../tools/mcp-tool.js');
+            const mcp = getMcpClientManager();
+            const connected = mcp?.listServers().find(s => s.name === serverName);
+
+            if (!connected) {
+              res.writeHead(200, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ name: serverName, status: 'disconnected', connected: false }));
+              return;
+            }
+
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+              ...connected,
+              connected: true,
+            }));
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'mcp_error', message: (err as Error).message }));
+          }
+          return;
+        }
+
+        // POST /internal/v1/mcp/servers/add — runtime connect a server
+        if (req.url === '/internal/v1/mcp/servers/add' && req.method === 'POST') {
+          try {
+            const chunks: Buffer[] = [];
+            for await (const chunk of req) chunks.push(chunk);
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+            const { getMcpClientManager } = await import('../tools/mcp-tool.js');
+            const mcp = getMcpClientManager();
+            if (!mcp) {
+              res.writeHead(503, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'mcp_not_initialized' }));
+              return;
+            }
+            const registered = await mcp.connectServer({
+              name: body.name,
+              type: body.type ?? 'stdio',
+              command: body.command,
+              args: body.args,
+              env: body.env,
+              url: body.url,
+            });
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, name: body.name, toolsRegistered: registered.length, toolNames: registered }));
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'mcp_add_failed', message: (err as Error).message }));
+          }
+          return;
+        }
+
+        // POST /internal/v1/mcp/servers/{name}/remove — runtime disconnect
+        const mcpRemoveMatch = req.url?.match(/^\/internal\/v1\/mcp\/servers\/([^/]+)\/remove$/);
+        if (mcpRemoveMatch && req.method === 'POST') {
+          try {
+            const serverName = decodeURIComponent(mcpRemoveMatch[1]);
+            const { getMcpClientManager } = await import('../tools/mcp-tool.js');
+            const mcp = getMcpClientManager();
+            if (!mcp) {
+              res.writeHead(503, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'mcp_not_initialized' }));
+              return;
+            }
+            await mcp.disconnectServer(serverName);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, name: serverName }));
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'mcp_remove_failed', message: (err as Error).message }));
+          }
+          return;
+        }
+
+        // POST /internal/v1/mcp/servers/refresh — reload config + reconnect
+        if (req.url === '/internal/v1/mcp/servers/refresh' && req.method === 'POST') {
+          try {
+            const { getMcpClientManager } = await import('../tools/mcp-tool.js');
+            const { loadMCPServerConfigs } = await import('../mcp/mcp-config.js');
+            const mcp = getMcpClientManager();
+            if (!mcp) {
+              res.writeHead(503, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'mcp_not_initialized' }));
+              return;
+            }
+            const configs = loadMCPServerConfigs(env.cwd);
+            await mcp.disconnectAll();
+            const results: Array<{ name: string; tools: number }> = [];
+            for (const config of configs) {
+              try {
+                const registered = await mcp.connectServer(config);
+                results.push({ name: config.name, tools: registered.length });
+              } catch (err) {
+                results.push({ name: config.name, tools: 0 });
+                console.warn(`[mcp] refresh: failed to reconnect "${config.name}": ${(err as Error).message}`);
+              }
+            }
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, refreshed: results.length, servers: results }));
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'mcp_refresh_failed', message: (err as Error).message }));
+          }
+          return;
+        }
+
         // ── 404 ──
         res.writeHead(404, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'not_found' }));

@@ -331,6 +331,104 @@ export class McpClientManager {
     return [...this.connections.keys()];
   }
 
+  // ── C10: Per-server connection management ──
+
+  /**
+   * Connect a single MCP server at runtime (no daemon restart).
+   * Registers each MCP tool as an individual agent tool: mcp__<server>__<tool>.
+   * Returns the list of registered tool names.
+   */
+  async connectServer(config: MCPServerConfig): Promise<string[]> {
+    if (this.connections.has(config.name)) {
+      await this.disconnectServer(config.name);
+    }
+
+    await this.connectOne(config);
+    const conn = this.connections.get(config.name);
+    if (!conn) return [];
+
+    const registered: string[] = [];
+    const { register: registerTool } = await import('@trimetaverse/agent-core');
+
+    for (const tool of conn.tools) {
+      const canonicalName = McpClientManager.buildToolName(config.name, tool.toolName);
+      try {
+        registerTool(
+          {
+            type: 'function',
+            function: {
+              name: canonicalName,
+              description: `[MCP:${config.name}] ${tool.description}`,
+              parameters: tool.inputSchema,
+            },
+          },
+          async (args: Record<string, unknown>) => {
+            return this.callTool(config.name, tool.toolName, args);
+          },
+        );
+        registered.push(canonicalName);
+      } catch (err) {
+        console.warn(`[mcp] failed to register tool "${canonicalName}": ${(err as Error).message}`);
+      }
+    }
+
+    console.log(`[mcp] server "${config.name}" connected: ${registered.length} tools registered`);
+    return registered;
+  }
+
+  /**
+   * Disconnect a single MCP server at runtime. Unregisters all its per-tool agent tools.
+   */
+  async disconnectServer(name: string): Promise<void> {
+    const conn = this.connections.get(name);
+    if (!conn) {
+      console.warn(`[mcp] server "${name}" not connected — nothing to disconnect`);
+      return;
+    }
+
+    const { unregister } = await import('@trimetaverse/agent-core');
+    for (const tool of conn.tools) {
+      const canonicalName = McpClientManager.buildToolName(name, tool.toolName);
+      try { unregister(canonicalName); } catch { /* best-effort */ }
+    }
+
+    try { await conn.client.close(); } catch { /* transport may already be closed */ }
+    this.connections.delete(name);
+    console.log(`[mcp] server "${name}" disconnected: ${conn.tools.length} tools unregistered`);
+  }
+
+  /**
+   * C10: Refresh a single server (disconnect + reconnect from config).
+   */
+  async refreshServer(config: MCPServerConfig): Promise<string[]> {
+    await this.disconnectServer(config.name);
+    return this.connectServer(config);
+  }
+
+  /**
+   * C10: List all connected servers with status.
+   */
+  listServers(): Array<{
+    name: string; type: string; status: 'connected';
+    toolCount: number; resourceCount: number; promptCount: number;
+  }> {
+    const result: Array<{
+      name: string; type: string; status: 'connected';
+      toolCount: number; resourceCount: number; promptCount: number;
+    }> = [];
+    for (const conn of this.connections.values()) {
+      result.push({
+        name: conn.serverName,
+        type: 'stdio', // approximate — detailed type tracked by config layer
+        status: 'connected',
+        toolCount: conn.tools.length,
+        resourceCount: conn.resources.length,
+        promptCount: conn.prompts.length,
+      });
+    }
+    return result;
+  }
+
   // ── Prompt Methods (P8) ──
 
   /**
