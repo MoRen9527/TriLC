@@ -161,6 +161,87 @@ function buildPlanModeDeps(): AgentLoopDeps {
   };
 }
 
+// ── C15 v2: Compacting agent loop wrapper ──
+// Wraps agentLoop with auto-compaction: monitors cumulative prompt tokens
+// via loop_end.usageSummary, triggers compactViaModelClient (direct ModelClient,
+// no HTTP → no circular dependency), injects summary as system context, restarts.
+// Stops after maxRestarts to prevent infinite loop.
+
+const COMPACT_TOKEN_THRESHOLD = 90_000; // ~70% of 128K context
+const MAX_COMPACT_RESTARTS = 3;
+
+async function* runCompactingAgentLoop(
+  options: AgentLoopOptions,
+  logger = (msg: string) => console.log(msg),
+): AsyncGenerator<AgentEvent> {
+  let currentOptions = { ...options };
+  let accumulatedPromptTokens = 0;
+  let restartCount = 0;
+
+  while (restartCount <= MAX_COMPACT_RESTARTS) {
+    let loopHadContent = false;
+    let loopPromptTokens = 0;
+
+    for await (const event of agentLoop(currentOptions)) {
+      // Track token usage from loop_end
+      if (event.type === 'loop_end' && event.usageSummary) {
+        loopPromptTokens = event.usageSummary.tokens.prompt_tokens;
+      }
+      if (event.type === 'content_delta' || event.type === 'assistant_message') {
+        loopHadContent = true;
+      }
+      yield event;
+    }
+
+    if (!loopHadContent) break; // empty loop, no point compacting
+
+    accumulatedPromptTokens += loopPromptTokens;
+
+    // Check compaction threshold
+    if (accumulatedPromptTokens > COMPACT_TOKEN_THRESHOLD) {
+      logger(`[trilc:compact] auto-trigger: ${accumulatedPromptTokens} tokens > ${COMPACT_TOKEN_THRESHOLD} threshold`);
+
+      const compactable = (currentOptions.messages ?? [])
+        .filter(m => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+        .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content as string }));
+
+      if (compactable.length < 3) {
+        logger('[trilc:compact] not enough messages to compact, continuing');
+        break;
+      }
+
+      try {
+        const { compactViaModelClient } = await import('../services/compact/compact.js');
+        const result = await compactViaModelClient(compactable);
+
+        // Inject summary + keep last 2 messages for context
+        currentOptions = {
+          ...currentOptions,
+          systemPrompt: `[Compact summary]\n${result.summary}\n\n---\n\n${currentOptions.systemPrompt ?? ''}`,
+          messages: [
+            ...(currentOptions.messages ?? []).slice(-2),
+          ],
+        };
+        accumulatedPromptTokens = 0;
+        restartCount++;
+        yield { type: 'compaction', message: `Compacted: removed ~${result.tokensRemoved} tokens, ${compactable.length} messages → summary ${result.summary.length} chars` } as AgentEvent;
+        logger(`[trilc:compact] done: removed ~${result.tokensRemoved} tokens, restart #${restartCount}`);
+        continue; // restart loop with compacted context
+      } catch (err) {
+        logger(`[trilc:compact] failed: ${(err as Error).message}, continuing uncompacted`);
+        yield { type: 'compaction_failed', message: (err as Error).message } as AgentEvent;
+        break; // give up, continue with full context
+      }
+    }
+
+    break; // normal completion, no compaction needed
+  }
+
+  if (restartCount > MAX_COMPACT_RESTARTS) {
+    logger(`[trilc:compact] max restarts (${MAX_COMPACT_RESTARTS}) reached, giving up`);
+  }
+}
+
 /** P3: onPermissionAsk bridge — routes 'ask' decisions to the TUI. */
 async function askPermissionViaTui(
   toolName: string,
@@ -1888,7 +1969,7 @@ export function createTriLCApp(env: TriLCEnv) {
             let terminalError: string | undefined;
 
             const taskSessionRules = buildSessionPermissionRules();
-            for await (const event of agentLoop({
+            for await (const event of runCompactingAgentLoop({
               model: entry.model,
               systemPrompt,
               messages,
@@ -1949,12 +2030,28 @@ export function createTriLCApp(env: TriLCEnv) {
                   break;
                 }
                 case 'recovery': {
-                  // C13: agent-core Tier 2 fallback — model provider failed,
-                  // switching to fallback model. Log for degraded diagnostics.
                   const rec = event as any;
                   if (rec.tier === 2) {
                     console.log(`[trilc:model] degraded to fallback model: ${rec.message}`);
                   }
+                  break;
+                }
+                case 'compaction': {
+                  const comp = event as any;
+                  console.log(`[trilc:compact] ${comp.message}`);
+                  writeSSE('task_progress', {
+                    step: toolCount,
+                    totalSteps: toolCount + 1,
+                    description: comp.message ?? 'Compacting conversation...',
+                  });
+                  break;
+                }
+                case 'compaction_failed': {
+                  console.warn(`[trilc:compact] failed: ${(event as any).message}`);
+                  break;
+                }
+                case 'compaction_done': {
+                  // handled by compaction case above (combined progress reporting)
                   break;
                 }
                 case 'loop_end': {

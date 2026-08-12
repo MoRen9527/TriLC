@@ -104,6 +104,53 @@ export async function compactConversation(
 }
 
 /**
+ * C15 v2: Compact via direct ModelClient call (no HTTP → no circular dependency).
+ * Uses the trimodel client directly instead of the local /v1/messages endpoint.
+ * This is the version used by the auto-trigger wrapping layer in app.ts.
+ */
+export async function compactViaModelClient(
+  messages: TriLCMessage[],
+  apiKey?: string,
+  baseUrl?: string,
+  customInstructions?: string,
+): Promise<CompactResult> {
+  if (messages.length < 3) {
+    throw new Error(ERROR_MESSAGE_NOT_ENOUGH_MESSAGES);
+  }
+
+  const { createModelClient } = await import('trimodel');
+  const client = createModelClient({
+    deepseekApiKey: apiKey ?? process.env.DEEPSEEK_API_KEY ?? '',
+    deepseekBaseUrl: baseUrl ?? process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1',
+  });
+
+  const prompt = getCompactPrompt(customInstructions);
+  const estimatedInputTokens = estimateMessageTokens(messages);
+
+  const compactMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [
+    { role: 'user', content: prompt + '\n\n---\n\nConversation to summarize:\n\n' },
+    ...messages.map(m => ({ role: m.role, content: m.content })),
+  ];
+
+  const response = await client.chat(COMPACT_MODEL, compactMessages, {
+    max_tokens: MAX_COMPACT_TOKENS,
+  });
+
+  if (!response.content) {
+    throw new Error(ERROR_MESSAGE_INCOMPLETE_RESPONSE);
+  }
+
+  const formattedSummary = formatCompactSummary(response.content);
+  const userMessage = getCompactUserSummaryMessage(response.content, true);
+
+  return {
+    summary: formattedSummary,
+    message: userMessage,
+    tokensRemoved: estimatedInputTokens,
+  };
+}
+
+/**
  * Prepare compacted message list for TriLC.
  * Returns a new message list with the summary as a system message.
  */
