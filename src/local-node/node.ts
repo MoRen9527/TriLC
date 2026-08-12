@@ -1,7 +1,7 @@
 // ── Local Node (agent-core powered) ──
 // Programmatic agent execution entry point — mirrors the HTTP server's
 // agentLoop integration but as a direct API for other TriLC modules.
-// Uses @trimetaverse/agent-core for loop, tools, and permissions.
+// Uses @tricompany/agent-core for loop, tools, and permissions.
 
 import {
   agentLoop,
@@ -9,7 +9,7 @@ import {
   type AgentLoopOptions,
   type AgentEvent,
   validateMessage,
-} from '@trimetaverse/agent-core';
+} from '@tricompany/agent-core';
 import type { TriLCEnv } from '../config/env.js';
 import type { Message } from 'trimodel';
 

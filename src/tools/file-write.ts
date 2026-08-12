@@ -4,7 +4,7 @@
 
 import { writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { resolve, isAbsolute, dirname } from 'node:path';
-import { register as registerTool, type ToolContext } from '@trimetaverse/agent-core';
+import { register as registerTool, type ToolContext } from '@tricompany/agent-core';
 
 export function registerWriteTool(): void {
   registerTool(

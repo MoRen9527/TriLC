@@ -1,5 +1,5 @@
 // ── MCP Tool Proxy (P6 + P7 + P8) ──
-import { register as registerTool } from '@trimetaverse/agent-core';
+import { register as registerTool } from '@tricompany/agent-core';
 
 let mcpManager: import('../mcp/mcp-client.js').McpClientManager | null = null;
 let initialized = false;

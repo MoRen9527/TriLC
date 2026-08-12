@@ -6,7 +6,7 @@
 // Uses agent-core tool registration (ToolDefinition + ToolHandler).
 
 import type { ToolDefinition } from 'trimodel';
-import { register as registerTool } from '@trimetaverse/agent-core';
+import { register as registerTool } from '@tricompany/agent-core';
 import { isInteractiveActive, requestInteraction } from '../server/interactions.js';
 
 export interface QuestionOption {

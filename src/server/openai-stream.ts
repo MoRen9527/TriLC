@@ -6,7 +6,7 @@
 //   data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{...}}]}
 //   data: [DONE]
 
-import type { AgentEvent } from '@trimetaverse/agent-core';
+import type { AgentEvent } from '@tricompany/agent-core';
 
 export interface OpenAISSEOptions {
   model: string;

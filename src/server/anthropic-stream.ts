@@ -7,7 +7,7 @@
 //   message_start, content_block_start, content_block_delta,
 //   content_block_stop, message_delta, message_stop, ping, error
 
-import type { AgentEvent } from '@trimetaverse/agent-core';
+import type { AgentEvent } from '@tricompany/agent-core';
 
 export interface AnthropicSSEOptions {
   model: string;

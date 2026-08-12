@@ -59,7 +59,7 @@ function createMockSessionStore() {
 
 // ── Slow agent: controllable resolution ──
 // We mock runHeartbeatAgent via module interception. Since the real module
-// calls @trimetaverse/agent-core (which requires a runtime), we mock the
+// calls @tricompany/agent-core (which requires a runtime), we mock the
 // heartbeat-runner's dependency instead.
 // For these tests we validate the runner's scheduling logic, not agent execution.
 
@@ -136,7 +136,7 @@ describe("TriLCHeartbeatRunner", () => {
     mock.timers.tick(5100);
 
     // The actual agent loop would be called via the wake handler.
-    // Since runHeartbeatAgent requires @trimetaverse/agent-core (not available
+    // Since runHeartbeatAgent requires @tricompany/agent-core (not available
     // in test), we verify the scheduling logic: the runner started without
     // throwing and the timer ticked without error.
   });

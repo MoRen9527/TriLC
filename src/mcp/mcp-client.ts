@@ -348,7 +348,7 @@ export class McpClientManager {
     if (!conn) return [];
 
     const registered: string[] = [];
-    const { register: registerTool } = await import('@trimetaverse/agent-core');
+    const { register: registerTool } = await import('@tricompany/agent-core');
 
     for (const tool of conn.tools) {
       const canonicalName = McpClientManager.buildToolName(config.name, tool.toolName);
@@ -386,7 +386,7 @@ export class McpClientManager {
       return;
     }
 
-    const { unregister } = await import('@trimetaverse/agent-core');
+    const { unregister } = await import('@tricompany/agent-core');
     for (const tool of conn.tools) {
       const canonicalName = McpClientManager.buildToolName(name, tool.toolName);
       try { unregister(canonicalName); } catch { /* best-effort */ }

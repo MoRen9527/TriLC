@@ -4,7 +4,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve, isAbsolute, dirname } from 'node:path';
-import { register as registerTool, type ToolContext } from '@trimetaverse/agent-core';
+import { register as registerTool, type ToolContext } from '@tricompany/agent-core';
 
 // ── Quote normalization (A级复制 from CC FileEditTool/utils.ts) ──
 // CC's fuzzy match: when exact old_string match fails, normalize curly quotes

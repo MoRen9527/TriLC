@@ -36,7 +36,7 @@
 // first, then buildPlanModeDeps blocks second). This is intentional
 // defense-in-depth, not a bug.
 
-import { register as registerTool } from '@trimetaverse/agent-core';
+import { register as registerTool } from '@tricompany/agent-core';
 
 // ── Shared plan mode state ──
 

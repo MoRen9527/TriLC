@@ -4,7 +4,7 @@
 
 import { readdirSync, statSync } from 'node:fs';
 import { resolve, isAbsolute, sep, join } from 'node:path';
-import { register as registerTool } from '@trimetaverse/agent-core';
+import { register as registerTool } from '@tricompany/agent-core';
 
 const MAX_RESULTS = 100;
 

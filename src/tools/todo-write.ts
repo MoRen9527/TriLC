@@ -5,7 +5,7 @@
 // P1: Added CC TaskCreateTool full compatibility (activeForm, metadata, blocks, blockedBy)
 
 import { resolve, isAbsolute } from 'node:path';
-import { register as registerTool } from '@trimetaverse/agent-core';
+import { register as registerTool } from '@tricompany/agent-core';
 
 // In-memory task store (simple MVP implementation)
 const taskStore = new Map<string, Task>();

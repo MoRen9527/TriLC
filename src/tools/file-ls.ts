@@ -4,7 +4,7 @@
 
 import { readdirSync, statSync } from 'node:fs';
 import { resolve, isAbsolute, basename } from 'node:path';
-import { register as registerTool } from '@trimetaverse/agent-core';
+import { register as registerTool } from '@tricompany/agent-core';
 
 interface LSEntry {
   name: string;

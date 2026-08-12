@@ -5,7 +5,7 @@
 // Called by HeartbeatRunner for each due agent. Runs a single agentLoop
 // cycle and persists the result to session-store for recovery and audit.
 
-import { agentLoop } from "@trimetaverse/agent-core";
+import { agentLoop } from "@tricompany/agent-core";
 import type { HeartbeatRunResult } from "./heartbeat-wake.js";
 import type { SessionRecord } from "../session-store/types.js";
 

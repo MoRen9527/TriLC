@@ -1,5 +1,5 @@
 // ── Local Planner (agent-core powered) ──
-// Uses sub-agent spawn from @trimetaverse/agent-core for task decomposition.
+// Uses sub-agent spawn from @tricompany/agent-core for task decomposition.
 // Replaces the hardcoded string-array stub with real agent-driven planning.
 
 import {
@@ -7,7 +7,7 @@ import {
   type AgentDefinition,
   type SpawnConfig,
   type SubAgentEvent,
-} from '@trimetaverse/agent-core';
+} from '@tricompany/agent-core';
 import type { TriLCEnv } from '../config/env.js';
 
 export interface TaskPlan {

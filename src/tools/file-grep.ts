@@ -7,7 +7,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { resolve, isAbsolute, join } from 'node:path';
 import { execSync } from 'node:child_process';
-import { register as registerTool } from '@trimetaverse/agent-core';
+import { register as registerTool } from '@tricompany/agent-core';
 
 const DEFAULT_HEAD_LIMIT = 250;
 const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB per file max for JS fallback

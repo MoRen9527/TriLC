@@ -5,7 +5,7 @@
 //   GET  /models               → OpenAI-compatible model list
 //   POST /v1/messages          → Anthropic Messages API (SSE + JSON)
 //   POST /chat/completions     → OpenAI Chat Completions API (SSE + JSON)
-//   POST /internal/v1/agent    → SSE + JSON modes (agentLoop from @trimetaverse/agent-core)
+//   POST /internal/v1/agent    → SSE + JSON modes (agentLoop from @tricompany/agent-core)
 //
 // TriLC does NOT load pipeline (Soul Loader / Memory Injector / Context Builder / Tool Gater).
 // Those are TriMC-only services. Local mode uses legacy raw mode directly.
@@ -16,11 +16,11 @@ import { request as httpsRequest } from 'node:https';
 import { join } from 'node:path';
 import { writeFile } from 'node:fs/promises';
 import type { TriLCEnv } from '../config/env.js';
-import { agentLoop, register as registerTool, canUseTool } from '@trimetaverse/agent-core';
-import type { AgentEvent, AgentLoopOptions, AgentLoopDeps } from '@trimetaverse/agent-core';
-import type { AgentTier, PermissionMode, PermissionRule } from '@trimetaverse/agent-core';
+import { agentLoop, register as registerTool, canUseTool } from '@tricompany/agent-core';
+import type { AgentEvent, AgentLoopOptions, AgentLoopDeps } from '@tricompany/agent-core';
+import type { AgentTier, PermissionMode, PermissionRule } from '@tricompany/agent-core';
 import { isPlanModeActive, PLAN_MODE_WHITELIST } from '../tools/plan-mode.js';
-import { validateMessage, type GuardResult } from '@trimetaverse/agent-core';
+import { validateMessage, type GuardResult } from '@tricompany/agent-core';
 import type { Message, ToolDefinition, UsageSummary } from 'trimodel';
 import { createModelClient } from 'trimodel';
 import { createEventQueue } from '../event-queue/index.js';

@@ -19,7 +19,7 @@ import {
   // formatSSELine is not needed for in-memory capture
 } from '../../src/server/anthropic-stream.js';
 import { agentEventsToOpenAISSE } from '../../src/server/openai-stream.js';
-import type { AgentEvent } from '@trimetaverse/agent-core';
+import type { AgentEvent } from '@tricompany/agent-core';
 
 // ── Test fixtures ──
 // Replicates the canonical turn shape emitted by agentLoop per model invocation:

@@ -18,7 +18,7 @@ import assert from 'node:assert';
 
 import { agentEventsToAnthropicSSE } from '../../src/server/anthropic-stream.js';
 import { agentEventsToOpenAISSE } from '../../src/server/openai-stream.js';
-import type { AgentEvent } from '@trimetaverse/agent-core';
+import type { AgentEvent } from '@tricompany/agent-core';
 
 async function* toAsync(events: AgentEvent[]): AsyncGenerator<AgentEvent> {
   for (const e of events) yield e;

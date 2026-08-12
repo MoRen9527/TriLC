@@ -20,7 +20,7 @@
   "dependencies": {
     "@alcalzone/ansi-tokenize": "^0.2.5",
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "@trimetaverse/agent-core": "file:../TriMC/packages/agent-core",
+    "@tricompany/agent-core": "file:../TriCompany/packages/agent-core",
     "auto-bind": "^5.0.1",
     "bidi-js": "^1.0.3",
     "chalk": "^5.6.2",

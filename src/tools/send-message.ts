@@ -5,7 +5,7 @@
 // - CC 支持 shutdown/plan 协议 → TriLC 单进程，简化为基础消息传递
 // - CC 支持 bridge/uds 跨会话 → TriLC 仅支持进程内消息
 
-import { register as registerTool } from '@trimetaverse/agent-core';
+import { register as registerTool } from '@tricompany/agent-core';
 
 // In-process message inbox (simplified - CC uses complex mailbox)
 const messageInbox = new Map<string, Message[]>();

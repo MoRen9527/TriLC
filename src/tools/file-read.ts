@@ -4,7 +4,7 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { resolve, isAbsolute } from 'node:path';
-import { register as registerTool } from '@trimetaverse/agent-core';
+import { register as registerTool } from '@tricompany/agent-core';
 
 const MAX_LINES = 2000;
 const MAX_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB safety cap

@@ -5,9 +5,9 @@
 // - CC 支持 worktree/remote isolation → TriLC 简化为基础进程内隔离
 // - CC 有复杂的 agent 加载系统 → TriLC 使用 agent-core built-in agents
 
-import { register as registerTool } from '@trimetaverse/agent-core';
-import { spawnAgent, getBuiltInAgent, listBuiltInAgents } from '@trimetaverse/agent-core';
-import type { AgentDefinition, SpawnConfig } from '@trimetaverse/agent-core';
+import { register as registerTool } from '@tricompany/agent-core';
+import { spawnAgent, getBuiltInAgent, listBuiltInAgents } from '@tricompany/agent-core';
+import type { AgentDefinition, SpawnConfig } from '@tricompany/agent-core';
 
 // ── Helper: List agents for /agents command ──
 // Fetches built-in agents from agent-core + contract agents from daemon.

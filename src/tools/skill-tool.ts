@@ -4,7 +4,7 @@
 // Uses agent-core tool registration (ToolDefinition + ToolHandler).
 
 import type { ToolDefinition } from 'trimodel';
-import { register as registerTool } from '@trimetaverse/agent-core';
+import { register as registerTool } from '@tricompany/agent-core';
 
 export interface SkillToolInput {
   skill: string;

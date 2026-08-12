@@ -8,7 +8,7 @@ import {
   register as registerTool,
   createProcessSupervisor,
   type ProcessSupervisor,
-} from '@trimetaverse/agent-core';
+} from '@tricompany/agent-core';
 
 // ── Security policy ──
 
