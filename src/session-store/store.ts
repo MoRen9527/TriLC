@@ -155,7 +155,7 @@ export function createSessionStore(dbPath: string) {
     status: SessionStatus,
     messageCount?: number,
   ): void {
-    const closedAt = status === 'completed' || status === 'interrupted'
+    const closedAt = status === 'completed' || status === 'interrupted' || status === 'error'
       ? new Date().toISOString()
       : null;
     const count = messageCount ?? getMessageCount(id);

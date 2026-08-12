@@ -7,7 +7,7 @@
 //   2.4: SessionStatus 'error' 语义、task_error→error 映射、interrupted 保留恢复路径
 //   2.5: ConnectionManager local 初始状态、持久化、退避、状态信息
 
-import { describe, it } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createSessionStore } from '../src/session-store/index.js';
 import { existsSync, unlinkSync, mkdirSync } from 'node:fs';

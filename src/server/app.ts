@@ -224,12 +224,12 @@ async function* runCompactingAgentLoop(
         };
         accumulatedPromptTokens = 0;
         restartCount++;
-        yield { type: 'compaction', message: `Compacted: removed ~${result.tokensRemoved} tokens, ${compactable.length} messages → summary ${result.summary.length} chars` } as AgentEvent;
+        yield { type: 'compaction', message: `Compacted: removed ~${result.tokensRemoved} tokens, ${compactable.length} messages → summary ${result.summary.length} chars` } as unknown as AgentEvent;
         logger(`[trilc:compact] done: removed ~${result.tokensRemoved} tokens, restart #${restartCount}`);
         continue; // restart loop with compacted context
       } catch (err) {
         logger(`[trilc:compact] failed: ${(err as Error).message}, continuing uncompacted`);
-        yield { type: 'compaction_failed', message: (err as Error).message } as AgentEvent;
+        yield { type: 'compaction_failed', message: (err as Error).message } as unknown as AgentEvent;
         break; // give up, continue with full context
       }
     }
@@ -2083,7 +2083,7 @@ export function createTriLCApp(env: TriLCEnv) {
               if (terminalError) break;
 
               // Map agent events to W30 SSE event types
-              switch (event.type) {
+              switch (event.type as string) {
                 case 'content_delta': {
                   deltaContent += (event as any).delta ?? '';
                   writeSSE('delta', { content: (event as any).delta ?? '' });
