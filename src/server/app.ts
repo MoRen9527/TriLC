@@ -283,35 +283,43 @@ interface ConnectionManagerOptions {
   nodeId: string;
   version: string;
   intervalMs?: number;
+  /** 2.5: Initial connection state (default: 'degraded').
+   *  Use 'local' when trimcBaseUrl is empty — daemon runs standalone. */
+  initialState?: ConnectionState;
   queueSize?: () => number;
   getPendingForReplay?: (connectionId: string, limit?: number) => ReplayEventItem[];
   applyReplayResponse?: (connectionId: string, res: ReplayResponse, events: ReplayEventItem[]) => void;
 }
 
-// ── ConnectionManager ──
+// ── ConnectionManager (2.5: local state + persistence + backoff) ──
 
 class ConnectionManager {
-  private state: ConnectionState = 'degraded';
+  private state: ConnectionState;
   private consecutiveFailures = 0;
   private consecutiveSuccesses = 0;
   private readonly failThreshold = 3;
   private readonly recoverThreshold = 2;
+  private readonly DEGRADED_BACKOFF_MS = 5 * 60 * 1000; // 2.5: slow heartbeat after 5 min degraded
+  private readonly DEGRADED_SLOW_INTERVAL_MS = 60_000; // 2.5: 60s interval when degraded > 5 min
   private healthCheckTimer: NodeJS.Timeout | null = null;
   private readonly trimcBaseUrl: string;
-  private readonly healthCheckIntervalMs: number;
+  private healthCheckIntervalMs: number;
   private readonly nodeId: string;
   private readonly version: string;
   private startTime: number;
+  private degradedAt: number | null = null; // 2.5: timestamp when degraded started
   private _queueSize: () => number;
   private _getPendingForReplay: (connectionId: string, limit?: number) => ReplayEventItem[];
   private _applyReplayResponse: (connectionId: string, res: ReplayResponse, events: ReplayEventItem[]) => void;
   private recoveryCallback: (() => void) | null = null;
+  private stateFile: string | null = null; // 2.5: persistence file path
 
   // ── Heartbeat Wake (CTO-008-M Phase 1: extracted to heartbeat-wake module) ──
   private wake = createHeartbeatWake();
 
   constructor(trimcBaseUrl: string, opts: ConnectionManagerOptions) {
     this.trimcBaseUrl = trimcBaseUrl;
+    this.state = opts.initialState ?? 'degraded';
     this.nodeId = opts.nodeId;
     this.version = opts.version;
     this.healthCheckIntervalMs = opts.intervalMs ?? 10_000;
@@ -319,6 +327,9 @@ class ConnectionManager {
     this._getPendingForReplay = opts.getPendingForReplay ?? (() => []);
     this._applyReplayResponse = opts.applyReplayResponse ?? (() => {});
     this.startTime = Date.now();
+    if (this.state === 'local') {
+      console.log('[trilc:conn] running in local mode — TriMC not configured');
+    }
   }
 
   get currentState(): ConnectionState {
@@ -333,9 +344,11 @@ class ConnectionManager {
       if (this.consecutiveSuccesses >= this.recoverThreshold) {
         this.state = 'connected';
         this.consecutiveSuccesses = 0;
+        this.degradedAt = null; // 2.5: clear degraded timer
+        this.healthCheckIntervalMs = 10_000; // 2.5: restore normal interval
         console.log('[trilc:conn] recovered → connected');
+        this.persistState();
         publish({ type: 'node:connected' });
-        // Trigger event replay for all pending events accumulated during degraded period
         this._performReplay().catch((err) => {
           console.error('[trilc:conn] replay failed:', err instanceof Error ? err.message : String(err));
         });
@@ -351,11 +364,16 @@ class ConnectionManager {
       if (this.consecutiveFailures >= this.failThreshold) {
         this.state = 'degraded';
         this.consecutiveFailures = 0;
+        this.degradedAt = Date.now(); // 2.5: track when degraded started
         console.log('[trilc:conn] degraded → will use local fallback');
+        this.persistState();
         publish({ type: 'node:degraded' });
       }
     } else if (this.state === 'degraded') {
-      // Already degraded, stay here
+      // 2.5: degraded backoff — after 5 min, slow heartbeat to 60s
+      if (this.degradedAt && (Date.now() - this.degradedAt > this.DEGRADED_BACKOFF_MS)) {
+        this.healthCheckIntervalMs = this.DEGRADED_SLOW_INTERVAL_MS;
+      }
     }
   }
 
@@ -466,6 +484,57 @@ class ConnectionManager {
     } catch (err) {
       console.error('[trilc:conn] replay request failed:', err instanceof Error ? err.message : String(err));
     }
+  }
+
+  // ── 2.5: State persistence ──
+
+  /** Enable state persistence to {dataDir}/connection-state.json */
+  enablePersistence(dataDir: string): void {
+    this.stateFile = dataDir.replace(/\\/g, '/') + '/connection-state.json';
+    this.restoreState();
+    this.persistState();
+  }
+
+  private persistState(): void {
+    if (!this.stateFile) return;
+    try {
+      const { mkdirSync, writeFileSync } = require('node:fs');
+      const { dirname } = require('node:path');
+      const dir = dirname(this.stateFile);
+      if (!require('node:fs').existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(this.stateFile, JSON.stringify({
+        state: this.state,
+        lastStateChange: new Date().toISOString(),
+        consecutiveFailures: this.consecutiveFailures,
+        degradedAt: this.degradedAt ? new Date(this.degradedAt).toISOString() : null,
+      }, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    } catch { /* best-effort */ }
+  }
+
+  private restoreState(): void {
+    if (!this.stateFile) return;
+    try {
+      const { existsSync, readFileSync } = require('node:fs');
+      if (!existsSync(this.stateFile)) return;
+      const raw = readFileSync(this.stateFile, 'utf-8');
+      const saved = JSON.parse(raw) as { state?: string; consecutiveFailures?: number; degradedAt?: string };
+      if (saved.state && (saved.state === 'connected' || saved.state === 'degraded' || saved.state === 'local')) {
+        this.state = saved.state;
+        this.consecutiveFailures = saved.consecutiveFailures ?? 0;
+        console.log(`[trilc:conn] restored state: ${this.state} (from ${this.stateFile})`);
+      }
+    } catch { /* ignore corrupt file */ }
+  }
+
+  /** 2.5: Get state info for task/submit response notification. */
+  getStateInfo(): { connectionState: ConnectionState; warning?: string } {
+    if (this.state === 'degraded') {
+      return { connectionState: 'degraded', warning: 'TriMC unreachable, using local fallback' };
+    }
+    if (this.state === 'local') {
+      return { connectionState: 'local', warning: 'TriMC not configured, running standalone' };
+    }
+    return { connectionState: 'connected' };
   }
 
   // Allow setting connectionId externally (used by createTriLCApp)
@@ -662,13 +731,17 @@ export function createTriLCApp(env: TriLCEnv) {
   };
   resetConnectionId();
 
-  const connMgr = new ConnectionManager(env.trimcBaseUrl, {
+  // 2.5: 'local' state when TriMC is not configured
+  const isLocal = !env.trimcBaseUrl || env.trimcBaseUrl === 'http://localhost:8710' && !env.trimcBaseUrl;
+  const connMgr = new ConnectionManager(env.trimcBaseUrl || 'http://localhost:8710', {
     nodeId: env.nodeId,
     version: env.version,
+    initialState: isLocal ? 'local' : undefined,
     queueSize: () => eventQueue.getQueueSize(),
     getPendingForReplay: (cid, limit) => eventQueue.getPendingForReplay(cid, limit),
     applyReplayResponse: (cid, res, events) => eventQueue.applyReplayResponse(cid, res, events),
   });
+  connMgr.enablePersistence(env.dataDir);
 
   // Wire connectionId into ConnectionManager for replay
   connMgr._setConnectionId(connectionId);
@@ -1902,11 +1975,15 @@ export function createTriLCApp(env: TriLCEnv) {
             console.warn('[trilc:task] failed to persist session:', (saveErr as Error).message);
           }
 
+          // 2.5: Include connection state in task submission response
+          const connInfo = connMgr.getStateInfo();
           res.writeHead(201, { 'content-type': 'application/json' });
           res.end(JSON.stringify({
             sessionId,
             streamEndpoint: `/internal/v1/sessions/${sessionId}/stream`,
             status: 'running',
+            connectionState: connInfo.connectionState,
+            ...(connInfo.warning ? { warning: connInfo.warning } : {}),
           }));
           return;
         }
