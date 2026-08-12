@@ -1,4 +1,5 @@
 // ── TriLC Local HTTP Server ──
+// r8-1 rollback drill: temporary comment line for revert exercise
 // Exposes the same API surface as TriMC:
 //   GET  /healthz              → { ok: true, service: 'trilc' }
 //   GET  /v1/models            → Anthropic-compatible model list
