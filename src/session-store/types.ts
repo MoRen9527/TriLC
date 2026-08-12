@@ -4,7 +4,7 @@
 //
 // Schema v2 (2026-07-22): cloud sync fields added per arch-trilc-daemon §6.
 
-export type SessionStatus = 'active' | 'completed' | 'interrupted' | 'expired';
+export type SessionStatus = 'active' | 'completed' | 'interrupted' | 'error' | 'expired';
 
 /** Cloud sync status for session replication to TriMC. */
 export type SyncStatus = 'local' | 'pending' | 'syncing' | 'synced' | 'error';

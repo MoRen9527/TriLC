@@ -1957,7 +1957,7 @@ export function createTriLCApp(env: TriLCEnv) {
             entry.status = 'error';
             publish({ type: 'task:failed', taskId: sessionId, error: errDetail });
             writeSSE('task_error', { status: 'failed', error: errDetail });
-            try { sessionStore.updateSessionStatus(sessionId, 'interrupted'); } catch { /* ignore */ }
+            try { sessionStore.updateSessionStatus(sessionId, 'error'); } catch { /* ignore */ }
             res.end();
             return;
           }
@@ -2083,7 +2083,7 @@ export function createTriLCApp(env: TriLCEnv) {
 
             if (terminalError) {
               try {
-                sessionStore.updateSessionStatus(sessionId, 'interrupted');
+                sessionStore.updateSessionStatus(sessionId, 'error');
               } catch {
                 // ignore
               }
@@ -2101,7 +2101,7 @@ export function createTriLCApp(env: TriLCEnv) {
               entry.status = 'error';
               publish({ type: 'task:failed', taskId: sessionId, error: emptyError });
               writeSSE('task_error', { status: 'failed', error: emptyError });
-              try { sessionStore.updateSessionStatus(sessionId, 'interrupted'); } catch { /* ignore */ }
+              try { sessionStore.updateSessionStatus(sessionId, 'error'); } catch { /* ignore */ }
               res.end();
               return;
             }
@@ -2138,7 +2138,7 @@ export function createTriLCApp(env: TriLCEnv) {
             writeSSE('task_error', { status: 'failed', error: msg });
 
             try {
-              sessionStore.updateSessionStatus(sessionId, 'interrupted');
+              sessionStore.updateSessionStatus(sessionId, 'error');
             } catch {
               // ignore
             }
