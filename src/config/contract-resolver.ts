@@ -6,6 +6,7 @@
 import { readFileSync, existsSync, watch } from 'fs';
 import { resolve } from 'path';
 import { parse as parseYaml } from 'yaml';
+import { loadContractV3, type AgentContractV3 } from '@tricompany/agent-core';
 
 // ── Types ──
 
@@ -54,21 +55,6 @@ export interface EmployeeRoster {
   families: Record<string, number>;
 }
 
-interface ContractYaml {
-  contract: {
-    agent_id: string;
-    family?: string;
-  };
-  paths: Record<string, string>;
-  decision_rights?: {
-    approve?: string[];
-    freeze?: string[];
-    escalate?: string[];
-    forbidden?: string[];
-  };
-  runtime_baseline?: Record<string, unknown>;
-}
-
 // ── Resolver ──
 
 class AgentContractResolver {
@@ -114,36 +100,32 @@ class AgentContractResolver {
     return count;
   }
 
-  /** 加载单个 contract */
+  /** 加载单个 contract（v3.0 解析走 agent-core 权威 schema） */
   private loadOne(contractPath: string): AgentContract | null {
-    const yamlText = readFileSync(contractPath, 'utf-8');
-    const parsed = parseYaml(yamlText) as unknown as ContractYaml;
-
-    const agentId = parsed.contract?.agent_id;
-    const family = (parsed.contract?.family as 'Role' | 'Registry') || 'Role';
-
-    if (!agentId || !parsed.paths) {
-      console.warn(`[contract-resolver] invalid contract: ${contractPath}`);
+    // thin adapter 边界（v3-spec §四）：解析+校验统一 loadContractV3，
+    // 本域保留五件套路径组装与 system prompt 组装
+    let parsed: AgentContractV3;
+    try {
+      parsed = loadContractV3(contractPath);
+    } catch (err) {
+      console.warn(`[contract-resolver] failed to load ${contractPath}:`, (err as Error).message);
       return null;
     }
 
-    // paths 兼容性归一化：colleagues_social（合并字段）→ colleagues + social
-    const rawPaths = parsed.paths;
-    if (rawPaths.colleagues_social) {
-      if (!rawPaths.colleagues) rawPaths.colleagues = rawPaths.colleagues_social;
-      if (!rawPaths.social) rawPaths.social = rawPaths.colleagues_social;
-    }
-    // 确保所有必填字段有默认值，避免 undefined 传入 resolve()
+    const agentId = parsed.contract.agent_id;
+    const family = parsed.contract.family;
+
+    // v3 schema 保证六文件路径必填非空
     const paths: Required<AgentContract['paths']> = {
-      soul: rawPaths.soul || '',
-      agent_body: rawPaths.agent_body || '',
-      agent_frontmatter: rawPaths.agent_frontmatter || '',
-      memory: rawPaths.memory || '',
-      colleagues: rawPaths.colleagues || '',
-      social: rawPaths.social || '',
+      soul: parsed.paths.soul,
+      agent_body: parsed.paths.agent_body,
+      agent_frontmatter: parsed.paths.agent_frontmatter,
+      memory: parsed.paths.memory,
+      colleagues: parsed.paths.colleagues,
+      social: parsed.paths.social,
     };
 
-    // 读取五件套（兼容 colleagues_social 合并字段）
+    // 读取五件套
     const soul = this.readFileSafe(resolve(this.sourceRoot, paths.soul));
     const agentBody = this.readFileSafe(resolve(this.sourceRoot, paths.agent_body));
     const agentFrontmatter = this.readFileSafe(resolve(this.sourceRoot, paths.agent_frontmatter));
@@ -163,12 +145,12 @@ class AgentContractResolver {
       ? explicitToolControl
       : bodyToolControl;
 
-    // decision_rights
+    // decision_rights（v3 四键全量）
     const decisionRights = {
-      approve: (parsed.decision_rights?.approve) || [],
-      freeze: (parsed.decision_rights?.freeze) || [],
-      escalate: (parsed.decision_rights?.escalate) || [],
-      forbidden: (parsed.decision_rights?.forbidden) || [],
+      approve: parsed.decision_rights.approve,
+      freeze: parsed.decision_rights.freeze,
+      escalate: parsed.decision_rights.escalate,
+      forbidden: parsed.decision_rights.forbidden,
     };
 
     return {
