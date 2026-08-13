@@ -6,7 +6,7 @@ import { connectAnthropicSSE } from './useAnthropicSSE.js';
 
 const SESSION_ENDPOINT = 'http://localhost:8711/internal/v1/sessions';
 const ENDPOINT = 'http://localhost:8711/v1/messages';
-const DEFAULT_MODEL = 'deepseek-v4-flash';
+const DEFAULT_MODEL = 'tmv-deepseek-v4-flash';
 
 export type RequestState = 'idle' | 'waitingForFirstToken' | 'streaming';
 export interface ToolCall { id: string; name: string; arguments: string; status: 'pending' | 'done' | 'blocked'; }

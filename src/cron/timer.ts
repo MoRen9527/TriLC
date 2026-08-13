@@ -224,7 +224,7 @@ async function executeJobCore(deps: CronTimerDeps, job: CronJob): Promise<JobExe
 
   const result = await runHeartbeatAgent({
     agentId: `cron-${job.id}`, sessionStore: deps.sessionStore, cwd: deps.cwd,
-    model: "deepseek-v4-flash", maxTurns: 10, systemPrompt: job.systemPrompt,
+    model: "tmv-deepseek-v4-flash", maxTurns: 10, systemPrompt: job.systemPrompt,
     userMessage: `Cron job "${job.name}" triggered. Execute your task.`,
   });
   return result.status === "ran" ? { status: "ok" } : { status: "error", error: result.reason };

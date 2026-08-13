@@ -1120,7 +1120,7 @@ export function createTriLCApp(env: TriLCEnv) {
             return;
           }
 
-          const model = parsed.model ?? 'deepseek-v4-pro';
+          const model = parsed.model ?? 'tmv-deepseek-v4-pro';
           // Step 4: End-to-end verification — log received model parameter
           console.log(`[trilc] /v1/messages model=${model}`);
           const maxTurns = parsed.max_tokens ? Math.min(Math.ceil(parsed.max_tokens / 100), 25) : 25;
@@ -1429,7 +1429,7 @@ export function createTriLCApp(env: TriLCEnv) {
 
           // ── Local agentLoop fallback ──
           const loopOptions: AgentLoopOptions = {
-            model: parsed.model ?? 'deepseek-v4-pro',
+            model: parsed.model ?? 'tmv-deepseek-v4-pro',
             systemPrompt: parsed.systemPrompt ?? '',
             messages: parsed.messages ?? [],
             maxTurns: parsed.maxTurns ?? 25,
@@ -1535,7 +1535,7 @@ export function createTriLCApp(env: TriLCEnv) {
             return;
           }
 
-          const model = parsed.model ?? 'deepseek-v4-pro';
+          const model = parsed.model ?? 'tmv-deepseek-v4-pro';
           const maxTurns = parsed.max_tokens ? Math.min(Math.ceil(parsed.max_tokens / 100), 25) : 25;
 
           // Convert OpenAI messages to internal format
@@ -1754,7 +1754,7 @@ export function createTriLCApp(env: TriLCEnv) {
               sessionId = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
               sessionStore.createSession({
                 id: sessionId,
-                model: body.model ?? 'deepseek-v4-flash',
+                model: body.model ?? 'tmv-deepseek-v4-flash',
                 systemPrompt: defaultSystemPrompt(),
                 cwd: env.cwd,
                 title: body.title,
@@ -1963,7 +1963,7 @@ export function createTriLCApp(env: TriLCEnv) {
           }
 
           const sessionId = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-          const model = getKeyCache()?.defaultModel ?? process.env.TRIMODEL_DEFAULT_MODEL ?? 'deepseek-v4-pro';
+          const model = getKeyCache()?.defaultModel ?? process.env.TRIMODEL_DEFAULT_MODEL ?? 'tmv-deepseek-v4-pro';
           const entry: TaskStreamEntry = {
             sessionId,
             message: body.message.trim(),
@@ -2820,7 +2820,7 @@ export function createTriLCApp(env: TriLCEnv) {
       const DEFAULT_HEARTBEAT_AGENT: HeartbeatAgentConfig = {
         agentId: "default-heartbeat",
         intervalMs: 30 * 60 * 1000,
-        model: "deepseek-v4-flash",
+        model: "tmv-deepseek-v4-flash",
         maxTurns: 10,
         systemPrompt: "You are a system heartbeat agent. Report current status concisely.",
         userMessage: "Periodic heartbeat check. Confirm all systems nominal.",
@@ -2835,7 +2835,7 @@ export function createTriLCApp(env: TriLCEnv) {
           // REQ-014b: onboarding workspace = projectRoot (TRILC_PROJECT_ROOT), not daemon cwd
           // REQ-016: statePath so the agent reads the real progress file (dataDir), not workspace copies
           const companyStatePath = join(env.dataDir, 'company', 'state.json');
-          agents.push(buildOnboardingAgent(env.projectRoot ?? env.cwd, getKeyCache()?.defaultModel ?? "deepseek-v4-flash", companyStatePath));
+          agents.push(buildOnboardingAgent(env.projectRoot ?? env.cwd, getKeyCache()?.defaultModel ?? "tmv-deepseek-v4-flash", companyStatePath));
           console.log("[trilc] TriCompany uninitialized — onboarding agent registered");
         } else {
           console.log("[trilc] TriCompany initialized — onboarding skipped");
@@ -3045,12 +3045,12 @@ function validateModelRegistry(): void {
 
     const defaultModel = getKeyCache()?.defaultModel
       ?? process.env.TRIMODEL_DEFAULT_MODEL
-      ?? 'deepseek-v4-pro';
+      ?? 'tmv-deepseek-v4-pro';
 
     // Known ultimate fallback targets — these MUST be in the registry for
     // agent-core's Tier 2 recovery to work. If missing, tmv-* models will
     // have no viable fallback path when TriStaciss is offline.
-    const criticalFallbacks = ['deepseek-v4-flash', 'deepseek-v4-pro'];
+    const criticalFallbacks = ['tmv-deepseek-v4-flash', 'tmv-deepseek-v4-pro'];
     const missing: string[] = [];
     if (!models.includes(defaultModel)) {
       missing.push(defaultModel);

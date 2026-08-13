@@ -8,7 +8,7 @@ import { getCompactPrompt, formatCompactSummary, getCompactUserSummaryMessage } 
 import { estimateMessageTokens } from './grouping.js';
 
 const COMPACT_API = 'http://localhost:8711/v1/messages';
-const COMPACT_MODEL = 'deepseek-v4-flash';
+const COMPACT_MODEL = 'tmv-deepseek-v4-flash';
 const MAX_COMPACT_TOKENS = 8192;
 
 export interface CompactResult {

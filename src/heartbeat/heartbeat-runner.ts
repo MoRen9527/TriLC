@@ -24,7 +24,7 @@ export interface HeartbeatAgentConfig {
   agentId: string;
   /** Interval between heartbeat executions in milliseconds. */
   intervalMs: number;
-  /** Model to use (default: deepseek-v4-flash). */
+  /** Model to use (default: tmv-deepseek-v4-flash). */
   model?: string;
   /** Maximum agent loop turns (default: 10). */
   maxTurns?: number;

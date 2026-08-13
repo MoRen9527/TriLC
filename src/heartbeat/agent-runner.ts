@@ -45,7 +45,7 @@ export async function runHeartbeatAgent(
     agentId,
     sessionStore,
     cwd,
-    model = "deepseek-v4-flash",
+    model = "tmv-deepseek-v4-flash",
     maxTurns = 10,
     systemPrompt,
     userMessage,

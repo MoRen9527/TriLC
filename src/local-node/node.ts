@@ -31,7 +31,7 @@ export class LocalNode {
     this.state = 'running';
 
     const loopOpts: AgentLoopOptions = {
-      model: 'deepseek-v4-pro',
+      model: 'tmv-deepseek-v4-pro',
       systemPrompt: opts.systemPrompt,
       messages: opts.messages,
       maxTurns: opts.maxTurns ?? 25,
