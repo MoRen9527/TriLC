@@ -56,6 +56,7 @@ describe('AgentContractResolver', () => {
       approve: ['release'],
       freeze: [],
       escalate: [],
+      forbidden: [],
     });
     assert.deepEqual(resolver.getToolControl('sample-agent'), { tools: ['read'] });
   });

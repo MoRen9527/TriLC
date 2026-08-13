@@ -24,6 +24,7 @@ export interface AgentContract {
     approve: string[];
     freeze: string[];
     escalate: string[];
+    forbidden: string[];
   };
   systemPrompt: string;   // 拼接后的完整 system prompt
   toolControl: Record<string, unknown>;  // frontmatter 解析后的工具配置
@@ -63,6 +64,7 @@ interface ContractYaml {
     approve?: string[];
     freeze?: string[];
     escalate?: string[];
+    forbidden?: string[];
   };
   runtime_baseline?: Record<string, unknown>;
 }
@@ -166,6 +168,7 @@ class AgentContractResolver {
       approve: (parsed.decision_rights?.approve) || [],
       freeze: (parsed.decision_rights?.freeze) || [],
       escalate: (parsed.decision_rights?.escalate) || [],
+      forbidden: (parsed.decision_rights?.forbidden) || [],
     };
 
     return {
