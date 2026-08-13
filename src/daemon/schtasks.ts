@@ -62,7 +62,10 @@ function buildTaskScript(config: TriLCDaemonServiceConfig): string {
   }
   const allArgs = [config.entryScript, ...config.programArgs];
   const command = [quoteCmdArg(config.nodeBin), ...allArgs.map(quoteCmdArg)].join(" ");
-  lines.push(command);
+  // 装后验收②诊断线：daemon 输出重定向到日志文件（此前无落盘，schtasks
+  // 运行态输出不可见、工具卡住无从排查）
+  const daemonLog = path.join(resolveStateDir(config), "daemon.log");
+  lines.push(`${command} >> ${quoteCmdArg(daemonLog)} 2>&1`);
   return `${lines.join("\r\n")}\r\n`;
 }
 
