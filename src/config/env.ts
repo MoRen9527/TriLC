@@ -22,6 +22,13 @@ export type TriLCEnv = {
    * - Env: TRILC_PROJECT_ROOT
    */
   projectRoot: string;
+  /**
+   * Company weekly plane root (TRILC_WEEKLY_PLANE_ROOT) — read-only shared
+   * view of TriMetaverse docs/workflow/operating-records. Raw env passthrough
+   * only; resolution order (env → workspace sibling → undefined) lives in
+   * src/project/weekly-plane-root.ts. Unset = legacy project-track behavior.
+   */
+  weeklyPlaneRoot?: string;
 };
 
 import { hostname } from 'node:os';
@@ -99,5 +106,6 @@ export function readEnv(): TriLCEnv {
     version: resolveVersion(),
     tricompanySourcePath: process.env.TRICOMPANY_SOURCE_PATH ?? resolveFromWorkspace(),
     projectRoot,
+    weeklyPlaneRoot: process.env.TRILC_WEEKLY_PLANE_ROOT || undefined,
   };
 }

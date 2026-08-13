@@ -4,10 +4,25 @@
 // Cross-project agent memory access is prohibited at the routing layer.
 //
 // Default projectRoot = cwd ensures full backward compatibility.
+//
+// ── Two-track semantics (r2-2, prod-grade-2-trilc-plane-view) ──
+// Project track:  {projectRoot}/docs/execution/operating-records — isolated,
+//                 auto-created by ensureProjectDirs() (unchanged).
+// Company track:  companyWeeklyPlaneDir (TriMetaverse/docs/workflow/
+//                 operating-records) — READ-ONLY shared view. Set only when
+//                 TRILC_WEEKLY_PLANE_ROOT is configured or workspace sibling
+//                 discovery succeeds; never auto-created, never written by
+//                 TriLC (write ownership stays with the orchestration layer).
+// Isolation note: pipe3-1's prohibition surface is cross-project access to
+//                 the `.tricompany-cognition/` memory stores. The weekly plane
+//                 is NOT a memory store — it is a user-configured read-only
+//                 shared document view (equivalent to reading any external
+//                 path). enforceProjectIsolation() is intentionally unchanged.
 
 import { resolve, join, normalize } from 'node:path';
 import { existsSync, mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { resolveWeeklyPlaneRoot } from './weekly-plane-root.js';
 
 // ── Path constants ──
 
@@ -36,6 +51,13 @@ export interface ProjectPaths {
   cronDbPath: string;
   /** JSON file path for key cache. */
   keyCachePath: string;
+  /**
+   * Company weekly plane root (TriMetaverse/docs/workflow/operating-records) —
+   * read-only shared view. Only present when TRILC_WEEKLY_PLANE_ROOT is
+   * configured or workspace sibling discovery succeeds; undefined otherwise
+   * (legacy project-track behavior, byte-for-byte unchanged).
+   */
+  companyWeeklyPlaneDir?: string;
 }
 
 // ── Project registry (in-process guard) ──
@@ -67,11 +89,19 @@ function deriveProjectId(projectRoot: string): string {
  *  - projectId is a stable, content-addressed identifier
  *
  * @param projectRoot - Absolute or relative path. Defaults to process.cwd().
+ * @param weeklyPlaneRoot - Optional company weekly plane root override.
+ *   Defaults to resolveWeeklyPlaneRoot() (env → sibling discovery → undefined);
+ *   undefined keeps the legacy project-track-only behavior byte-for-byte.
  */
-export function resolveProjectPaths(projectRoot?: string): ProjectPaths {
+export function resolveProjectPaths(
+  projectRoot?: string,
+  weeklyPlaneRoot?: string,
+): ProjectPaths {
   const root = projectRoot ? resolve(projectRoot) : process.cwd();
   const existing = activeProjects.get(root);
   if (existing) return existing;
+
+  const companyWeeklyPlaneDir = weeklyPlaneRoot ?? resolveWeeklyPlaneRoot();
 
   const cognitionDir = join(root, COGNITION_DIR);
   const operatingRecordsDir = join(root, OPERATING_RECORDS_DIR);
@@ -86,6 +116,7 @@ export function resolveProjectPaths(projectRoot?: string): ProjectPaths {
     eventQueueDbPath: join(cognitionDir, 'event-queue.db'),
     cronDbPath: join(cognitionDir, 'cron.db'),
     keyCachePath: join(cognitionDir, 'key-cache.json'),
+    ...(companyWeeklyPlaneDir ? { companyWeeklyPlaneDir } : {}),
   };
 
   activeProjects.set(root, paths);
@@ -96,9 +127,16 @@ export function resolveProjectPaths(projectRoot?: string): ProjectPaths {
  * Ensure project directories exist on disk.
  * Creates {projectRoot}/.tricompany-cognition/ if missing.
  * Creates {projectRoot}/docs/execution/operating-records/ if missing.
+ *
+ * The company weekly plane dir is NEVER created here — read-only view only.
+ *
+ * @param weeklyPlaneRoot - Optional override, passed through to resolveProjectPaths.
  */
-export function ensureProjectDirs(projectRoot?: string): ProjectPaths {
-  const paths = resolveProjectPaths(projectRoot);
+export function ensureProjectDirs(
+  projectRoot?: string,
+  weeklyPlaneRoot?: string,
+): ProjectPaths {
+  const paths = resolveProjectPaths(projectRoot, weeklyPlaneRoot);
 
   if (!existsSync(paths.cognitionDir)) {
     mkdirSync(paths.cognitionDir, { recursive: true });

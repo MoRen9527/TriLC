@@ -79,6 +79,24 @@ keyCachePath        → join(cognitionDir, 'key-cache.json')
 
 **Verdict**: PASS. All paths are correctly scoped. Backward compatibility maintained.
 
+### 2.2a `companyWeeklyPlaneDir` two-track extension (r2-2, prod-grade-2-trilc-plane-view)
+
+**Company track (read-only shared view, NEW)**:
+```
+companyWeeklyPlaneDir → resolveWeeklyPlaneRoot():
+  1. TRILC_WEEKLY_PLANE_ROOT env (must exist on disk)
+  2. workspace sibling: <TriLC-root>/../TriMetaverse/docs/workflow/operating-records
+  3. undefined → legacy project-track behavior, byte-for-byte unchanged
+```
+
+**Semantics**:
+- Read-only view of the company weekly plane (TriMetaverse `docs/workflow/operating-records`); write ownership stays with the orchestration layer
+- NEVER auto-created: `ensureProjectDirs()` only creates the project-track dirs (G1/G2 unchanged)
+- Isolation boundary unchanged: `enforceProjectIsolation()` guards the `.tricompany-cognition/` memory stores only — the weekly plane is not a memory store, it is a user-configured shared document view
+- Project track (`docs/execution/operating-records`) untouched; the two tracks coexist and are semantically distinct (project-level isolation records vs company-level shared facts)
+
+**Backward compatibility**: no env + discovery failure → `companyWeeklyPlaneDir` undefined → every read falls back to the project track; `resolveProjectPaths()` API signature is additive (optional second parameter); existing 24 router tests unchanged.
+
 ---
 
 ### 2.3 `ensureProjectDirs(projectRoot?)` — G1, G2
