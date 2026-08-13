@@ -33,10 +33,12 @@ export function resolveWeeklyPlaneRoot(): string | undefined {
   }
 
   // 2. workspace sibling discovery (source state).
-  //    This module compiles to dist/project/ and also runs from src/project/ —
-  //    both are two levels below the TriLC root, so '..', '..' lands on it.
+  //    This module lives at src/project/ (compiled: dist/project/) — three
+  //    levels below the workspace root D:/Code/ai, so three '..' hops land on
+  //    the sibling TriMetaverse checkout. (Two hops would land INSIDE the
+  //    TriLC repo — r2-3 regression: fixed from '..', '..'.)
   const scriptDir = dirname(fileURLToPath(import.meta.url));
-  const sibling = resolve(scriptDir, '..', '..', ...WEEKLY_PLANE_SEGMENTS);
+  const sibling = resolve(scriptDir, '..', '..', '..', ...WEEKLY_PLANE_SEGMENTS);
   if (existsSync(sibling)) return sibling;
 
   // 3. not configured / discovery failed → undefined (legacy behavior).

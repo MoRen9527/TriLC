@@ -21,8 +21,11 @@ import {
 const ORIG_ENV = process.env.TRILC_WEEKLY_PLANE_ROOT;
 
 function expectedSiblingPath(): string {
+  // Independently derived expectation — NOT copy-pasted from the implementation.
+  // This test file lives at src/project/ → three hops up = the workspace root
+  // D:/Code/ai, then into the sibling TriMetaverse checkout.
   const scriptDir = dirname(fileURLToPath(import.meta.url));
-  return resolve(scriptDir, '..', '..', 'TriMetaverse', 'docs', 'workflow', 'operating-records');
+  return resolve(scriptDir, '..', '..', '..', 'TriMetaverse', 'docs', 'workflow', 'operating-records');
 }
 
 describe('resolveWeeklyPlaneRoot', () => {
