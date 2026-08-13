@@ -16,6 +16,7 @@ import { request as httpsRequest } from 'node:https';
 import { join } from 'node:path';
 import { writeFile } from 'node:fs/promises';
 import type { TriLCEnv } from '../config/env.js';
+import { resolveWeeklyPlaneRoot } from '../project/weekly-plane-root.js';
 import { agentLoop, register as registerTool, canUseTool } from '@tricompany/agent-core';
 import type { AgentEvent, AgentLoopOptions, AgentLoopDeps } from '@tricompany/agent-core';
 import type { AgentTier, PermissionMode, PermissionRule } from '@tricompany/agent-core';
@@ -3364,7 +3365,7 @@ function startCLAUDE_mdLoad(cwd: string): void {
   });
 }
 
-function defaultSystemPrompt(cwd?: string): string {
+export function defaultSystemPrompt(cwd?: string): string {
   const isWin = process.platform === 'win32';
   const shell = isWin
     ? 'Windows. Commands run via cmd.exe. Use Windows-compatible commands: dir (not ls), where (not which), type (not cat), findstr (not grep). Avoid Unix-only flags like -name. Prefer PowerShell-style or native Windows commands.'
@@ -3373,6 +3374,12 @@ function defaultSystemPrompt(cwd?: string): string {
       : 'Linux. Commands run via sh.';
 
   const basePrompt = `You are TriCade, a capable coding and task assistant running on ${shell} When you need to run shell commands or search files, generate commands compatible with this platform. Prefer the Read/Glob/Grep tools for file operations instead of raw shell commands when available.`;
+
+  // r17 ②：公司周平面根注入（读取端，r2 树契约的最后一环）——
+  // 模型上下文需知道公司周平面根，否则按旧约定找项目内
+  // docs/execution/operating-records（安装态为空/旧数据）→ current-week
+  // 判定错误（W33 vs 实际 active W34）。仅读取提示，不改变任何写语义。
+  const weeklyPlaneHint = buildWeeklyPlaneHint();
 
   // P2-Batch1-#5: Trigger async load if needed
   const targetCwd = cwd || process.cwd();
@@ -3384,10 +3391,21 @@ function defaultSystemPrompt(cwd?: string): string {
 
   // Append cached content if available; always include agent roster (KI-PH2-001 fix)
   if (cachedClaudeMd && cachedClaudeMd.content) {
-    return `${basePrompt}\n\n## Project Instructions (from CLAUDE.md)\n\n${cachedClaudeMd.content}${cachedAgentRoster}`;
+    return `${basePrompt}\n\n## Project Instructions (from CLAUDE.md)\n\n${cachedClaudeMd.content}${cachedAgentRoster}${weeklyPlaneHint}`;
   }
 
-  return basePrompt + cachedAgentRoster;
+  return basePrompt + cachedAgentRoster + weeklyPlaneHint;
+}
+
+/**
+ * r17 ②：公司周平面读取提示（读取端注入）。
+ * 周平面根解析走 src/project/weekly-plane-root.ts（env 显式 → workspace
+ * sibling → undefined 回退不注入）。
+ */
+function buildWeeklyPlaneHint(): string {
+  const planeRoot = resolveWeeklyPlaneRoot();
+  if (!planeRoot) return '';
+  return `\n\n## Company Weekly Plane (read-only)\n\nThe company weekly operating plane lives at \`${planeRoot}\`. When asked about the current week, weekly indexes (OP-*.json), operating records, or unresolved items, read from this directory instead of any project-local operating-records path. The active week is the \`2026-Wnn\` directory whose OP index has \`status: "active"\` (its index also carries \`latestActiveWeek: true\`).`;
 }
 
 /**
