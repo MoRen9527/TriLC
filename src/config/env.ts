@@ -69,7 +69,9 @@ function resolveVersion(): string {
   if (existsSync(versionPath)) {
     try {
       const raw = readFileSync(versionPath, 'utf-8');
-      const parsed = JSON.parse(raw);
+      // BOM 容错：Windows PowerShell 5.1 的 Set-Content -Encoding UTF8 会写 BOM，
+      // JSON.parse 对 BOM 开头抛错（BUG-20260805-002 掩盖链的一环）
+      const parsed = JSON.parse(raw.replace(/^﻿/, ''));
       if (parsed && typeof parsed.version === 'string' && parsed.version) {
         return parsed.version;
       }
