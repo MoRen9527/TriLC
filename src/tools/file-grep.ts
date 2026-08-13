@@ -7,7 +7,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { resolve, isAbsolute, join } from 'node:path';
 import { execSync } from 'node:child_process';
-import { register as registerTool } from '@tricompany/agent-core';
+import { register as registerTool, type ToolContext } from '@tricompany/agent-core';
 
 const DEFAULT_HEAD_LIMIT = 250;
 const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB per file max for JS fallback
@@ -547,9 +547,13 @@ export function registerGrepTool(): void {
         },
       },
     },
-    async (args: Record<string, unknown>) => {
+    async (args: Record<string, unknown>, ctx?: ToolContext) => {
       const pattern = args.pattern as string;
-      const searchPath = (args.path as string) || process.cwd();
+      // REQ-014b: resolve relative paths against the agent loop cwd (ctx.cwd),
+      // not the daemon launch dir. ctx is absent in legacy call sites → fall
+      // back to process.cwd() (unchanged legacy behavior).
+      const base = ctx?.cwd ?? process.cwd();
+      const searchPath = (args.path as string) || base;
       const globFilter = args.glob as string | undefined;
       const outputMode = (args.output_mode as string) || 'files_with_matches';
       const contextBefore = (args['-B'] as number) || 0;
@@ -566,7 +570,7 @@ export function registerGrepTool(): void {
 
       const absolutePath = isAbsolute(searchPath)
         ? searchPath
-        : resolve(process.cwd(), searchPath);
+        : resolve(base, searchPath);
 
       // Try ripgrep first
       const rgResult = rgGrep({

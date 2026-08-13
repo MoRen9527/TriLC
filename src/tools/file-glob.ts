@@ -4,7 +4,7 @@
 
 import { readdirSync, statSync } from 'node:fs';
 import { resolve, isAbsolute, sep, join } from 'node:path';
-import { register as registerTool } from '@tricompany/agent-core';
+import { register as registerTool, type ToolContext } from '@tricompany/agent-core';
 
 const MAX_RESULTS = 100;
 
@@ -154,15 +154,19 @@ export function registerGlobTool(): void {
         },
       },
     },
-    async (args: Record<string, unknown>) => {
+    async (args: Record<string, unknown>, ctx?: ToolContext) => {
       const pattern = args.pattern as string;
-      const searchPath = (args.path as string) || process.cwd();
+      // REQ-014b: resolve relative paths against the agent loop cwd (ctx.cwd),
+      // not the daemon launch dir. ctx is absent in legacy call sites → fall
+      // back to process.cwd() (unchanged legacy behavior).
+      const base = ctx?.cwd ?? process.cwd();
+      const searchPath = (args.path as string) || base;
 
       if (!pattern) return JSON.stringify({ error: 'pattern is required' });
 
       const absolutePath = isAbsolute(searchPath)
         ? searchPath
-        : resolve(process.cwd(), searchPath);
+        : resolve(base, searchPath);
 
       // Validate directory exists
       try {

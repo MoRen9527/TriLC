@@ -1970,7 +1970,14 @@ export function createTriLCApp(env: TriLCEnv) {
             message: body.message.trim(),
             conversationId: body.conversationId ?? `conv_${Date.now().toString(36)}`,
             model,
-            systemPrompt: body.systemPrompt ?? defaultSystemPrompt(),
+            // REQ-014b / r4-1 C: when the client supplies an agent systemPrompt,
+            // defaultSystemPrompt (and its weekly-plane hint) is skipped entirely.
+            // Append the hint explicitly so the model still knows the company
+            // weekly plane root. defaultSystemPrompt already embeds it internally
+            // for the no-prompt path — never both (see buildWeeklyPlaneHint).
+            systemPrompt: body.systemPrompt
+              ? body.systemPrompt + buildWeeklyPlaneHint()
+              : defaultSystemPrompt(),
             context: {
               files: body.context?.files ?? [],
               workspaceRoot: body.context?.workspaceRoot ?? env.cwd,
@@ -3401,6 +3408,14 @@ export function defaultSystemPrompt(cwd?: string): string {
  * r17 ②：公司周平面读取提示（读取端注入）。
  * 周平面根解析走 src/project/weekly-plane-root.ts（env 显式 → workspace
  * sibling → undefined 回退不注入）。
+ *
+ * 注入点（r4-1 C 标记，防双注入）：本 hint 有两处消费——
+ *   1. defaultSystemPrompt() 内部（no-prompt 路径，见 defaultSystemPrompt）；
+ *   2. POST /internal/v1/tasks/submit 外部 append（client systemPrompt 路径，
+ *      app.ts 1973 行附近）。
+ * 两处互斥：defaultSystemPrompt 返回时已含 hint，外部 append 只发生在
+ * client 显式传入 systemPrompt 的分支。新增调用点时必须二选一叠加，
+ * 不得同时套用两处。
  */
 function buildWeeklyPlaneHint(): string {
   const planeRoot = resolveWeeklyPlaneRoot();

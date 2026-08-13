@@ -4,7 +4,7 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { resolve, isAbsolute } from 'node:path';
-import { register as registerTool } from '@tricompany/agent-core';
+import { register as registerTool, type ToolContext } from '@tricompany/agent-core';
 
 const MAX_LINES = 2000;
 const MAX_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB safety cap
@@ -53,16 +53,20 @@ export function registerReadTool(): void {
         },
       },
     },
-    async (args: Record<string, unknown>) => {
+    async (args: Record<string, unknown>, ctx?: ToolContext) => {
       const filePath = args.file_path as string;
       const offset = typeof args.offset === 'number' ? args.offset : 1;
       const limit = typeof args.limit === 'number' ? args.limit : undefined;
 
       if (!filePath) return JSON.stringify({ error: 'file_path is required' });
 
+      // REQ-014b: resolve relative paths against the agent loop cwd (ctx.cwd),
+      // not the daemon launch dir. ctx is absent in legacy call sites → fall
+      // back to process.cwd() (unchanged legacy behavior).
+      const base = ctx?.cwd ?? process.cwd();
       const absolutePath = isAbsolute(filePath)
         ? filePath
-        : resolve(process.cwd(), filePath);
+        : resolve(base, filePath);
 
       try {
         // Safety: check file size before reading

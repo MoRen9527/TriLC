@@ -8,6 +8,7 @@ import {
   register as registerTool,
   createProcessSupervisor,
   type ProcessSupervisor,
+  type ToolContext,
 } from '@tricompany/agent-core';
 
 // ── Security policy ──
@@ -103,9 +104,11 @@ export function registerShellExecTool(opts: ShellExecOptions): void {
         },
       },
     },
-    async (args: Record<string, unknown>) => {
+    async (args: Record<string, unknown>, ctx?: ToolContext) => {
       const command = args.command as string;
-      const cwd = (args.cwd as string) || process.cwd();
+      // REQ-014b: model-explicit args.cwd wins (legacy semantics preserved),
+      // then the agent loop cwd (ctx.cwd), then the daemon launch dir.
+      const cwd = (args.cwd as string) || ctx?.cwd || process.cwd();
 
       if (!command) return JSON.stringify({ error: 'command is required' });
 

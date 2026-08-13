@@ -4,7 +4,7 @@
 
 import { readdirSync, statSync } from 'node:fs';
 import { resolve, isAbsolute, basename } from 'node:path';
-import { register as registerTool } from '@tricompany/agent-core';
+import { register as registerTool, type ToolContext } from '@tricompany/agent-core';
 
 interface LSEntry {
   name: string;
@@ -80,14 +80,18 @@ export function registerLSTool(): void {
         },
       },
     },
-    async (args: Record<string, unknown>) => {
+    async (args: Record<string, unknown>, ctx?: ToolContext) => {
       const inputPath = args.path as string || '.';
       const detailed = args.detailed === true;
       const pattern = args.pattern as string | undefined;
 
+      // REQ-014b: resolve relative paths against the agent loop cwd (ctx.cwd),
+      // not the daemon launch dir. ctx is absent in legacy call sites → fall
+      // back to process.cwd() (unchanged legacy behavior).
+      const base = ctx?.cwd ?? process.cwd();
       const absolutePath = isAbsolute(inputPath)
         ? resolve(inputPath)
-        : resolve(process.cwd(), inputPath);
+        : resolve(base, inputPath);
 
       try {
         const entries = readdirSync(absolutePath, { withFileTypes: true });
