@@ -50,7 +50,9 @@ function resolveTaskUser(): string | null {
 function buildTaskScript(config: TriLCDaemonServiceConfig): string {
   const lines: string[] = ["@echo off"];
   const label = config.label || TRILC_TASK_NAME;
-  lines.push(`rem ${label} — TriMetaverse Local Controller`);
+  // 纯 ASCII（装后验收①）：em-dash 在 GBK cmd.exe 下尾字节解析成 "m"
+  // 破坏 rem 行 → 下一行被吞/杂音。rem 行严禁非 ASCII。
+  lines.push(`rem ${label} - TriMetaverse Local Controller`);
   lines.push(`cd /d ${quoteCmdArg(config.cwd)}`);
   if (config.env) {
     for (const [key, value] of Object.entries(config.env)) {
