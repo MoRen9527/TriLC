@@ -4,7 +4,8 @@
 // CTO-008-P P.1: CLI entry point for PC desktop packaging.
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, join } from 'node:path';
+import { mkdirSync, openSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { platform } from 'node:os';
 import type { TriLCDaemonServiceConfig } from './daemon/service.js';
@@ -200,13 +201,21 @@ async function cmdStart(port: number, permissionMode?: string, allowRules?: stri
   // Clean up stale PID file (the daemon self-registers on startup — REQ-018)
   await removePidFile();
 
+  // ①诊断修复（日志两层第一层）：daemon 子进程输出落盘
+  // <dataDir>/daemon/daemon.log（此前 stdio:'ignore' 全丢——崩溃无可诊断）
+  const daemonDataDir = process.env.TRILC_DATA_DIR ?? `${process.env.LOCALAPPDATA ?? process.env.HOME ?? '/tmp'}/trilc`;
+  const daemonLogDir = join(daemonDataDir, 'daemon');
+  mkdirSync(daemonLogDir, { recursive: true });
+  const daemonLogPath = join(daemonLogDir, 'daemon.log');
+  const daemonLogFd = openSync(daemonLogPath, 'a');
+
   const entryPoint = resolve(__dirname, 'index.js');
   const child: ChildProcess = spawn(
     process.execPath,
     [entryPoint],
     {
       detached: true,
-      stdio: 'ignore',
+      stdio: ['ignore', daemonLogFd, daemonLogFd],
       env: {
         ...process.env,
         TRILC_PORT: String(port),
@@ -226,19 +235,35 @@ async function cmdStart(port: number, permissionMode?: string, allowRules?: stri
     process.exit(1);
   }
 
-  // Wait for the daemon to self-register its PID (REQ-018: daemon owns PID file)
-  const deadline = Date.now() + 10000;
+  // ①诊断修复（健康窗口）：10s 单次 → 30s 轮询。冷启动需拉 keys +
+  // 13 员工 roster + 14 contracts + TriMC 连接，10s 过窄（22:05/22:12
+  // auto-start 连败实证）。失败输出明确诊断原因 + 日志路径。
+  const pidDeadline = Date.now() + 30000;
   let registered = false;
-  while (Date.now() < deadline) {
+  let spawnDied = false;
+  while (Date.now() < pidDeadline) {
     const registeredPid = await readPid();
     if (registeredPid === child.pid) { registered = true; break; }
-    if (!isProcessAlive(child.pid)) break; // spawn died before registering
-    await new Promise((r) => setTimeout(r, 200));
+    if (!isProcessAlive(child.pid)) { spawnDied = true; break; } // spawn died before registering
+    await new Promise((r) => setTimeout(r, 500));
   }
 
-  const ready = await healthCheck(port);
-  if (!ready.ok) {
-    console.error(`[trilc] daemon failed to start (pid=${child.pid}) — port ${port} not healthy.`);
+  let ready = false;
+  let lastHealthDetail = '';
+  const healthDeadline = Date.now() + 30000;
+  while (Date.now() < healthDeadline) {
+    const check = await healthCheck(port);
+    if (check.ok) { ready = true; break; }
+    lastHealthDetail = 'healthz not responding';
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+
+  if (!ready) {
+    const reason = spawnDied
+      ? `daemon process exited during startup (pid=${child.pid})`
+      : `daemon not healthy within 30s (pid=${child.pid}): ${lastHealthDetail || 'no detail'}`;
+    console.error(`[trilc] daemon failed to start — ${reason}`);
+    console.error(`[trilc] daemon log: ${daemonLogPath}`);
     process.exit(1);
   }
 
