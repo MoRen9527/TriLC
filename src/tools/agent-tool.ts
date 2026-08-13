@@ -10,21 +10,27 @@ import { spawnAgent, getBuiltInAgent, listBuiltInAgents } from '@tricompany/agen
 import type { AgentDefinition, SpawnConfig } from '@tricompany/agent-core';
 
 // ── Helper: List agents for /agents command ──
-// Fetches built-in agents from agent-core + contract agents from daemon.
+// Fetches built-in agents from agent-core + company agents from the TriMC
+// company endpoint (装后验收③：chat /agents 需接 company 视图——TriMC
+// /internal/v1/agents 返回员工注册表，count 14 已实证）。
 export async function listAgentsForDisplay(): Promise<string> {
   const builtIn = listBuiltInAgents().map(a => ({ name: a.name, description: a.description }));
   let contractAgents: Array<{ name: string; description: string }> = [];
 
   try {
-    const res = await fetch('http://localhost:8711/internal/v1/agents');
-    const json = await res.json() as { ok: boolean; agents?: Array<{ id: string; name?: string; description?: string; systemPrompt?: string }> };
+    const trimcBase = process.env.TRIMC_BASE_URL ?? 'http://127.0.0.1:8710';
+    const res = await fetch(`${trimcBase}/internal/v1/agents`);
+    const json = await res.json() as {
+      ok: boolean;
+      agents?: Array<{ agentId?: string; name?: string; sessionId?: string }>;
+    };
     if (json.ok && json.agents) {
       contractAgents = json.agents.map(a => ({
-        name: a.id,
-        description: a.name || a.description || a.id,
+        name: a.agentId ?? a.name ?? 'unknown',
+        description: a.name || a.agentId || 'company agent',
       }));
     }
-  } catch { /* daemon unreachable — built-in only */ }
+  } catch { /* company endpoint unreachable — built-in only */ }
 
   const all = [...builtIn, ...contractAgents];
   if (all.length === 0) return 'No agents available.';
