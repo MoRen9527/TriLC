@@ -62,10 +62,10 @@ function buildTaskScript(config: TriLCDaemonServiceConfig): string {
   }
   const allArgs = [config.entryScript, ...config.programArgs];
   const command = [quoteCmdArg(config.nodeBin), ...allArgs.map(quoteCmdArg)].join(" ");
-  // 装后验收②诊断线：daemon 输出重定向到日志文件（此前无落盘，schtasks
-  // 运行态输出不可见、工具卡住无从排查）
-  const daemonLog = path.join(resolveStateDir(config), "daemon.log");
-  lines.push(`${command} >> ${quoteCmdArg(daemonLog)} 2>&1`);
+  // r19 修复：cmd 层不做输出重定向——日志捕获由 daemon 层 stdio append
+  // 负责（cli.js start 的 spawn fd）。两层同文件双 open 在 Windows 触发
+  // EBUSY 文件锁（schtasks 实例自锁起不来）。
+  lines.push(command);
   return `${lines.join("\r\n")}\r\n`;
 }
 

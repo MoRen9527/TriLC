@@ -36,6 +36,40 @@ import { resolve, dirname } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+/**
+ * r19 修复：dist 形态（node dist/cli.js）无 tsx 的 dotenv 自动加载，
+ * schtasks ONLOGON 环境缺 TRIMODEL_API_TOKEN 等关键变量（keys fetch 401）。
+ * 兜底加载工作区/仓库根 .env——不覆盖已存在的进程 env。
+ */
+function loadEnvFileFallback(): void {
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    resolve(scriptDir, '..', '..', '..', '.env'), // 工作区根 D:/Code/ai/.env
+    resolve(scriptDir, '..', '..', '.env'),       // TriLC 根 .env
+    resolve(process.cwd(), '.env'),
+  ];
+  for (const envPath of candidates) {
+    if (!existsSync(envPath)) continue;
+    try {
+      for (const rawLine of readFileSync(envPath, 'utf-8').split(/\r?\n/)) {
+        const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(rawLine.trim());
+        if (!match) continue;
+        const key = match[1];
+        let value = match[2].trim();
+        if (
+          (value.startsWith('"') && value.endsWith('"')) ||
+          (value.startsWith("'") && value.endsWith("'"))
+        ) {
+          value = value.slice(1, -1);
+        }
+        if (!(key in process.env)) process.env[key] = value;
+      }
+    } catch { /* unreadable .env — ignore */ }
+  }
+}
+
+loadEnvFileFallback();
+
 function resolveFromWorkspace(): string {
   // Check env var first
   if (process.env.TRICOMPANY_SOURCE_PATH) return process.env.TRICOMPANY_SOURCE_PATH;
