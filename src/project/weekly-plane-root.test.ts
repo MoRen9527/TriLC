@@ -6,10 +6,9 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 
 import { resolveWeeklyPlaneRoot } from './weekly-plane-root.js';
 import {
@@ -20,12 +19,23 @@ import {
 
 const ORIG_ENV = process.env.TRILC_WEEKLY_PLANE_ROOT;
 
-function expectedSiblingPath(): string {
-  // Independently derived expectation — NOT copy-pasted from the implementation.
-  // This test file lives at src/project/ → three hops up = the workspace root
-  // D:/Code/ai, then into the sibling TriMetaverse checkout.
-  const scriptDir = dirname(fileURLToPath(import.meta.url));
-  return resolve(scriptDir, '..', '..', '..', 'TriMetaverse', 'docs', 'workflow', 'operating-records');
+/**
+ * Hardcoded workspace fact anchor (r2-3 重验口径): the sibling expectation
+ * is an INDEPENDENT fact — the absolute path of the local workspace layout —
+ * deliberately NOT derived from the implementation's hop-count logic. If the
+ * implementation regresses its depth, this forced assertion goes red instead
+ * of silently passing through a false-negative else branch.
+ */
+const WORKSPACE_SIBLING_FACT = resolve(
+  'D:/Code/ai',
+  'TriMetaverse',
+  'docs',
+  'workflow',
+  'operating-records',
+);
+
+function siblingFactExists(): boolean {
+  return existsSync(WORKSPACE_SIBLING_FACT);
 }
 
 describe('resolveWeeklyPlaneRoot', () => {
@@ -58,24 +68,23 @@ describe('resolveWeeklyPlaneRoot', () => {
 
   it('env empty string → falls through to sibling discovery', () => {
     process.env.TRILC_WEEKLY_PLANE_ROOT = '';
-    const expected = expectedSiblingPath();
     const result = resolveWeeklyPlaneRoot();
-    // Source-state workspace: sibling exists → hit; otherwise → undefined.
-    if (existsSync(expected)) {
-      assert.equal(result, expected);
+    // Workspace present → MUST hit the hardcoded fact; absent → legacy fallback.
+    if (siblingFactExists()) {
+      assert.equal(result, WORKSPACE_SIBLING_FACT);
     } else {
       assert.equal(result, undefined);
     }
   });
 
-  it('no env → sibling hit when workspace present, else undefined', () => {
-    const expected = expectedSiblingPath();
-    const result = resolveWeeklyPlaneRoot();
-    if (existsSync(expected)) {
-      assert.equal(result, expected, 'source-state workspace should discover the sibling');
-    } else {
-      assert.equal(result, undefined, 'no sibling and no env → legacy fallback');
+  it('no env + workspace sibling exists → MUST hit (forced assertion)', () => {
+    if (!siblingFactExists()) {
+      // Non-workspace environment (CI / server): only legacy fallback applies.
+      assert.equal(resolveWeeklyPlaneRoot(), undefined);
+      return;
     }
+    // Forced hit: independent fact anchor, no else-branch escape hatch.
+    assert.equal(resolveWeeklyPlaneRoot(), WORKSPACE_SIBLING_FACT);
   });
 });
 
@@ -108,7 +117,7 @@ describe('router two-track semantics (r2-2)', () => {
     // In source-state workspace discovery may hit; both are valid.
     assert.ok(
       paths.companyWeeklyPlaneDir === undefined ||
-        paths.companyWeeklyPlaneDir === expectedSiblingPath(),
+        paths.companyWeeklyPlaneDir === WORKSPACE_SIBLING_FACT,
     );
   });
 
