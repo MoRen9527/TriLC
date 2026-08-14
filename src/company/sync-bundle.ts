@@ -313,6 +313,11 @@ export function computeKeyFingerprint(material: string): string {
   return createHash('sha256').update(material, 'utf-8').digest('hex').slice(0, 8);
 }
 
+/** 路径短指纹 = SHA-256(path).slice(0,8)（§7.2 防截断；L1 worktree 路径呈现）。 */
+export function computePathFingerprint(path: string): string {
+  return createHash('sha256').update(path, 'utf-8').digest('hex').slice(0, 8);
+}
+
 // ── 单调性（§一.4：bundleId 唯一 + generatedAt 严格递增）──
 
 /**

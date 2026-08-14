@@ -235,6 +235,18 @@
 - 单测：sync-bundle 12 用例（校验矩阵/白名单/指纹/单调性/泄漏扫描）+ init-sync 16 用例（链态门 409/防重入 409/公司态 400/项目 400/422/五维降级矩阵/幂等重跑同 bundleId/内容变化新 bundleId/push 失败分类/事件序/git 固定身份/双远端/序列化无 sk-/status remote 降级/启动 re-sync 只读）。
 - 全量基线：398/399（1 fail = test/tui/components.test.ts 环境缺口既有，基线 340/341 口径不退化；+58 含 i3-2 同批）。
 
+### L1-L4 协同确认（`src/company/init-confirm.ts`，Phase D）
+
+- **I4 Phase D 新增**：`GET /internal/v1/init/confirm/check`（按需计算，无后台常驻轮询）+ `POST /internal/v1/init/confirm`（服务端重算 check → readyForConfirm 门禁 409 附 check → `updateConfirm` 快照 confirmed + l1/l2/l3 → `transitionTo('ready')` → init:step-event confirmed）。
+- L1 注册同一性：注册点 activeProjectKey/repoUrl/worktrees ↔ bundle.project ↔ TriMC status.project 三面比对；worktree 路径用短指纹呈现（SHA-256.slice(0,8)，sync-bundle.ts `computePathFingerprint`）。
+- L2 版本一致：本地 HEAD == bundle.devHead == fleetHead.commit；降级口径（remote null）→ 双值比较 + degraded: true。
+- L3 写读闭环：applied.bundleId == 本地 bundle 文件 bundleId（sync commit 即探针）。
+- L4 反向闭环：{ status: 'pending', note: '由首个协同工作承载' }（I5 树承载）。
+- readyForConfirm = l1 && l2 && l3 全 ok（§2.8 验收口径：协同开启成功 = 三元素一致 + 一次确认）。
+- TriMC status 端点增 additive `project` 字段（applied project 维内容，L1 服务器侧事实源）。
+- 单测 +11：三面一致全绿 / repoUrl 错误仓 / worktree 指纹呈现 + 服务器侧不一致 / fleet 落后 / 降级口径 / 未 applied 未就绪 / 本地 bundle 缺失 / confirm 成功转移 ready + 快照 + 事件 / 409 notReady 附 check / 409 chainState / 防重入并发。全量 409/410（1 fail 同既有缺口）。
+- 两入口渲染：trilc chat CONFIRM 文本流程（L1-L4 呈现 + 红差异 + 诊断入口 + 确认问答）+ TriPilot 确认卡（三元素同显 + HEAD 徽标 + 未就绪提示 + 确认按钮门禁禁用态）；零本地执行。
+
 ## Sources
 
 - `../../src/runtime/`

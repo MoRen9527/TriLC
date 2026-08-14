@@ -84,6 +84,20 @@ interface SyncRunPayload {
   retryable?: boolean;
 }
 
+interface ConfirmCheckPayload {
+  chainState: string;
+  l1: {
+    ok: boolean;
+    items: Array<{ element: 'repoUrl' | 'projectKey' | 'worktreePath'; status: string; local: string; bundle: string; server: string }>;
+  };
+  l2: { ok: boolean; localHead: string; bundleHead: string; fleetHead: string };
+  l3: { ok: boolean; appliedBundleId: string | null; localBundleId: string | null };
+  l4: { status: string; note: string };
+  readyForConfirm: boolean;
+  remote: 'ok' | null;
+  degraded: boolean;
+}
+
 export interface InitCliFlowResult {
   outcome: 'assembled' | 'skipped' | 'blocked' | 'error';
   detail?: string;
@@ -470,6 +484,98 @@ async function runSyncFlow(port: number): Promise<InitCliFlowResult> {
   return { outcome: 'error', detail: `sync ${runRes.status}` };
 }
 
+// ── confirm 流程（I4 Phase D 增量：L1-L4 协同确认卡文本化；零本地执行——
+// 只渲染 + 发 daemon 端点指令（GET confirm/check、POST confirm））──
+
+const L1_ELEMENT_LABELS: Record<string, string> = {
+  repoUrl: '仓库 URL',
+  projectKey: '项目 key',
+  worktreePath: 'worktree 路径指纹',
+};
+
+function renderConfirmCheck(check: ConfirmCheckPayload): string {
+  const lines: string[] = [];
+  const short = (s: string) => (s.length > 20 ? `${s.slice(0, 8)}…` : s);
+  // L1 三元素同显（三方同显：本地注册点 / bundle / 服务器）
+  lines.push('  [L1 注册同一性]');
+  for (const item of check.l1.items) {
+    const mark = item.status === 'ok' ? '[OK]' : '[✕]';
+    lines.push(
+      `  ${mark} ${L1_ELEMENT_LABELS[item.element] ?? item.element}：` +
+        `本地=${short(item.local) || '—'} bundle=${short(item.bundle) || '—'} 服务器=${short(item.server) || '—'}`,
+    );
+  }
+  // L2 HEAD 一致性徽标
+  const l2mark = check.l2.ok ? '[OK]' : check.degraded ? '[~]' : '[✕]';
+  lines.push(
+    `  ${l2mark} [L2 版本一致] 本地=${short(check.l2.localHead)} bundle=${short(check.l2.bundleHead)} 服务器=${short(check.l2.fleetHead) || '不可达'}`,
+  );
+  // L3 写读闭环
+  const l3mark = check.l3.ok ? '[OK]' : '[未就绪]';
+  lines.push(
+    `  ${l3mark} [L3 写读闭环] applied=${short(check.l3.appliedBundleId ?? '') || '—'} 本地=${short(check.l3.localBundleId ?? '') || '—'}`,
+  );
+  lines.push(`  [--] [L4 反向闭环] ${check.l4.note}`);
+  if (check.degraded) lines.push('  注记：服务器不可达（降级口径）— L2/L3 服务器侧事实待恢复后复核');
+  // 红差异提示 + 诊断入口（哪端、什么元素、期望 vs 实际）
+  for (const item of check.l1.items) {
+    if (item.status !== 'ok') {
+      lines.push(`  差异：${L1_ELEMENT_LABELS[item.element] ?? item.element} 三面不一致（本地=${short(item.local) || '—'}，bundle=${short(item.bundle) || '—'}，服务器=${short(item.server) || '—'}）`);
+      lines.push(`    诊断：${item.element === 'worktreePath' || item.element === 'projectKey' || item.element === 'repoUrl' ? '重新登记 = PROJECT-LINK 流程（link/claim）' : ''}`);
+    }
+  }
+  if (!check.l2.ok) {
+    lines.push(
+      `  差异：dev HEAD 不一致（本地=${short(check.l2.localHead)}，bundle=${short(check.l2.bundleHead)}，服务器=${short(check.l2.fleetHead) || '不可达'}）` +
+        `— 诊断：重新同步 = SYNC 流程（sync/run）；服务器落后 = fleet 每 15min 收敛`,
+    );
+  }
+  if (!check.l3.ok) {
+    lines.push('  未就绪：服务器尚未 applied 本地 bundle — 先等待 fleet 收敛（每 15min），重跑本确认即可');
+  }
+  return lines.join('\n');
+}
+
+async function runConfirmFlow(port: number): Promise<InitCliFlowResult> {
+  const checkRes = await getJson<ConfirmCheckPayload>(port, '/internal/v1/init/confirm/check');
+  if (checkRes.status !== 200 || !checkRes.json) {
+    return { outcome: 'error', detail: `confirm/check 不可用（http ${checkRes.status}）— daemon 确认端点未就绪` };
+  }
+  console.log(renderConfirmCheck(checkRes.json));
+
+  if (!checkRes.json.readyForConfirm) {
+    console.log('[trilc:init] 未达确认门禁（readyForConfirm=false）— 按上表差异处理后重进本流程。');
+    return { outcome: 'skipped', detail: 'confirm not ready' };
+  }
+  const confirm = await ask('三元素一致 + 写读闭环已达标 — 确认开启协同？（y/n）> ');
+  if (confirm.toLowerCase() !== 'y' && confirm.toLowerCase() !== 'yes') {
+    console.log('[trilc:init] 已取消 — 协同未开启（重进本流程随时确认）。');
+    return { outcome: 'skipped', detail: 'confirm cancelled' };
+  }
+  const res = await postJson(port, '/internal/v1/init/confirm', { entry: 'trilc-chat' });
+  const body = res.json as { status?: number; chainState?: string; confirmed?: boolean; busy?: boolean; notReady?: boolean; check?: ConfirmCheckPayload; message?: string } | null;
+  if (res.status === 200 && body?.confirmed) {
+    console.log('\n[trilc:init] 协同开启成功 ✓（三元素一致 + 一次确认）');
+    console.log(`  chainState：${body.chainState ?? 'ready'}（READY — 首个协同工作由后续流程承载）`);
+    return { outcome: 'skipped', detail: 'confirmed → ready' };
+  }
+  if (res.status === 409 && body?.notReady && body.check) {
+    console.log('[trilc:init] 门禁未达（服务端重算未就绪）— 最新 check：');
+    console.log(renderConfirmCheck(body.check));
+    return { outcome: 'error', detail: 'confirm notReady' };
+  }
+  if (res.status === 409 && body?.busy) {
+    console.log('[trilc:init] 确认执行中（单执行体互斥）— 稍后重试。');
+    return { outcome: 'error', detail: 'confirm busy' };
+  }
+  if (res.status === 409 && body?.chainState) {
+    console.log(`[trilc:init] 当前链路状态不允许确认（${body.chainState}）— 请先完成前置阶段。`);
+    return { outcome: 'error', detail: `confirm 409: ${body.chainState}` };
+  }
+  console.log(`[trilc:init] 确认失败（http ${res.status}）：${body?.message ?? 'unknown'}`);
+  return { outcome: 'error', detail: `confirm ${res.status}` };
+}
+
 /**
  * chat 启动入口：chain/status 呈初始化阶段 → 文本化流程。
  * - selfcheck：诊断卡（blocked → 流程结束返回聊天；pass/degraded → 继续开张；
@@ -548,8 +654,8 @@ export async function runInitCliFlow(port: number): Promise<InitCliFlowResult> {
       console.log('\n[trilc:init] 初始化阶段：SYNC（五维同步）');
       return runSyncFlow(port);
     case 'confirm':
-      console.log('\n[trilc:init] 初始化阶段：CONFIRM（协同确认）— 由后续流程承接，进入聊天。');
-      return { outcome: 'skipped', detail: 'confirm phase' };
+      console.log('\n[trilc:init] 初始化阶段：CONFIRM（协同确认）');
+      return runConfirmFlow(port);
     default:
       // ready / uninitialized：普通聊天
       return { outcome: 'skipped', detail: `chainState=${status.chainState}` };

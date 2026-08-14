@@ -141,6 +141,8 @@ export interface SyncStatusRemote {
   appliedGeneratedAt: string | null;
   fleetHead: { branch: string; commit: string } | null;
   dims: Record<string, string> | null;
+  /** 服务器已应用 project 维（Phase D L1 三面比对事实源）。 */
+  project: BundleProject | null;
 }
 
 export interface SyncStatusPayload {
@@ -333,7 +335,7 @@ export function bundleTargetPath(mainCheckoutPath: string): string {
   return resolve(mainCheckoutPath, 'docs', 'registry', 'init-sync', 'sync-config.json');
 }
 
-async function readExistingBundle(targetPath: string): Promise<SyncBundle | null> {
+export async function readExistingBundle(targetPath: string): Promise<SyncBundle | null> {
   try {
     const raw = await readFile(targetPath, 'utf-8');
     const validation = validateSyncBundle(JSON.parse(raw));
@@ -633,7 +635,7 @@ export async function getSyncStatus(deps: InitSyncDeps): Promise<SyncStatusPaylo
   } catch {
     // 本地 bundle 读取失败不阻塞 status（remote 事实仍可呈现）
   }
-  const remote = await fetchRemoteStatus(deps);
+  const remote = await fetchRemoteSyncStatus(deps);
   return {
     chainState: chainFrame.chainState,
     phaseDetail: chainFrame.phaseDetail.sync,
@@ -643,7 +645,11 @@ export async function getSyncStatus(deps: InitSyncDeps): Promise<SyncStatusPaylo
   };
 }
 
-async function fetchRemoteStatus(deps: InitSyncDeps): Promise<SyncStatusRemote | null> {
+/**
+ * 拉取 TriMC config/sync/status（超时 3s 降级 null，§6.8）。
+ * 导出供 init-confirm.ts（Phase D check 的服务器侧事实源）复用。
+ */
+export async function fetchRemoteSyncStatus(deps: InitSyncDeps): Promise<SyncStatusRemote | null> {
   const timeoutMs = deps.timeoutMs ?? 3000;
   try {
     const res = await fetch(`${deps.trimcBaseUrl}/internal/v1/config/sync/status`, {
@@ -655,6 +661,7 @@ async function fetchRemoteStatus(deps: InitSyncDeps): Promise<SyncStatusRemote |
       applied?: { bundleId?: string; generatedAt?: string } | null;
       fleetHead?: { branch: string; commit: string } | null;
       dims?: Record<string, string> | null;
+      project?: BundleProject | null;
     };
     if (!body.ok) return null;
     return {
@@ -663,6 +670,7 @@ async function fetchRemoteStatus(deps: InitSyncDeps): Promise<SyncStatusRemote |
       appliedGeneratedAt: body.applied?.generatedAt ?? null,
       fleetHead: body.fleetHead ?? null,
       dims: body.dims ?? null,
+      project: body.project ?? null,
     };
   } catch {
     return null; // 不可达降级（§6.8）
@@ -702,7 +710,7 @@ export async function runStartupResyncCheck(deps: InitSyncDeps): Promise<void> {
       }
       return;
     }
-    const remote = await fetchRemoteStatus(deps);
+    const remote = await fetchRemoteSyncStatus(deps);
     if (!remote) return; // 远程不可达静默
     if (remote.appliedBundleId === localBundleId) {
       console.log(`[trilc:init-sync] daemon restart: local bundle ${localBundleId} already applied on server — no-op`);

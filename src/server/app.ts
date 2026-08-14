@@ -89,6 +89,7 @@ import {
   type InitSyncDeps,
   type SyncEntry,
 } from '../company/init-sync.js';
+import { runConfirmCheck, runConfirm } from '../company/init-confirm.js';
 import { createSessionReaper } from '../cron/session-reaper.js';
 import { createMinimalCronEngine, type MinimalCronEngine } from '../cron/service.js';
 import { createUpdateCheckHandler, startUpdateCheckLoop } from '../update/update-check.js';
@@ -1352,6 +1353,51 @@ export function createTriLCApp(env: TriLCEnv) {
             res.writeHead(500, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ error: 'sync_status_unavailable', message: (err as Error).message }));
           }
+          return;
+        }
+
+        // ── GET /internal/v1/init/confirm/check ──
+        // I4 Phase D（§六.1）：L1-L4 协同确认按需计算（无后台常驻轮询）。
+        // 数据源 = 注册点 ↔ 本地 bundle ↔ TriMC status.project/fleetHead
+        // 三面；远程不可达 → degraded 口径（remote: null）。
+        if (req.url === '/internal/v1/init/confirm/check' && req.method === 'GET') {
+          try {
+            const payload = await runConfirmCheck(initSyncDeps);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(payload));
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'confirm_check_unavailable', message: (err as Error).message }));
+          }
+          return;
+        }
+
+        // ── POST /internal/v1/init/confirm ──
+        // I4 Phase D（§六.2）：用户一次确认（两入口同载荷 { entry }）→
+        // 服务端重算 check → readyForConfirm 门禁（409 附 check）→
+        // 快照 confirmed → transitionTo('ready') → init:step-event。
+        if (req.url === '/internal/v1/init/confirm' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: Record<string, unknown> = {};
+          if (raw.trim()) {
+            try {
+              body = JSON.parse(raw) as Record<string, unknown>;
+            } catch {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+              return;
+            }
+          }
+          const entryRaw = body.entry;
+          const entry: SyncEntry =
+            entryRaw === 'tripilot' || entryRaw === 'trilc-chat' ? entryRaw : 'daemon';
+          const result = await runConfirm(initSyncDeps, entry);
+          res.writeHead(result.status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(result));
           return;
         }
 
