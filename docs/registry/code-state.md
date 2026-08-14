@@ -176,6 +176,33 @@
 - 全量基线：340/341（1 fail = test/tui/components.test.ts ink-testing-library 环境缺口，r19 基线既有非本树引入）。
 - 活体冒烟：TRILC_DATA_DIR 显式隔离实例 8726（候选 A 轮）+ 8727（A' 轮）全链 PASS。A' 轮实证：selfcheck 完成（degraded）→ 链态自动 onboarding（chain-changed from=selfcheck to=onboarding sourceEntry=daemon，SSE 序 selfcheck-finished 先于 chain-changed）→ assemble 200（响应与 §一.5 契约字面一致，无 advancedFromSelfcheck）→ 工作区白名单 8 产物 → 重入 422 → 8711 全程未扰动。
 
+## 项目面注册点 + link/claim/inspect（W33，init-collab I3 — commit 71cccc9 独占四文件；共享文件 init-chain.updateProjectLink / app.ts 三端点 / bus.ts 事件族 / init-cli-flow 文本流程随 44c82a1 合并提交，i3-4 小狄终审放行）
+
+### 注册点（`src/project/project-registry.ts`）
+
+- 落点 `%LOCALAPPDATA%\trilc\project-registry.json` 固定路径（不随 TRILC_DATA_DIR 覆盖）；`TRILC_PROJECT_REGISTRY` env 仅测试隔离。文件不存在 → 默认帧（内置预置表 + 空运行态），惰性首写才落盘（符合设计）。
+- schema（i3-1 §一冻结，I4 并行依据）：`{ schemaVersion: 1, activeProjectKey, projects: { <key>: { repoUrl, mainCheckoutPath, hasNpmFileDeps, defaultBranch, worktrees[] } } }`；worktrees 主键 = 绝对路径 + gitdir（同键幂等刷新、键冲突拒绝）。
+- 真 tmp→rename 原子写 + 读回校验（schemaVersion + activeProjectKey）；内存态缓存（daemon 热更新源，link/claim 同请求内可见）。
+- 项目仓注册表合并同文件：MVP 内置预置表（TriMetaverse 单条目；repoUrl 恒预置保白名单完整性，hasNpmFileDeps/defaultBranch 文件可覆盖 = 现场纠偏安全阀）。**生效时机：冷启动生效**（daemon 内存态缓存优先；运行中改文件需重启 daemon——i3-3 观察项 b 裁决：文档注明，不修）。
+- 惰性清理（幽灵路径）：读取时逐项 existsSync(path)+existsSync(gitdir)，无效项登记移除、不删磁盘（物理资产保留可重新认领）。
+
+### link/claim/inspect 执行体（`src/project/project-link.ts`）
+
+- `POST /internal/v1/projects/link` 六步原子序同一请求：检测（形态判别 absent/empty-dir/worktree/git-repo/non-git-dir）→ 关联判定（remote origin URL 白名单规范化比对：https/ssh 同仓等价、去尾 .git、scp 形态）→ hasNpmFileDeps 门禁（拒绝自动 add）→ 认领（worktree 形态 gitdir 属主命中 → 只登记绝不重复 add）/ 建立（local: `worktree add -b project/<key>`；github: clone → defaultBranch checkout → setMainCheckout → 转本地链路）→ 登记去重 + `git worktree list` 交叉验证 → 链态快照 + 内存态热更新。失败分类十类 + 回滚（`worktree remove` 非 --force，全仓禁用 --force；链态失败 → 注册点回滚 + worktree remove）。防重入 409 busy。
+- 链态门：link/claim 仅 `chainState=project-link`，其他 409 `{ chainState }`；inspect 只读不受门禁。本树零 transitionTo 转出（→sync 归 I4）。
+- `POST /internal/v1/projects/claim`：打开文件夹认领（§4a 同构，零 git 写）。
+- `GET /internal/v1/projects/inspect?path=`：识别分流三分类 managed-worktree / project-clone / unlinked。
+- SSE 事件族（经既有 /internal/v1/init/events 通道）：`init:project-link-started/progress/finished`（step 枚举 detect/match/gate/claim/clone/worktree-add/register/chain-update；失败帧带 classification）；finished = chain/status 投影同帧。HTTP 语义：同步执行返回 200 完整结果（契约 202 字面落地调整，SSE 帧实时发布体验等价，i3-4 终审认可）。
+- git 单执行体：`execFile` 参数数组无 shell（OBS-20260814-002）；克隆凭据走 git 系统凭据管理器，代码零密钥。
+- 契约落地差异（i3-4 终审标注）：GitHub 源 match 先行于 detect（克隆默认落点依赖 key，语义不变）；lazyCleanup gitdir 校验落地为 existsSync（MVP 口径）。
+- 已知观察项（i3-3 单列、i3-4 裁决）：github clone 期间无中间进度帧（362M 慢传输下向导无反馈，execFile 退出回调模型；600s timeout + clone-failed 分类兜底）——挂后续小树修（流式 stderr 进度解析 + 心跳帧），不阻塞 I3 收官。
+
+### 测试与基线
+
+- 单测 30 例：project-registry 12（原子写/主键去重/键冲突拒绝/惰性清理幽灵项/磁盘资产保留/幂等刷新）+ project-link 18（URL 规范化矩阵/链态门 409/六步全流程事件序/认领绝不重复 add/同目标重链走认领/门禁拒绝/非白名单拒绝/回滚两路径非 --force/防重入 busy/github 克隆链/claim 矩阵/inspect 三分类/--force 禁用断言/他主检出登记项不误判幽灵）。
+- 全量基线：398/399（1 fail = test/tui/components.test.ts 环境缺口既有，不退化）。
+- 活体（i3-2 CEO 机 8799 三重隔离 + i3-3 独立 8798/8797 双隔离；prod 8711 全程健康、prod 注册点零写入）：inspect 三分类、local 建立全链、同目标重链认领幂等、claim 200、github 白名单拒绝（evil 仓 422 零 clone）+ 真实克隆收敛（首试网络瞬时失败分类 clone-failed → 重试收敛）、门禁 422 零 add、branch-conflict 422、链态门 409、防重入 busy、SSE 八帧投影一致。两缺陷活体复测 PASS（同目标重链误拒 / crossValidateWithGit 他主检出误判幽灵）。
+
 ## 五维同步 + 协同确认（W33，init-collab I4 — 本树，commit 见 tree-op i4-2 checkpoint）
 
 ### bundle 契约（`src/company/sync-bundle.ts`，纯函数可单测）
