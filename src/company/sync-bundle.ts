@@ -291,6 +291,11 @@ export function canonicalize(value: unknown): string {
  * 不含 bundleId/generatedAt/generatedBy 元字段（幂等重跑判定语义：
  * 同内容 → 不重新生成、不换 bundleId，§一.4）。生成前比较与
  * contentHash 共用本函数（init-sync.ts 组装前幂等判定）。
+ * 修正记录 ②（i4-4 终审裁决，OBS-1）：project.devHead 同口径排除——
+ * devHead 是自引用事实：每次成功 run 必 commit bundle 文件推进 HEAD，
+ * 下一轮收集的 devHead 必变 → 纳入会使内容 hash 恒变 → 幂等重跑
+ * 「同内容不重新生成/纯重推」语义失效（§一.4 门禁 5）。devHead 保留为
+ * bundle 内诊断事实（生成时值），不参与幂等判定。
  */
 export function computeDimsContentHash(dims: {
   company: unknown;
@@ -299,10 +304,23 @@ export function computeDimsContentHash(dims: {
   employees: unknown;
   project: unknown;
 }): string {
-  return createHash('sha256').update(canonicalize(dims), 'utf-8').digest('hex');
+  const { project, ...rest } = dims;
+  const projectForHash = projectDimForHash(project);
+  return createHash('sha256')
+    .update(canonicalize({ ...rest, project: projectForHash }), 'utf-8')
+    .digest('hex');
 }
 
-/** contentHash = 五维语义哈希（本 bundle 的五维段）。 */
+/** 幂等哈希口径：project 维剔除 devHead（自引用字段，两端同口径）。 */
+function projectDimForHash(project: unknown): unknown {
+  if (typeof project === 'object' && project !== null && !Array.isArray(project)) {
+    const { devHead: _omitted, ...rest } = project as Record<string, unknown>;
+    return rest;
+  }
+  return project;
+}
+
+/** contentHash = 五维语义哈希（本 bundle 的五维段，devHead 排除）。 */
 export function computeContentHash(bundle: SyncBundle): string {
   const { company, model, keys, employees, project } = bundle;
   return computeDimsContentHash({ company, model, keys, employees, project });
@@ -393,6 +411,8 @@ export interface ConfirmCheckL2 {
   localHead: string;
   bundleHead: string;
   fleetHead: string;
+  /** bundleHead 为 localHead 祖先或相等（i4-4 修正记录 ② additive；诊断呈现用）。 */
+  bundleAncestor?: boolean;
 }
 
 export interface ConfirmCheckL3 {

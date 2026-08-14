@@ -397,7 +397,7 @@ describe('init-sync 幂等重跑与 push 失败分类', () => {
     assert.equal(chain.getState(), 'confirm');
   });
 
-  it('内容变化重跑 → 新 bundleId + generatedAt 严格递增', async () => {
+  it('内容变化重跑 → 新 bundleId + generatedAt 严格递增（模型目录变化）', async () => {
     await chainTo('project-link');
     await chain.updateProjectLink({ status: 'linked', source: 'local', projectKey: 'trimetaverse', worktreePath: mainPath });
     await writeCompanyInitialized();
@@ -410,15 +410,58 @@ describe('init-sync 幂等重跑与 push 失败分类', () => {
     await runInitSync(deps, 'daemon');
     const b1 = JSON.parse(await fs.readFile(bundleTargetPath(mainPath), 'utf-8')) as SyncBundle;
 
-    const second = scriptedGit(
-      ...successGitSequence('ffffffffffffffffffffffffffffffffffffffff'), // devHead 变化
-    );
-    const deps2 = buildDeps(second.git);
+    // 真实内容变化：模型目录新增条目（非 devHead——R1 口径 devHead 自引用排除）
+    const second = scriptedGit(...successGitSequence());
+    const deps2 = buildDeps(second.git, {
+      fetchModels: async () => [{ id: 'tmv-deepseek-v4-pro' }, { id: 'tmv-deepseek-reasoner' }],
+    });
     const r2 = await runInitSync(deps2, 'daemon');
     assert.equal(r2.status, 200);
     const b2 = JSON.parse(await fs.readFile(bundleTargetPath(mainPath), 'utf-8')) as SyncBundle;
     if (r2.status === 200) assert.notEqual(r2.bundleId, b1.bundleId);
     assert.ok(Date.parse(b2.generatedAt) > Date.parse(b1.generatedAt));
+  });
+
+  it('R1 幂等矩阵：仅 devHead 变化的重跑 → 不换 bundleId + 不 commit + 纯重推', async () => {
+    await chainTo('project-link');
+    await chain.updateProjectLink({ status: 'linked', source: 'local', projectKey: 'trimetaverse', worktreePath: mainPath });
+    await writeCompanyInitialized();
+    await writeRegistryFrame('trimetaverse', mainPath);
+    const first = scriptedGit(
+      ...successGitSequence().slice(0, 5),
+      { code: 128, stdout: '', stderr: 'network down' },
+    );
+    const deps = buildDeps(first.git);
+    const r1 = await runInitSync(deps, 'daemon');
+    assert.equal(r1.status, 500);
+    const b1 = JSON.parse(await fs.readFile(bundleTargetPath(mainPath), 'utf-8')) as SyncBundle;
+    const bytesAfterFail = await fs.readFile(bundleTargetPath(mainPath), 'utf-8');
+
+    // 重跑：devHead 变化（自引用推进）但五维真实内容未变 → 幂等复用 existing
+    // 原样（跳过写 → 字节不变 → diff --quiet=0 → 无 commit → 纯重推）
+    const second = scriptedGit(
+      { code: 0, stdout: 'c0ffee01c0ffee01c0ffee01c0ffee01c0ffee01\n', stderr: '' }, // employees HEAD
+      { code: 0, stdout: 'ffffffffffffffffffffffffffffffffffffffff\n', stderr: '' }, // devHead 变化
+      EMPTY_GIT(), // add
+      { code: 0, stdout: '', stderr: '' }, // diff --cached --quiet → 无变更（未写新 devHead）
+      EMPTY_GIT(), // push origin
+      EMPTY_GIT(), // push sg-server
+    );
+    const deps2 = buildDeps(second.git);
+    const r2 = await runInitSync(deps2, 'daemon');
+    assert.equal(r2.status, 200);
+    if (r2.status === 200) {
+      assert.equal(r2.rePushedOnly, true);
+      assert.equal(r2.bundleId, b1.bundleId); // 幂等：不换 bundleId
+    }
+    // 字节不变（existing 原样返回，不覆盖 devHead）
+    const bytesAfterRerun = await fs.readFile(bundleTargetPath(mainPath), 'utf-8');
+    assert.equal(bytesAfterRerun, bytesAfterFail);
+    const b2 = JSON.parse(bytesAfterRerun) as SyncBundle;
+    assert.equal(b2.project.devHead, 'd3adbeefd3adbeefd3adbeefd3adbeefd3adbeef'); // 保留生成时值
+    // 无 commit 调用（git 序列只有 add/diff/push，无 commit）
+    assert.ok(!second.calls.some((c) => c.includes('commit')));
+    assert.equal(chain.getState(), 'confirm');
   });
 
   it('成功后再触发 → 409 { chainState: confirm }', async () => {

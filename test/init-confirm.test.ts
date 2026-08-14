@@ -189,7 +189,7 @@ describe('runConfirmCheck — L1 三面比对', () => {
       assert.equal(check.l1.ok, true);
       for (const item of check.l1.items) assert.equal(item.status, 'ok');
       assert.equal(check.l2.ok, true);
-      assert.deepEqual(check.l2, { ok: true, localHead: DEV_HEAD, bundleHead: DEV_HEAD, fleetHead: DEV_HEAD });
+      assert.deepEqual(check.l2, { ok: true, localHead: DEV_HEAD, bundleHead: DEV_HEAD, fleetHead: DEV_HEAD, bundleAncestor: true });
       assert.equal(check.l3.ok, true);
       assert.equal(check.l3.appliedBundleId, 'confirm-bundle-1');
       assert.equal(check.l3.localBundleId, 'confirm-bundle-1');
@@ -239,35 +239,220 @@ describe('runConfirmCheck — L1 三面比对', () => {
       assert.equal(check.l1.ok, false);
     });
   });
-});
 
-describe('runConfirmCheck — L2/L3 + 降级口径', () => {
-  it('fleet 落后（bundle == 本地 ≠ fleet）→ l2 mismatch + 三值可诊断', async () => {
+  it('R3：worktreePath 三方空集 → 一致判 ok（L1 职责 = 一致性非完备性）', async () => {
+    // 注册点同为空集（三方均无 worktree 登记）
+    await fs.mkdir(path.dirname(registryPath), { recursive: true });
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        activeProjectKey: 'trimetaverse',
+        projects: {
+          trimetaverse: { repoUrl: REPO_URL, hasNpmFileDeps: false, defaultBranch: 'dev', mainCheckoutPath: mainPath, worktrees: [] },
+        },
+      }, null, 2),
+      'utf-8',
+    );
+    const emptyWtBundle = localBundleFixture();
+    emptyWtBundle.project.worktrees = [];
+    await writeLocalBundle(emptyWtBundle);
+    const { git } = scriptedGit({ code: 0, stdout: `${DEV_HEAD}\n`, stderr: '' });
+    const emptyWtServer = serverStatusPayload({
+      project: {
+        projectKey: 'trimetaverse',
+        repoUrl: REPO_URL,
+        defaultBranch: 'dev',
+        worktrees: [],
+        devHead: DEV_HEAD,
+      },
+    });
+    await withStatusServer(emptyWtServer, async (baseUrl) => {
+      const check = await runConfirmCheck(buildDeps(git, baseUrl));
+      const wtItem = check.l1.items.find((i) => i.element === 'worktreePath');
+      assert.equal(wtItem?.status, 'ok');
+      assert.equal(wtItem?.local, '');
+      assert.equal(check.l1.ok, true);
+    });
+  });
+
+  it('R3：worktreePath 一侧空集其余非空 → error', async () => {
     await writeRegistryFrame();
     await writeLocalBundle(localBundleFixture());
     const { git } = scriptedGit({ code: 0, stdout: `${DEV_HEAD}\n`, stderr: '' });
+    const emptyServerWt = serverStatusPayload({
+      project: {
+        projectKey: 'trimetaverse',
+        repoUrl: REPO_URL,
+        defaultBranch: 'dev',
+        worktrees: [],
+        devHead: DEV_HEAD,
+      },
+    });
+    await withStatusServer(emptyServerWt, async (baseUrl) => {
+      const check = await runConfirmCheck(buildDeps(git, baseUrl));
+      const wtItem = check.l1.items.find((i) => i.element === 'worktreePath');
+      assert.equal(wtItem?.status, 'error');
+      assert.equal(check.l1.ok, false);
+    });
+  });
+
+  it('R3：repoUrl 空值维持非空要求 → error（完备性要求不回退）', async () => {
+    await writeRegistryFrame();
+    const noRepoBundle = localBundleFixture();
+    (noRepoBundle.project as { repoUrl: string }).repoUrl = '';
+    await writeLocalBundle(noRepoBundle);
+    const { git } = scriptedGit({ code: 0, stdout: `${DEV_HEAD}\n`, stderr: '' });
+    await withStatusServer(serverStatusPayload(), async (baseUrl) => {
+      const check = await runConfirmCheck(buildDeps(git, baseUrl));
+      const repoItem = check.l1.items.find((i) => i.element === 'repoUrl');
+      assert.equal(repoItem?.status, 'error');
+      assert.equal(check.l1.ok, false);
+    });
+  });
+});
+
+describe('runConfirmCheck — L2 同线收敛矩阵（i4-4 修正记录 ②）+ L3 + 降级口径', () => {
+  it('三值相等 → 同线绿（bundleAncestor=true，无 merge-base 调用）', async () => {
+    await writeRegistryFrame();
+    await writeLocalBundle(localBundleFixture());
+    const { git, calls } = scriptedGit({ code: 0, stdout: `${DEV_HEAD}\n`, stderr: '' });
+    await withStatusServer(serverStatusPayload(), async (baseUrl) => {
+      const check = await runConfirmCheck(buildDeps(git, baseUrl));
+      assert.equal(check.l2.ok, true);
+      assert.equal(check.l2.bundleAncestor, true);
+      assert.equal(calls.length, 1); // 仅 rev-parse（等值短路，零 merge-base）
+    });
+  });
+
+  it('fleet 落后（fleet 是 local 祖先）→ 同线绿 + 落后仅提示不阻断', async () => {
+    await writeRegistryFrame();
+    await writeLocalBundle(localBundleFixture());
+    // 等值 bundle；fleet ≠ local → merge-base fleet→local = 祖先（绿）
+    const { git } = scriptedGit(
+      { code: 0, stdout: `${DEV_HEAD}\n`, stderr: '' }, // rev-parse localHead
+      { code: 0, stdout: '', stderr: '' }, // merge-base fleet→local → 0 = fleet 是 local 祖先
+    );
     const lagged = serverStatusPayload({ fleetHead: { branch: 'dev', commit: 'f'.repeat(40) } });
     await withStatusServer(lagged, async (baseUrl) => {
       const check = await runConfirmCheck(buildDeps(git, baseUrl));
-      assert.equal(check.l2.ok, false);
-      assert.equal(check.l2.localHead, DEV_HEAD);
+      assert.equal(check.l2.ok, true); // 同线可 ff 收敛 → 绿
       assert.equal(check.l2.fleetHead, 'f'.repeat(40));
+      assert.equal(check.l2.bundleAncestor, true);
+    });
+  });
+
+  it('fleet 领先（local 是 fleet 祖先）→ 同线绿', async () => {
+    await writeRegistryFrame();
+    await writeLocalBundle(localBundleFixture());
+    const { git } = scriptedGit(
+      { code: 0, stdout: `${DEV_HEAD}\n`, stderr: '' },
+      { code: 0, stdout: '', stderr: '' }, // merge-base local→fleet → 0 = local 是 fleet 祖先
+    );
+    const ahead = serverStatusPayload({ fleetHead: { branch: 'dev', commit: 'a'.repeat(40) } });
+    await withStatusServer(ahead, async (baseUrl) => {
+      const check = await runConfirmCheck(buildDeps(git, baseUrl));
+      assert.equal(check.l2.ok, true);
+    });
+  });
+
+  it('分叉（双方可解析但互非祖先）→ 红勿确认', async () => {
+    await writeRegistryFrame();
+    await writeLocalBundle(localBundleFixture());
+    const { git } = scriptedGit(
+      { code: 0, stdout: `${DEV_HEAD}\n`, stderr: '' },
+      { code: 1, stdout: '', stderr: '' }, // merge-base local→fleet → 1（非祖先）
+      { code: 1, stdout: '', stderr: '' }, // merge-base fleet→local → 1（非祖先）→ 分叉
+    );
+    const diverged = serverStatusPayload({ fleetHead: { branch: 'dev', commit: 'e'.repeat(40) } });
+    await withStatusServer(diverged, async (baseUrl) => {
+      const check = await runConfirmCheck(buildDeps(git, baseUrl));
+      assert.equal(check.l2.ok, false);
+      assert.equal(check.l2.bundleAncestor, true);
       assert.equal(check.readyForConfirm, false);
     });
   });
 
-  it('远程不可达 → degraded: true + remote null + L2 双值比较（MVP 接受口径）', async () => {
+  it('fleetHead 本地不可解析（未拉取）→ 红 + 先 pull 诊断', async () => {
     await writeRegistryFrame();
     await writeLocalBundle(localBundleFixture());
+    const { git } = scriptedGit(
+      { code: 0, stdout: `${DEV_HEAD}\n`, stderr: '' },
+      { code: 128, stdout: '', stderr: 'bad object' }, // merge-base local→fleet → 128 不可解析
+    );
+    const unresolvable = serverStatusPayload({ fleetHead: { branch: 'dev', commit: 'b'.repeat(40) } });
+    await withStatusServer(unresolvable, async (baseUrl) => {
+      const check = await runConfirmCheck(buildDeps(git, baseUrl));
+      assert.equal(check.l2.ok, false);
+      assert.equal(check.readyForConfirm, false);
+    });
+  });
+
+  it('bundleHead 非 localHead 祖先（分叉自 bundle）→ 红', async () => {
+    await writeRegistryFrame();
+    // bundle.devHead 与 localHead 不同且非祖先
+    const badBundle = localBundleFixture();
+    (badBundle.project as { devHead: string }).devHead = '9'.repeat(40);
+    await writeLocalBundle(badBundle);
+    const { git } = scriptedGit(
+      { code: 0, stdout: `${DEV_HEAD}\n`, stderr: '' },
+      { code: 1, stdout: '', stderr: '' }, // merge-base bundle→local → 1 非祖先
+    );
+    await withStatusServer(serverStatusPayload(), async (baseUrl) => {
+      const check = await runConfirmCheck(buildDeps(git, baseUrl));
+      assert.equal(check.l2.ok, false);
+      assert.equal(check.l2.bundleAncestor, false);
+      assert.equal(check.readyForConfirm, false);
+    });
+  });
+
+  it('空 bundleHead → 红（bundleAncestor=false）', async () => {
+    await writeRegistryFrame();
+    const noHeadBundle = localBundleFixture();
+    (noHeadBundle.project as { devHead: string }).devHead = '';
+    await writeLocalBundle(noHeadBundle);
     const { git } = scriptedGit({ code: 0, stdout: `${DEV_HEAD}\n`, stderr: '' });
+    await withStatusServer(serverStatusPayload(), async (baseUrl) => {
+      const check = await runConfirmCheck(buildDeps(git, baseUrl));
+      assert.equal(check.l2.ok, false);
+      assert.equal(check.l2.bundleAncestor, false);
+    });
+  });
+
+  it('降级（remote null）：bundleHead 祖先/相等即绿（废止双值比较）', async () => {
+    await writeRegistryFrame();
+    // bundleHead ≠ localHead 但为祖先（merge-base bundle→local = 0）→ 降级口径绿
+    const ancBundle = localBundleFixture();
+    (ancBundle.project as { devHead: string }).devHead = 'a'.repeat(40);
+    await writeLocalBundle(ancBundle);
+    const { git } = scriptedGit(
+      { code: 0, stdout: `${DEV_HEAD}\n`, stderr: '' },
+      { code: 0, stdout: '', stderr: '' }, // merge-base bundle→local → 0 祖先
+    );
     const check = await runConfirmCheck(buildDeps(git, 'http://127.0.0.1:9'));
     assert.equal(check.degraded, true);
     assert.equal(check.remote, null);
-    assert.equal(check.l2.ok, true); // 本地 == bundle（双值）
+    assert.equal(check.l2.ok, true); // 祖先 → 绿
+    assert.equal(check.l2.bundleAncestor, true);
     assert.equal(check.l2.fleetHead, '');
     // L3 无法验证 applied → 未就绪
     assert.equal(check.l3.ok, false);
     assert.equal(check.readyForConfirm, false);
+  });
+
+  it('降级（remote null）：bundleHead 非祖先 → 红', async () => {
+    await writeRegistryFrame();
+    const badBundle = localBundleFixture();
+    (badBundle.project as { devHead: string }).devHead = '9'.repeat(40);
+    await writeLocalBundle(badBundle);
+    const { git } = scriptedGit(
+      { code: 0, stdout: `${DEV_HEAD}\n`, stderr: '' },
+      { code: 1, stdout: '', stderr: '' }, // merge-base bundle→local → 1 非祖先
+    );
+    const check = await runConfirmCheck(buildDeps(git, 'http://127.0.0.1:9'));
+    assert.equal(check.degraded, true);
+    assert.equal(check.l2.ok, false);
+    assert.equal(check.l2.bundleAncestor, false);
   });
 
   it('未 applied（applied.bundleId ≠ 本地）→ l3 未就绪 + 重试口径', async () => {

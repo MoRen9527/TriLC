@@ -345,14 +345,19 @@ export async function readExistingBundle(targetPath: string): Promise<SyncBundle
   }
 }
 
-/** 幂等判定：同五维语义内容 → 复用现存 bundleId/generatedAt（纯重推）。 */
+/**
+ * 幂等判定：同五维语义内容（devHead 排除，R1 自引用口径）→ 复用现存
+ * bundle 原样（不写新 devHead）→ 字节不变 → 无 commit → 纯重推。
+ * 内容变更 → 新 bundleId + generatedAt 严格递增。
+ */
 function assembleBundle(
   dims: CollectedDims,
   existing: SyncBundle | null,
   deps: InitSyncDeps,
-): SyncBundle {
+): { bundle: SyncBundle; reused: boolean } {
   const dimsHash = computeDimsContentHash(dims);
-  // 只比现存 bundle 的五维段（元字段 bundleId/generatedAt 不纳入——重放检测语义）
+  // 只比现存 bundle 的五维段（元字段 bundleId/generatedAt 不纳入；project.devHead
+  // 自引用字段同口径排除——i4-4 终审修正记录 ②）
   const existingDimsHash = existing
     ? computeDimsContentHash({
         company: existing.company,
@@ -363,19 +368,23 @@ function assembleBundle(
       })
     : null;
   if (existing && dimsHash === existingDimsHash) {
-    // 内容未变：不重新生成、不换 bundleId（§一.4 幂等单调）
-    return { ...existing, company: dims.company, model: dims.model, keys: dims.keys, employees: dims.employees, project: dims.project };
+    // 内容未变：返回 existing 原样（不重新生成、不换 bundleId、不覆盖 devHead——
+    // 字节不变 → 无 commit → 纯重推，§一.4 幂等单调 + R1）
+    return { bundle: existing, reused: true };
   }
   return {
-    schemaVersion: 1,
-    bundleId: randomUUID(),
-    generatedAt: nextGeneratedAt(existing?.generatedAt ?? null, deps.nowMs ? deps.nowMs() : undefined),
-    generatedBy: buildGeneratedBy(deps.trilcVersion, hostname()),
-    company: dims.company,
-    model: dims.model,
-    keys: dims.keys,
-    employees: dims.employees,
-    project: dims.project,
+    bundle: {
+      schemaVersion: 1,
+      bundleId: randomUUID(),
+      generatedAt: nextGeneratedAt(existing?.generatedAt ?? null, deps.nowMs ? deps.nowMs() : undefined),
+      generatedBy: buildGeneratedBy(deps.trilcVersion, hostname()),
+      company: dims.company,
+      model: dims.model,
+      keys: dims.keys,
+      employees: dims.employees,
+      project: dims.project,
+    },
+    reused: false,
   };
 }
 
@@ -547,7 +556,7 @@ async function doInitSync(deps: InitSyncDeps, entry: SyncEntry, runId: string): 
   }
   const targetPath = bundleTargetPath(projectEntry.mainCheckoutPath);
   const existing = await readExistingBundle(targetPath);
-  const bundle = assembleBundle(dims, existing, deps);
+  const { bundle, reused } = assembleBundle(dims, existing, deps);
   const validation = validateSyncBundle(bundle);
   if (!validation.ok) {
     return fail('bundle-validation-failed', `bundle 校验失败：${validation.error} ${validation.message}`, 500, false);
@@ -558,9 +567,11 @@ async function doInitSync(deps: InitSyncDeps, entry: SyncEntry, runId: string): 
     return fail('secret-leak-guard', (err as Error).message, 500, false);
   }
 
-  // 4. 写 + commit + push
+  // 4. 写 + commit + push（R1：幂等路径跳过写——existing 原样字节不变 → 无 commit → 纯重推）
   try {
-    await writeBundleAtomic(targetPath, bundle);
+    if (!reused) {
+      await writeBundleAtomic(targetPath, bundle);
+    }
   } catch (err) {
     return fail('bundle-write-failed', `bundle 原子写失败：${(err as Error).message}`, 500, true);
   }

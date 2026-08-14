@@ -94,15 +94,20 @@ describe('sync-bundle 指纹 / 哈希 / 单调性', () => {
     assert.notEqual(computeKeyFingerprint('sk-different'), fp);
   });
 
-  it('contentHash 只覆盖五维语义（元字段变化不影响；内容变化影响）', () => {
+  it('contentHash 只覆盖五维语义（元字段变化不影响；内容变化影响；devHead 自引用排除 R1）', () => {
     const a = validBundle();
     const b = validBundle();
     b.bundleId = '99999999-9999-4999-9999-999999999999';
     b.generatedAt = '2026-08-15T00:00:00.000Z';
     b.generatedBy = 'other-instance';
     assert.equal(computeContentHash(a), computeContentHash(b)); // 元字段不纳入
+    // R1（i4-4 修正记录 ②）：project.devHead 自引用字段同口径排除——devHead 每次
+    // 成功 run 必推进，纳入会使幂等重跑判定恒失效
     b.project.devHead = '0000000000000000000000000000000000000000';
-    assert.notEqual(computeContentHash(a), computeContentHash(b)); // 内容变化纳入
+    assert.equal(computeContentHash(a), computeContentHash(b)); // devHead 变化不纳入
+    // 其他维内容变化 → 纳入
+    b.project.repoUrl = 'https://github.com/other/repo.git';
+    assert.notEqual(computeContentHash(a), computeContentHash(b));
     assert.equal(
       computeContentHash(a),
       computeDimsContentHash({ company: a.company, model: a.model, keys: a.keys, employees: a.employees, project: a.project }),

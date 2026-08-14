@@ -505,11 +505,19 @@ function renderConfirmCheck(check: ConfirmCheckPayload): string {
         `本地=${short(item.local) || '—'} bundle=${short(item.bundle) || '—'} 服务器=${short(item.server) || '—'}`,
     );
   }
-  // L2 HEAD 一致性徽标
+  // worktree 清单空集注记（三方一致判 ok，非阻塞——完备性归 I3 门禁）
+  const wtItem = check.l1.items.find((i) => i.element === 'worktreePath');
+  if (wtItem?.status === 'ok' && !wtItem.local) {
+    lines.push('  注记：worktree 清单为空（三方一致）— 注册完备性归 PROJECT-LINK 门禁，非阻塞');
+  }
+  // L2 同线收敛徽标（i4-4 修正记录 ②：等值/互为祖先 = 同线可 ff 收敛）
   const l2mark = check.l2.ok ? '[OK]' : check.degraded ? '[~]' : '[✕]';
   lines.push(
     `  ${l2mark} [L2 版本一致] 本地=${short(check.l2.localHead)} bundle=${short(check.l2.bundleHead)} 服务器=${short(check.l2.fleetHead) || '不可达'}`,
   );
+  if (check.l2.ok && (check.l2.localHead !== check.l2.fleetHead)) {
+    lines.push('  注记：本地与服务器同线（ff 收敛可达）— 落后/领先仅提示，不阻断');
+  }
   // L3 写读闭环
   const l3mark = check.l3.ok ? '[OK]' : '[未就绪]';
   lines.push(
@@ -526,8 +534,8 @@ function renderConfirmCheck(check: ConfirmCheckPayload): string {
   }
   if (!check.l2.ok) {
     lines.push(
-      `  差异：dev HEAD 不一致（本地=${short(check.l2.localHead)}，bundle=${short(check.l2.bundleHead)}，服务器=${short(check.l2.fleetHead) || '不可达'}）` +
-        `— 诊断：重新同步 = SYNC 流程（sync/run）；服务器落后 = fleet 每 15min 收敛`,
+      `  差异：dev HEAD 不同线（本地=${short(check.l2.localHead)}，bundle=${short(check.l2.bundleHead)}，服务器=${short(check.l2.fleetHead) || '不可达'}）` +
+        `— 诊断：先 git pull --ff-only 对齐后刷新复核；仍红 = 分叉，勿确认（人工处置）`,
     );
   }
   if (!check.l3.ok) {

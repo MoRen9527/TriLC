@@ -83,6 +83,13 @@ function fingerprintPaths(paths: string[]): string {
   return [...paths].sort().map((p) => computePathFingerprint(p)).join(',');
 }
 
+/**
+ * L1 元素级语义（i4-4 修正记录 ②，OBS-6a）：
+ * - repoUrl/projectKey：维持非空 + 三方等值要求（完备性 + 一致性）；
+ * - worktreePath：三方等值即 ok（含空集）——L1 职责 = 一致性判定，非完备性
+ *   判定（注册完备性归 I3 门禁）；空集由确认卡给「worktree 清单为空」提示
+ *   注记（非阻塞）。
+ */
 function compareL1Value(
   element: 'repoUrl' | 'projectKey' | 'worktreePath',
   local: string | null,
@@ -92,7 +99,8 @@ function compareL1Value(
   const localStr = local ?? '';
   const bundleStr = bundle ?? '';
   const serverStr = server ?? '';
-  const ok = !!localStr && localStr === bundleStr && bundleStr === serverStr;
+  const allEqual = localStr === bundleStr && bundleStr === serverStr;
+  const ok = element === 'worktreePath' ? allEqual : !!localStr && allEqual;
   return {
     element,
     status: ok ? 'ok' : 'error',
@@ -120,27 +128,89 @@ function computeL1(
   return { ok: items.every((i) => i.status === 'ok'), items };
 }
 
-// ── L2/L3/L4 ──
+// ── L2 同线收敛判定（i4-4 修正记录 ②：废止严格三值相等——bundle.devHead
+// 是生成时值〔必为自身 commit 的 parent〕、fleetHead 是实时值〔15min 持续
+// pull 前进〕，严格相等数学不可达。改「同 dev 线（ff 收敛可达）」语义）──
 
-function computeL2(
+/**
+ * git merge-base --is-ancestor 判定。
+ * 返回 true（a 是 b 祖先）/ false（可解析但非祖先）/ null（不可解析——
+ * 对象不在本地仓，如未拉取的 fleetHead）。
+ */
+async function isAncestor(
+  git: GitRunner,
+  cwd: string,
+  ancestor: string,
+  descendant: string,
+): Promise<boolean | null> {
+  const res = await git(['-C', cwd, 'merge-base', '--is-ancestor', ancestor, descendant]);
+  if (res.code === 0) return true;
+  if (res.code === 1) return false;
+  return null;
+}
+
+async function computeL2(
+  deps: InitSyncDeps,
   facts: LocalConfirmFacts,
   bundleProject: BundleProject | null,
   fleetHeadCommit: string | null,
   degraded: boolean,
-): ConfirmCheckPayload['l2'] {
+): Promise<ConfirmCheckPayload['l2']> {
   const localHead = facts.localHead ?? '';
   const bundleHead = bundleProject?.devHead ?? '';
   const fleetHead = fleetHeadCommit ?? '';
-  if (degraded) {
-    // 降级口径：服务器侧事实退化 → 双值比较（本地 == bundle），MVP 接受
-    return { ok: !!localHead && localHead === bundleHead, localHead, bundleHead, fleetHead };
+  const cwd = facts.mainCheckoutPath ?? '';
+  const git: GitRunner = deps.git ?? (await import('../project/project-link.js')).createGitRunner();
+
+  // bundleHead 必须为 localHead 的祖先或相等（本地可判定；空 bundleHead → 红）
+  let bundleAncestor: boolean | null = null;
+  if (!bundleHead) {
+    bundleAncestor = false;
+  } else if (bundleHead === localHead) {
+    bundleAncestor = true;
+  } else if (localHead && cwd) {
+    bundleAncestor = await isAncestor(git, cwd, bundleHead, localHead);
   }
-  return {
-    ok: !!localHead && localHead === bundleHead && bundleHead === fleetHead,
-    localHead,
-    bundleHead,
-    fleetHead,
-  };
+  const bundleOk = bundleAncestor === true;
+
+  // 降级口径（remote null）：bundleHead 祖先/相等即绿（废止原 local==bundle 双值比较）
+  if (degraded) {
+    return { ok: bundleOk, localHead, bundleHead, fleetHead, bundleAncestor: !!bundleAncestor };
+  }
+
+  if (!bundleOk) {
+    return { ok: false, localHead, bundleHead, fleetHead, bundleAncestor: !!bundleAncestor };
+  }
+
+  // fleet 同线判定：等值或互为祖先（一方为另一方祖先 = 同线可 ff 收敛 → 绿，
+  // 落后/领先仅提示不阻断；均不可达 = 分叉 → 红勿确认；fleetHead 本地不可
+  // 解析 = 未拉取 → 红 + 先 pull 诊断）
+  if (!fleetHead) {
+    return { ok: false, localHead, bundleHead, fleetHead, bundleAncestor: true };
+  }
+  if (fleetHead === localHead) {
+    return { ok: true, localHead, bundleHead, fleetHead, bundleAncestor: true };
+  }
+  if (cwd) {
+    const localToFleet = await isAncestor(git, cwd, localHead, fleetHead);
+    if (localToFleet === true) {
+      // local 是 fleet 祖先（fleet 领先，本地落后）→ 同线绿 + 提示
+      return { ok: true, localHead, bundleHead, fleetHead, bundleAncestor: true };
+    }
+    if (localToFleet === false) {
+      const fleetToLocal = await isAncestor(git, cwd, fleetHead, localHead);
+      if (fleetToLocal === true) {
+        // fleet 是 local 祖先（fleet 落后，随 15min pull 收敛）→ 同线绿 + 提示
+        return { ok: true, localHead, bundleHead, fleetHead, bundleAncestor: true };
+      }
+      if (fleetToLocal === false) {
+        // 双方可解析但互非祖先 → 分叉 → 红勿确认
+        return { ok: false, localHead, bundleHead, fleetHead, bundleAncestor: true };
+      }
+    }
+  }
+  // fleetHead 本地不可解析（未拉取）或 localHead 缺失 → 红 + 先 pull
+  return { ok: false, localHead, bundleHead, fleetHead, bundleAncestor: true };
 }
 
 // ── check 计算（GET confirm/check 数据源；POST confirm 服务端重算同源）──
@@ -157,7 +227,7 @@ export async function runConfirmCheck(deps: InitSyncDeps): Promise<ConfirmCheckP
   const appliedBundleId = remote?.appliedBundleId ?? null;
 
   const l1 = computeL1(facts, bundleProject, serverProject);
-  const l2 = computeL2(facts, bundleProject, remote?.fleetHead?.commit ?? null, degraded);
+  const l2 = await computeL2(deps, facts, bundleProject, remote?.fleetHead?.commit ?? null, degraded);
   const l3 = {
     ok: !!appliedBundleId && !!facts.bundle && appliedBundleId === facts.bundle.bundleId,
     appliedBundleId,
