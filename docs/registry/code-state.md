@@ -235,6 +235,14 @@
 - 单测：sync-bundle 12 用例（校验矩阵/白名单/指纹/单调性/泄漏扫描）+ init-sync 16 用例（链态门 409/防重入 409/公司态 400/项目 400/422/五维降级矩阵/幂等重跑同 bundleId/内容变化新 bundleId/push 失败分类/事件序/git 固定身份/双远端/序列化无 sk-/status remote 降级/启动 re-sync 只读）。
 - 全量基线：398/399（1 fail = test/tui/components.test.ts 环境缺口既有，基线 340/341 口径不退化；+58 含 i3-2 同批）。
 
+### 返修包 R（i4-4 终审打回，2026-08-14 一批交付）
+
+- **R1 devHead 自引用修复**（OBS-1）：`sync-bundle.ts` computeDimsContentHash 排除 project.devHead（自引用字段——每次成功 run 必 commit bundle 推进 HEAD，纳入使幂等重跑恒失效）；`init-sync.ts` assembleBundle 幂等路径返回 existing 原样 + writeBundleAtomic 跳过（字节不变 → 无 commit → 纯重推）；devHead 保留为 bundle 内诊断事实。TriMC types.ts computeContentHash 同口径（两端一致）。
+- **R2 L2 收敛语义**（OBS-6b）：`init-confirm.ts` computeL2 重写为同 dev 线语义（bundleHead 祖先/相等 localHead 且 local/fleet 等值或互为祖先 → 绿；分叉红勿确认；fleetHead 不可解析红+先 pull；降级 = bundleHead 祖先/相等，废止双值比较）；ConfirmCheckL2 增 bundleAncestor additive。
+- **R3 L1 空集一致**（OBS-6a）：worktreePath 三方等值（含空集）判 ok + 确认卡空集提示注记；repoUrl/projectKey 维持非空 + 等值。
+- 单测：+8 L2 矩阵 +2 L1 空集 +1 R1 幂等矩阵（仅 devHead 变化重跑不换 bundleId/不 commit/字节不变）；全量 427/426（1 fail = components.test.ts 既有缺口）。
+- 环境面（OBS-7 扩展，非代码）：TriCompany/packages/agent-core 被同窗口清空（git 跟踪文件 57 个 + dist/node_modules），小全以 git checkout（索引恢复）+ npm install + rebuild 恢复，全量基线复绿。
+
 ### L1-L4 协同确认（`src/company/init-confirm.ts`，Phase D）
 
 - **I4 Phase D 新增**：`GET /internal/v1/init/confirm/check`（按需计算，无后台常驻轮询）+ `POST /internal/v1/init/confirm`（服务端重算 check → readyForConfirm 门禁 409 附 check → `updateConfirm` 快照 confirmed + l1/l2/l3 → `transitionTo('ready')` → init:step-event confirmed）。
