@@ -517,34 +517,21 @@ async function cmdChat(port: number, agent?: string, resume?: string, permission
     }
   }
 
-  // REQ-20260805-005 (part 1): auto-resume pending onboarding session.
-  // If TriCompany is uninitialized and user opens chat without --resume,
-  // resume the latest company-onboarding heartbeat session so the CEO
-  // sees the agent's guidance immediately (no manual resume needed).
-  if (!resume && !resumeOpts) {
+  // i2-2 §五 叙事态下线：hb_company-onboarding auto-resume 分支已移除。
+  // 结构化 init 流程取代叙事 auto-resume（同 release 一次性，无并存期）。
+
+  // i2-2 §四.2：chat 模式启动时 chain/status 呈初始化阶段 → init 模式文本化
+  // 流程（编号多选 + 命名问答 + 汇总确认 + assemble 提交）。员工 --agent 会话
+  // 路径不动；流程只渲染 + 发 daemon 端点指令（零本地执行）。
+  if (!agent) {
     try {
-      const listUrl = `http://127.0.0.1:${port}/internal/v1/sessions`;
-      const res = await fetch(listUrl);
-      const json = await res.json() as { ok: boolean; sessions?: Array<{ id: string; title?: string }> };
-      if (json.ok && json.sessions) {
-        const onboarding = json.sessions.find((s) => s.id.startsWith('hb_company-onboarding_'));
-        if (onboarding) {
-          const fetchUrl = `http://127.0.0.1:${port}/internal/v1/sessions/${onboarding.id}`;
-          const res2 = await fetch(fetchUrl);
-          const json2 = await res2.json() as { ok: boolean; session?: { id: string; model: string; systemPrompt?: string }; messages?: Array<{ role: string; content: string | null }> };
-          if (json2.ok && json2.messages) {
-            const msgs = json2.messages
-              .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content)
-              .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content! }));
-            // REQ-013: carry the session's systemPrompt (onboarding persona)
-            // through the resume path.
-            resumeOpts = { sessionId: onboarding.id, messages: msgs, systemPrompt: json2.session?.systemPrompt };
-            console.log(`[trilc] onboarding pending — auto-resumed ${onboarding.id} (${msgs.length} messages)`);
-          }
-        }
+      const { runInitCliFlow } = await import('./company/init-cli-flow.js');
+      const flow = await runInitCliFlow(port);
+      if (flow.outcome === 'assembled') {
+        console.log('\n[trilc] 公司开张完成 — 进入聊天。');
       }
     } catch (err) {
-      console.warn('[trilc] onboarding auto-resume failed:', (err as Error).message);
+      console.warn('[trilc] init cli flow failed, falling back to chat:', (err as Error).message);
     }
   }
 

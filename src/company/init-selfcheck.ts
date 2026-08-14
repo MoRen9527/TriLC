@@ -126,10 +126,12 @@ const probeTrimodel: Probe = async () => {
   // 401 = 唯一认证阻塞类（§5.2）：key-cache 最近一次 fetch 认证失败
   if (ks.lastFetchError && /401|403|unauthorized/i.test(ks.lastFetchError)) {
     const at = ks.lastFetchAt ? new Date(ks.lastFetchAt).toISOString() : '?';
+    // 契约修正⑧（i2-1 §七）：detail 用实际错误串（截断 120），不硬编码「fetch 401」
+    const errText = ks.lastFetchError.slice(0, 120);
     return {
       id: 'trimodel',
       status: 'fail',
-      detail: `3333 可达；key-cache fetch 401（lastFetchAt=${at}）`,
+      detail: `3333 可达；key-cache fetch 认证失败（${errText}，lastFetchAt=${at}）`,
       hint: '认证失败 — blocked 级（TRIMODEL_API_TOKEN 注入面）',
     };
   }

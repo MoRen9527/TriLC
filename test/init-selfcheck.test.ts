@@ -203,7 +203,11 @@ test('key-cache 401 → trimodel fail → summary blocked（401 唯一认证阻�
     const checks = deps.chain.getSnapshot().phaseDetail.selfcheck.checks;
     const trimodel = checks.find((c) => c.id === 'trimodel');
     assert.equal(trimodel?.status, 'fail', '401 → trimodel fail（blocked 级）');
-    assert.ok(/401/.test(trimodel?.detail ?? ''), 'detail 含 401 证据');
+    // 契约修正⑧（i2-1 §七）：detail 用 ks.lastFetchError 实际错误串，不硬编码「fetch 401」
+    assert.ok(
+      /TriModel API returned 401/.test(trimodel?.detail ?? ''),
+      `detail 含实际错误串（got: ${trimodel?.detail}）`,
+    );
   } finally {
     restoreFetch();
     stopKeyCache();

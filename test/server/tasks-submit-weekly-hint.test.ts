@@ -108,15 +108,22 @@ describe('C: tasks/submit weekly-plane hint assembly', () => {
     assert.equal(occurrences, 1, `hint injected ${occurrences} times, expected exactly 1`);
   });
 
-  it('no-prompt path keeps defaultSystemPrompt with its internal hint', async () => {
+  // i2-2 §三：daemon 启动后链态 = selfcheck（uninitialized 自动转移）→ 无显式
+  // systemPrompt 的提交走 init 模式 bootstrap 替代 defaultSystemPrompt；
+  // 周平面提示仍恒有一次（r4-1 C 口径：no-prompt 路径无双重注入）。
+  it('no-prompt path during init phase: init-mode bootstrap + hint exactly once', async () => {
     const { status, json } = await postJSON('/internal/v1/tasks/submit', {
       message: 'hello again',
       context: { workspaceRoot: planeRoot },
     });
     assert.equal(status, 201);
     const prompt = await readSessionPrompt(json.sessionId);
-    assert.ok(prompt.includes(HINT_MARKER), 'defaultSystemPrompt must still embed the hint');
+    assert.ok(prompt.includes('TriCade 安装初始化阶段'), 'init 模式 bootstrap 替代 defaultSystemPrompt');
+    assert.ok(prompt.includes('当前阶段：selfcheck'), 'bootstrap 含当前链态');
+    assert.ok(prompt.includes('/internal/v1/init/chain/status'), 'bootstrap 含状态真源引用');
     assert.ok(!prompt.includes('CLIENT-PROMPT-123'), 'no-prompt path must not carry the client prompt');
+    assert.ok(!prompt.includes('Project Instructions (from CLAUDE.md)'), 'init 模式不携带 defaultSystemPrompt 主体');
+    assert.ok(prompt.includes(HINT_MARKER), 'init 模式同样注入周平面提示');
     const occurrences = prompt.split(HINT_MARKER).length - 1;
     assert.equal(occurrences, 1, `hint injected ${occurrences} times, expected exactly 1 (no double injection)`);
   });

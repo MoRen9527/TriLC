@@ -17,7 +17,7 @@
 // { chainState, from, to, eventSeq, sourceEntry }——与状态文件同帧投影，
 // eventSeq 与状态文件一致。事件发布通过注入的 publisher（app.ts publish）。
 
-import { mkdir, readFile, writeFile, rename, access } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename, access, copyFile } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import type { LocalBusEvent } from '../localbus/bus.js';
 
@@ -170,12 +170,26 @@ export class InitChain {
     this.publishFn = opts?.onEvent ?? null;
   }
 
-  /** 断点续跑 load：文件缺失 = uninitialized 默认帧（幂等）。 */
+  /**
+   * 断点续跑 load（I1 前置强制项③已落地，i2-1 拆解 §六）：
+   * - ENOENT（首次启动正常缺失）= 静默默认帧（不产噪音日志）；
+   * - JSON 解析错 = 复制损坏现场至 ${statePath}.corrupt + console.error + 默认帧
+   *   （daemon 不因损坏文件崩溃启动，零强制原则）。
+   */
   async load(): Promise<InitChainFile> {
     if (this.cache) return this.cache;
+    let raw: string;
     try {
       await access(this.statePath);
-      const raw = await readFile(this.statePath, 'utf-8');
+      raw = await readFile(this.statePath, 'utf-8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.error(`[trilc:init] init-chain load access failed: ${(err as Error).message}`);
+      }
+      this.cache = defaultChainFile();
+      return this.cache;
+    }
+    try {
       const parsed = JSON.parse(raw) as Partial<InitChainFile>;
       // 帧补齐：旧/缺字段回填默认（前向兼容）
       this.cache = {
@@ -187,7 +201,25 @@ export class InitChain {
           ? (parsed.chainState as ChainState)
           : 'uninitialized',
       };
-    } catch {
+    } catch (err) {
+      const corruptPath = `${this.statePath}.corrupt`;
+      try {
+        await access(corruptPath);
+        console.error(
+          `[trilc:init] init-chain.json parse failed (existing ${corruptPath} kept): ${(err as Error).message}`,
+        );
+      } catch {
+        try {
+          await copyFile(this.statePath, corruptPath);
+          console.error(
+            `[trilc:init] init-chain.json parse failed — copied to ${corruptPath}: ${(err as Error).message}`,
+          );
+        } catch (backupErr) {
+          console.error(
+            `[trilc:init] init-chain.json parse failed (corrupt backup failed too): ${(err as Error).message} / ${(backupErr as Error).message}`,
+          );
+        }
+      }
       this.cache = defaultChainFile();
     }
     return this.cache;

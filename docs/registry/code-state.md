@@ -100,6 +100,81 @@
 | `TRIMODEL_API_URL` | TriModel 配置平面 API 地址（默认 `http://127.0.0.1:3333`） |
 | `TRIMODEL_API_TOKEN` | TriModel API 认证 token |
 
+## 初始化状态机（W33，init-collab I1 — commit 186296a）
+
+### 链路进度状态机（`src/company/init-chain.ts`）
+
+- **I1 新增（init-collab-i1-statemachine）**：七态链路状态机 `UNINITIALIZED → SELFCHECK → ONBOARDING → PROJECT-LINK → SYNC → CONFIRM → READY`，与公司态 `CompanyInitState` 分离独立持久（`{dataDir}/company/init-chain.json`）。
+- 真 tmp→rename 原子写 + 校验读回；`eventSeq` 单调递增；无任何 git 操作（与 init-state.ts REQ-019 隐患区分，不复刻）。
+- 断点续跑：daemon 启动 `load()` 恢复帧；`transitionTo()` 发布 `init:chain-changed`（事件帧 = 状态文件投影，eventSeq 同帧）。
+- I1 真实动作仅 `uninitialized→selfcheck`（启动转移，不自动探测）；其余转移由后续树端点驱动。
+- 护栏延续：`src/company/session-initializer.ts` 与 TriMC 同源文件 diff 零行；`init-state.ts` diff 零行。
+
+### 自检（`src/company/init-selfcheck.ts`）
+
+- 五探测：healthz / tripilot（被动观察计数）/ trimodel / tristaciss / plane-hint-probe（第五探测构造 TriPilot 形态会话）。
+- summary 规则：任一 fail（blocked 级）→ blocked；仅 degraded → degraded；全 ok → pass。401/403/unauthorized = 认证失败族唯一 blocked 类（网络不可达 = degraded）。
+- 防重入：运行中再触发 → `{ conflict: true, runId }`（端点 409 同 runId）。
+- 事件族：`init:selfcheck-started/progress/finished`（均经 localbus publish 同通道）。
+
+### I1 端点（`src/server/app.ts`）
+
+- `GET /internal/v1/init/chain/status`（只读投影 + 诊断卡数据源）
+- `POST /internal/v1/init/selfcheck/run`（202 + 防重入 409）
+- 启动 load + `uninitialized` 自动转 selfcheck（不自动探测）
+- I1 同批修复：A1（TRILC_ENV_FILE + dataDir 相邻 .env 候选）、A2（tool_result SSE 载荷映射）、A3（C13 门卫收紧）、tasks/submit 提交计数钩子、key-cache fetch 状态跟踪。
+
+## 公司面装配升级（W33，init-collab I2 — 本树，commit 见 tree-op i2-2 checkpoint）
+
+### 装配执行体（`src/company/init-assemble.ts`）
+
+- **I2 新增**：`POST /internal/v1/init/assemble` 端点执行体（daemon 单执行体；两入口只发指令，零本地执行）。
+- 校验先行（400 族）：ceoName 必填（trim 1..64）、selections ≥1（A4 0 人拦截）、roleId 形状 + 岗位目录成员双校验（白名单逃逸直接拒绝）、去重、name 必填；阶段门禁 422 `{ chainState }`；防重入 409 `{ busy: true }`；<5 岗 warning 不拦截（CEO 裁决口径）。
+- 阶段门禁口径（候选 A，见 tree-op i2-2 checkpoint 记录）：onboarding 直接放行；selfcheck 且 summary ∈ {pass, degraded} → 提交段先补 selfcheck→onboarding 再装配；其余 422。
+- 预写段：白名单落点（`.claude/agents/<roleId>.md` / `docs/registry/company-state.json` / `docs/registry/business-state.md` / `AGENTS.md`）逐文件 tmp→rename + `.bak` 备份目录（`{dataDir}/company/assemble-bak/<runId>/`）；任一失败 → .bak 恢复 + 删新增文件 + 500 `{ rollback }`。
+- 提交段：`CompanyInitState.save({ state:'initialized', ... })` → `InitChain.transitionTo('project-link', entry)`（公司态先、链路态后；save 成功但 transition 失败不回滚文件，幂等重试路径承接）。
+- 幂等重试：公司态已 initialized 且链路态仍 onboarding/selfcheck → 跳过文件段与 state save，校验员工一致（不一致 409 `employees_mismatch`）后补 transition。
+- 事件：`init:step-event` assembling / assembled / assemble-failed；chain-changed 由 transitionTo 自动发布。
+- 既有真实内容不覆盖：`business-state.md` / `AGENTS.md` 缺失才写占位，存在即 preserved（响应报告）。
+- 同包断点续跑端点逻辑：`getOnboardingStateProjection()`（只读投影，progress.ceoName 优先）+ `validateProgressUpsert()` / `upsertOnboardingProgress()`（经 `CompanyInitState.save({ progress })` 机制沿用，init-state.ts 零改动）。
+- init 模式路由：`buildInitModeSystemPrompt(chainState)`（链态 ∈ {selfcheck, onboarding, project-link, sync, confirm} 且无 client systemPrompt 时替代 defaultSystemPrompt；含 init 端点指令面 + 零本地执行措辞）。
+
+### I2 端点增量（`src/server/app.ts`）
+
+- `GET /internal/v1/init/role-catalog`（contract-resolver `getRoleCatalog()`；resolver 未初始化/roster 缺失 → 503 不开天窗）
+- `POST /internal/v1/init/assemble`（校验 → 执行 → 200/400/409/422/500）
+- `GET /internal/v1/init/events`（daemon 级 init:* SSE 通道；无重放缓冲 = 断连重拉 status；25s keep-alive）
+- `GET /internal/v1/init/onboarding/state` + `POST /internal/v1/init/onboarding/progress`（REQ-016 断点续跑真源）
+- tasks/submit init 模式路由（无显式 systemPrompt + 链态 ∈ init 集 → init bootstrap + 周平面提示恒一次）
+
+### role-catalog 数据源（`src/config/contract-resolver.ts`）
+
+- `DEFAULT_SELECTED_ROLES` 常量（D1 决策 2026-08-14 CPO 确认）：ceo-chief-of-staff / full-stack-developer / chief-administrative-officer / chief-human-resources-officer / chief-technology-officer。
+- `getRoleCatalog()`：roster 主键 + 合同 identity 面（roleName=identity.role、oneLinePositioning=identity.description、isGovernance=tier==='C-suite'、defaultSelected=常量）。
+- `loadEmployeeRoster()` 路径候选扩展：`<sourceRoot>/docs/registry/` 与 `<TriCompany 根>/docs/registry/`（真源路径）。
+
+### 叙事态下线（i2-2 §五，同 release 一次性）
+
+- 删除 `src/company/onboarding.ts`（Step1-5 叙事 prompt 整体下线）
+- 删除 app.ts heartbeat 叙事 onboarding agent 注册块 + cli.ts `hb_company-onboarding` auto-resume 分支
+- ONBOARDING 阶段驱动 = 装配端点 + 事件流，无叙事 agent 并存路径
+
+### 前置项与契约修正（i2-2 落地）
+
+- I1 前置强制项③：`init-chain.ts load()` 区分 ENOENT（静默默认帧）vs 解析错（`.corrupt` 备份 + console.error + 默认帧），单测三件套覆盖。
+- 契约修正⑧：`init-selfcheck.ts` trimodel 认证失败 detail 用 `ks.lastFetchError` 实际错误串（截断 120）。
+
+### CLI 文本化流程（`src/company/init-cli-flow.ts`）
+
+- trilc chat 启动时 chain/status 呈初始化阶段 → 文本化流程（selfcheck 诊断卡 blocked 置顶 + 组合规则注记 → 编号多选（默认 D1 五岗）→ CEO 名/员工名问答（REQ-016 已答不重复问）→ 汇总确认 → assemble 提交，entry=trilc-chat）。
+- 员工 `--agent` 会话路径不动；流程只渲染 + 发 daemon 端点指令。
+
+### 测试与冒烟
+
+- 单测：init-chain（load 三件套 + 既有 8）/ init-selfcheck（detail 实际错误串断言更新）/ init-assemble 15 用例（校验矩阵、逃逸拒绝、422/409 门禁、回滚注入、幂等重试、事件帧一致、preserved、selfcheck 入口、progress roundtrip、init 模式矩阵）/ contract-resolver（getRoleCatalog 2 用例）/ tasks-submit-weekly-hint（init 模式路由 1 用例）。
+- 全量基线：336/337（1 fail = test/tui/components.test.ts ink-testing-library 环境缺口，r19 基线既有非本树引入）。
+- 活体冒烟：TRILC_DATA_DIR 显式隔离实例 8726 全链 PASS（自检 202 → 五探测 → assemble 200 advancedFromSelfcheck → 工作区白名单产物 → 重入 422 → SSE 事件族 → init 模式会话 bootstrap → 8711 全程未扰动）。
+
 ## Sources
 
 - `../../src/runtime/`

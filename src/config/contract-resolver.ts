@@ -13,6 +13,12 @@ import { loadContractV3, type AgentContractV3 } from '@tricompany/agent-core';
 export interface AgentContract {
   agentId: string;
   family: 'Role' | 'Registry';
+  /** 合同 identity 面（role-catalog 只读展示数据源：roleName/oneLinePositioning）。 */
+  identity: {
+    displayName: string;
+    role: string;
+    description: string;
+  };
   paths: {
     soul: string;
     agent_body: string;
@@ -53,6 +59,38 @@ export interface EmployeeRoster {
   employees: EmployeeRosterEntry[];
   tiers: Record<string, number>;
   families: Record<string, number>;
+}
+
+// ── Role Catalog（i2-1 拆解 §二：结构化员工选择载荷数据源）──
+
+/**
+ * D1 决策（2026-08-14，CPO 小乔确认）：默认勾选 5 岗 = playbook 1.2 四员工岗
+ * （ceo-chief-of-staff / full-stack-developer / chief-administrative-officer /
+ * chief-human-resources-officer）+ chief-technology-officer 为第 5 岗（技术
+ * 交付链必要、C-suite 治理岗、与「含治理角色」原则一致）。默认值仅影响初始
+ * 勾选（CEO 裁决：≥1 岗可开张，<5 岗提示不拦截）。
+ */
+export const DEFAULT_SELECTED_ROLES: readonly string[] = [
+  'ceo-chief-of-staff',
+  'full-stack-developer',
+  'chief-administrative-officer',
+  'chief-human-resources-officer',
+  'chief-technology-officer',
+];
+
+export interface RoleCatalogEntry {
+  roleId: string;
+  roleName: string;
+  /** 一句话定位 = 合同 identity.description（employee-standard-capabilities.md:50 映射）。 */
+  oneLinePositioning: string;
+  /** roster tier === 'C-suite'（8 C-suite 岗 true / 5 Execution 岗 false）。 */
+  isGovernance: boolean;
+  defaultSelected: boolean;
+}
+
+export interface RoleCatalog {
+  schemaVersion: 1;
+  roles: RoleCatalogEntry[];
 }
 
 // ── Resolver ──
@@ -156,6 +194,11 @@ class AgentContractResolver {
     return {
       agentId,
       family,
+      identity: {
+        displayName: parsed.identity.display_name ?? '',
+        role: parsed.identity.role ?? '',
+        description: parsed.identity.description ?? '',
+      },
       paths,
       decisionRights,
       systemPrompt,
@@ -217,14 +260,21 @@ class AgentContractResolver {
 
   /** 从 TriCompany 路径加载 employee-roster.json。
    *
-   * 路径：``<sourceRoot>/docs/registry/employee-roster.json``
+   * 真源路径：``<TriCompany 根>/docs/registry/employee-roster.json``（i2-1 §二）。
+   * sourceRoot 为 TriCompany/source-agents，故候选 =
+   *   1. ``<sourceRoot>/docs/registry/employee-roster.json``（历史候选）
+   *   2. ``<sourceRoot>/../docs/registry/employee-roster.json``（TriCompany 根真源）
    * 如果 roster 文件不存在或解析失败，roster 保持为 null。
    * 返回已解析的 roster 条目数量，或 0（失败时）。
    */
   loadEmployeeRoster(): number {
-    const rosterPath = resolve(this.sourceRoot, 'docs', 'registry', 'employee-roster.json');
-    if (!existsSync(rosterPath)) {
-      console.warn(`[contract-resolver] employee roster not found: ${rosterPath}`);
+    const candidates = [
+      resolve(this.sourceRoot, 'docs', 'registry', 'employee-roster.json'),
+      resolve(this.sourceRoot, '..', 'docs', 'registry', 'employee-roster.json'),
+    ];
+    const rosterPath = candidates.find((p) => existsSync(p));
+    if (!rosterPath) {
+      console.warn(`[contract-resolver] employee roster not found (tried: ${candidates.join(', ')})`);
       return 0;
     }
     try {
@@ -235,7 +285,7 @@ class AgentContractResolver {
         return 0;
       }
       this.employeeRoster = parsed;
-      console.log(`[contract-resolver] loaded ${parsed.employees.length} employee roster entries`);
+      console.log(`[contract-resolver] loaded ${parsed.employees.length} employee roster entries (${rosterPath})`);
       return parsed.employees.length;
     } catch (err) {
       console.warn(`[contract-resolver] failed to load employee roster:`, (err as Error).message);
@@ -259,6 +309,30 @@ class AgentContractResolver {
    */
   listEmployees(): EmployeeRosterEntry[] {
     return this.employeeRoster?.employees ?? [];
+  }
+
+  /**
+   * 岗位目录只读访问器（GET /internal/v1/init/role-catalog 数据源，i2-1 §二）。
+   *
+   * 以 roster 为主键（标准岗位 13 条目），从合同 identity 面取展示字段；
+   * roster 缺失或合同未加载时返回 null——端点映射 503，不开天窗造数据。
+   * Registry family 合同（business-strategy 等）天然被 roster 主键过滤。
+   */
+  getRoleCatalog(): RoleCatalog | null {
+    if (!this.employeeRoster) return null;
+    const roles: RoleCatalogEntry[] = [];
+    for (const entry of this.employeeRoster.employees) {
+      const contract = this.contracts.get(entry.id);
+      if (!contract || contract.family !== 'Role') continue;
+      roles.push({
+        roleId: entry.id,
+        roleName: contract.identity.role || entry.role,
+        oneLinePositioning: contract.identity.description,
+        isGovernance: entry.tier === 'C-suite',
+        defaultSelected: DEFAULT_SELECTED_ROLES.includes(entry.id),
+      });
+    }
+    return { schemaVersion: 1, roles };
   }
 
   /** 监听文件变更并热重载 */

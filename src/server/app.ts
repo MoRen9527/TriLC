@@ -26,7 +26,7 @@ import type { Message, ToolDefinition, UsageSummary } from 'trimodel';
 import { createModelClient } from 'trimodel';
 import { createEventQueue } from '../event-queue/index.js';
 import type { ReplayRequest, ReplayResponse } from '../event-queue/types.js';
-import { publish, localBus } from '../localbus/bus.js';
+import { publish, localBus, type LocalBusEvent } from '../localbus/bus.js';
 import { agentEventsToAnthropicSSE, formatSSELine } from './anthropic-stream.js';
 import { agentEventsToOpenAISSE, formatOpenAISSE, OPENAI_SSE_DONE } from './openai-stream.js';
 import { registerShellExecTool, getDefaultSupervisor, cancelAllShellProcesses } from '../tools/shell-exec.js';
@@ -54,7 +54,7 @@ import {
 import { createHeartbeatWake } from '../heartbeat/heartbeat-wake.js';
 import { createHeartbeatRunner, type TriLCHeartbeatRunner, type HeartbeatAgentConfig } from '../heartbeat/heartbeat-runner.js';
 import { CompanyInitState } from '../company/init-state.js';
-import { buildOnboardingAgent } from '../company/onboarding.js';
+import { getContractResolver } from '../config/contract-resolver.js';
 import { InitChain } from '../company/init-chain.js';
 import {
   beginSelfcheck,
@@ -63,6 +63,15 @@ import {
   recordTaskSubmission,
   type SelfcheckDeps,
 } from '../company/init-selfcheck.js';
+import {
+  runAssemble,
+  validateAssemblePayload,
+  getOnboardingStateProjection,
+  validateProgressUpsert,
+  upsertOnboardingProgress,
+  buildInitModeSystemPrompt,
+  type AssembleDeps,
+} from '../company/init-assemble.js';
 import { createSessionReaper } from '../cron/session-reaper.js';
 import { createMinimalCronEngine, type MinimalCronEngine } from '../cron/service.js';
 import { createUpdateCheckHandler, startUpdateCheckLoop } from '../update/update-check.js';
@@ -704,6 +713,23 @@ export function createTriLCApp(env: TriLCEnv) {
     probeSystemPrompt: '你是 TriCade 的安装初始化自检会话（selfcheck 第五探测构造面）。',
   };
 
+  // ── 公司态 + 装配执行体（i2-1 §一：daemon 端点单执行体；两入口只发指令）──
+  const companyInitState = new CompanyInitState(env.dataDir, env.projectRoot ?? env.cwd);
+  const assembleDeps: AssembleDeps = {
+    dataDir: env.dataDir,
+    workspaceRoot: env.projectRoot ?? env.cwd,
+    chain: initChain,
+    companyState: companyInitState,
+    publish,
+    getRoleCatalog: () => {
+      try {
+        return getContractResolver().getRoleCatalog();
+      } catch {
+        return null; // resolver 未初始化 → 端点层映射 503，不开天窗
+      }
+    },
+  };
+
   // ── Notifications (REQ-021) ──
   // In-memory + persisted to {dataDir}/notifications.json for client pulls.
   const noticeFile = join(env.dataDir, 'notifications.json');
@@ -910,7 +936,6 @@ export function createTriLCApp(env: TriLCEnv) {
       validateModelRegistry();
 
       // Phase 2: Initialize contract resolver (load agents from TriCompany)
-      const { getContractResolver } = await import('../config/contract-resolver.js');
       const agentCount = await getContractResolver(env.tricompanySourcePath).loadAll();
       console.log(`[trilc] contract resolver: ${agentCount} agents loaded`);
 
@@ -1014,6 +1039,139 @@ export function createTriLCApp(env: TriLCEnv) {
           const started = beginSelfcheck(selfcheckDeps);
           res.writeHead(202, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ runId: started.runId }));
+          return;
+        }
+
+        // ── GET /internal/v1/init/role-catalog ──
+        // i2-1 §二：结构化员工选择载荷（只读展示数据源）。resolver 未初始化
+        // 或 roster 缺失 → 503，不开天窗造数据。
+        if (req.url === '/internal/v1/init/role-catalog' && req.method === 'GET') {
+          try {
+            const catalog = getContractResolver().getRoleCatalog();
+            if (!catalog) {
+              res.writeHead(503, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'role_catalog_unavailable', message: 'employee roster or agent contracts not loaded' }));
+              return;
+            }
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(catalog));
+          } catch (err) {
+            res.writeHead(503, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'role_catalog_unavailable', message: (err as Error).message }));
+          }
+          return;
+        }
+
+        // ── POST /internal/v1/init/assemble ──
+        // i2-1 §一：公司面装配端点（daemon 单执行体；两入口只发指令）。
+        // 校验先行（400/422/409 矩阵见 init-assemble.ts）→ 预写段 → 提交段 → 事件。
+        if (req.url === '/internal/v1/init/assemble' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: unknown = null;
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+            return;
+          }
+          const catalog = assembleDeps.getRoleCatalog();
+          if (!catalog) {
+            res.writeHead(503, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'role_catalog_unavailable', message: 'employee roster or agent contracts not loaded' }));
+            return;
+          }
+          const v = validateAssemblePayload(body, catalog);
+          if (!v.ok) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: v.error, message: v.message }));
+            return;
+          }
+          const result = await runAssemble(assembleDeps, {
+            ceoName: v.ceoName,
+            selections: v.selections,
+            entry: (body as Record<string, unknown>).entry as 'tripilot' | 'trilc-chat',
+          });
+          res.writeHead(result.status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(result));
+          return;
+        }
+
+        // ── GET /internal/v1/init/events ──
+        // i2-1 §四：daemon 级 init 事件 SSE 通道（订阅 localbus 转发 init:* 族）。
+        // 无重放缓冲：断连重连 = 重拉 chain/status（事件流 = 状态文件投影）。
+        if (req.url === '/internal/v1/init/events' && req.method === 'GET') {
+          res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            'connection': 'keep-alive',
+            'x-accel-buffering': 'no',
+          });
+          const onInitEvent = (event: LocalBusEvent) => {
+            if (!event.type.startsWith('init:')) return;
+            res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+          };
+          localBus.on('event', onInitEvent);
+          const keepAlive = setInterval(() => res.write(': ping\n\n'), 25_000);
+          const cleanup = () => {
+            clearInterval(keepAlive);
+            localBus.off('event', onInitEvent);
+          };
+          req.on('close', cleanup);
+          res.write(': connected\n\n');
+          return;
+        }
+
+        // ── GET /internal/v1/init/onboarding/state ──
+        // i2-1 §四：断点续跑真源只读投影（A3：已答不重复问、可回看）。
+        if (req.url === '/internal/v1/init/onboarding/state' && req.method === 'GET') {
+          try {
+            const projection = await getOnboardingStateProjection(companyInitState);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(projection));
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'onboarding_state_unavailable', message: (err as Error).message }));
+          }
+          return;
+        }
+
+        // ── POST /internal/v1/init/onboarding/progress ──
+        // i2-1 §四：upsert 部分字段 → CompanyInitState.save({ progress }) 持久
+        // （REQ-016 断点续接机制沿用，init-state.ts 零改动）。
+        if (req.url === '/internal/v1/init/onboarding/progress' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: unknown = null;
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+            return;
+          }
+          const v = validateProgressUpsert(body);
+          if (!v.ok) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: v.error, message: v.message }));
+            return;
+          }
+          try {
+            await upsertOnboardingProgress(companyInitState, v.patch);
+            const projection = await getOnboardingStateProjection(companyInitState);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, progress: projection }));
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'progress_save_failed', message: (err as Error).message }));
+          }
           return;
         }
 
@@ -2023,6 +2181,11 @@ export function createTriLCApp(env: TriLCEnv) {
 
           const sessionId = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
           const model = getKeyCache()?.defaultModel ?? process.env.TRIMODEL_DEFAULT_MODEL ?? 'tmv-deepseek-v4-pro';
+          // i2-1 §三 init 模式路由：链态 ∈ 初始化阶段且无 client systemPrompt
+          // （非员工 agent 显式会话）→ init 模式 bootstrap 替代 defaultSystemPrompt；
+          // 员工合同装配路径（6.4）与自检第五探测（显式 systemPrompt）不动。
+          // 周平面提示保持「no-prompt 路径恒有一次」r4-1 C 口径（init 模式同注入）。
+          const initModePrompt = body.systemPrompt ? null : buildInitModeSystemPrompt(initChain.getState());
           const entry: TaskStreamEntry = {
             sessionId,
             message: body.message.trim(),
@@ -2035,7 +2198,7 @@ export function createTriLCApp(env: TriLCEnv) {
             // for the no-prompt path — never both (see buildWeeklyPlaneHint).
             systemPrompt: body.systemPrompt
               ? body.systemPrompt + buildWeeklyPlaneHint()
-              : defaultSystemPrompt(),
+              : (initModePrompt ? initModePrompt + buildWeeklyPlaneHint() : defaultSystemPrompt()),
             context: {
               files: body.context?.files ?? [],
               workspaceRoot: body.context?.workspaceRoot ?? env.cwd,
@@ -2921,25 +3084,10 @@ export function createTriLCApp(env: TriLCEnv) {
         userMessage: "Periodic heartbeat check. Confirm all systems nominal.",
       };
 
-      // REQ-20260805-001: if TriCompany uninitialized, register onboarding agent
-      // (auto-pushes greet → ask CEO name → role list → select+name → assemble).
-      const companyInit = new CompanyInitState(env.dataDir, env.projectRoot ?? env.cwd);
+      // i2-2 §五 叙事态下线：REQ-20260805-001 叙事 onboarding heartbeat agent
+      // 不再注册（ONBOARDING 阶段驱动 = 装配端点 + init:* 事件流，无叙事并存
+      // 路径）。结构化流程 = role-catalog / assemble / onboarding endpoints。
       const agents: HeartbeatAgentConfig[] = [DEFAULT_HEARTBEAT_AGENT];
-      try {
-        // I1 行为等价扩展：公司态 onboarding 未完成 OR 链路状态机处于
-        // onboarding 阶段（公司态已 initialized 但链路未走完时仍注册）。
-        if ((await companyInit.isOnboardingPending()) || initChain.getState() === 'onboarding') {
-          // REQ-014b: onboarding workspace = projectRoot (TRILC_PROJECT_ROOT), not daemon cwd
-          // REQ-016: statePath so the agent reads the real progress file (dataDir), not workspace copies
-          const companyStatePath = join(env.dataDir, 'company', 'state.json');
-          agents.push(buildOnboardingAgent(env.projectRoot ?? env.cwd, getKeyCache()?.defaultModel ?? "tmv-deepseek-v4-flash", companyStatePath));
-          console.log("[trilc] TriCompany uninitialized — onboarding agent registered");
-        } else {
-          console.log("[trilc] TriCompany initialized — onboarding skipped");
-        }
-      } catch (err) {
-        console.warn("[trilc] company init check failed:", (err as Error).message);
-      }
 
       heartbeatRunner.updateAgents(agents);
       heartbeatRunner.start();

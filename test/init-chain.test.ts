@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -151,6 +151,84 @@ test("missing file loads default uninitialized frame (idempotent)", async () => 
   assert.equal(f1.phaseDetail.onboarding.ref, 'company/state.json#progress');
   const f2 = await chain.load();
   assert.equal(f2, f1, 'load 幂等（缓存同帧）');
+  await rm(dir, { recursive: true, force: true });
+});
+
+// ── 5. load() ENOENT vs 解析错（I1 前置强制项③，i2-1 拆解 §六）──
+
+test("load() 三件套①：文件缺失 → 默认帧且无 .corrupt 生成（静默）", async () => {
+  const { dir, chain } = await freshChain();
+  const errorLogs: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => { errorLogs.push(args.map(String).join(' ')); };
+  try {
+    const f = await chain.load();
+    assert.equal(f.chainState, 'uninitialized', 'ENOENT → 默认帧');
+    assert.equal(errorLogs.length, 0, 'ENOENT 不产噪音日志');
+    const files = await readdir(join(dir, 'company')).catch(() => []);
+    assert.equal(files.some((x) => x.endsWith('.corrupt')), false, '无 .corrupt 生成');
+  } finally {
+    console.error = origError;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("load() 三件套②：非法 JSON → .corrupt 备份 + 默认帧 + console.error", async () => {
+  const { dir, chain } = await freshChain();
+  const companyDir = join(dir, 'company');
+  await mkdir(companyDir, { recursive: true });
+  const corruptContent = '{ "chainState": "onboarding", broken';
+  await writeFile(join(companyDir, 'init-chain.json'), corruptContent, 'utf-8');
+
+  const errorLogs: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => { errorLogs.push(args.map(String).join(' ')); };
+  try {
+    const f = await chain.load();
+    assert.equal(f.chainState, 'uninitialized', '解析错 → 默认帧（daemon 不崩溃启动）');
+    const files = await readdir(companyDir);
+    assert.equal(files.includes('init-chain.json.corrupt'), true, '.corrupt 保留损坏现场');
+    const backup = await readFile(join(companyDir, 'init-chain.json.corrupt'), 'utf-8');
+    assert.equal(backup, corruptContent, '.corrupt 内容 = 原始损坏字节');
+    assert.ok(
+      errorLogs.some((l) => l.includes('parse failed') && l.includes('.corrupt')),
+      `console.error 含 parse failed + .corrupt 路径（got: ${errorLogs.join(' | ')}）`,
+    );
+  } finally {
+    console.error = origError;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("load() 三件套③：合法 JSON 正常加载（回归，且不覆盖既有 .corrupt）", async () => {
+  const { dir, chain } = await freshChain();
+  const companyDir = join(dir, 'company');
+  await mkdir(companyDir, { recursive: true });
+  const frame = {
+    schemaVersion: 1,
+    chainState: 'onboarding',
+    phaseDetail: {
+      selfcheck: { runId: 'sc_reg', summary: 'pass', checks: [], finishedAt: '2026-08-14T10:00:00.000Z', retryCount: 1 },
+      onboarding: { step: null, ref: 'company/state.json#progress' },
+      'project-link': { status: 'pending', source: null, projectKey: null, worktreePath: null },
+      sync: { status: 'pending', bundleId: null },
+      confirm: { status: 'pending', l1: null, l2: null, l3: null },
+      ready: { firstCollab: 'pending' },
+    },
+    lastTransitionAt: '2026-08-14T10:00:00.000Z',
+    lastUpdatedAt: '2026-08-14T10:00:00.000Z',
+    eventSeq: 3,
+    sourceEntry: 'tripilot',
+  };
+  await writeFile(join(companyDir, 'init-chain.json'), JSON.stringify(frame), 'utf-8');
+
+  const f = await chain.load();
+  assert.equal(f.chainState, 'onboarding', '合法 JSON 正常加载');
+  assert.equal(f.eventSeq, 3);
+  assert.equal(f.phaseDetail.selfcheck.runId, 'sc_reg');
+  assert.equal(f.sourceEntry, 'tripilot');
+  const files = await readdir(companyDir);
+  assert.equal(files.some((x) => x.endsWith('.corrupt')), false, '合法加载不产 .corrupt');
   await rm(dir, { recursive: true, force: true });
 });
 
