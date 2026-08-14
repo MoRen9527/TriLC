@@ -37,17 +37,36 @@ import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 /**
+ * 环境文件候选（纯函数，可测）。
+ * r19-gate A1 扩展：安装态（C:\Program Files\TriCade）下 r19 三候选
+ * （工作区根/TriLC 根/cwd）全部落空 → schtasks 实例 keys fetch 401。
+ * 新增：
+ *   1. TRILC_ENV_FILE 显式注入（部署层指路——cmd/任务里只放路径，不放密钥）
+ *   2. dataDir 相邻 .env（TRILC_DATA_DIR ?? %LOCALAPPDATA%/trilc）——安装态可达
+ */
+export function buildEnvFileCandidates(scriptDir: string, cwd: string): string[] {
+  const explicit = process.env.TRILC_ENV_FILE;
+  const dataDirEnv = process.env.TRILC_DATA_DIR
+    ? resolve(process.env.TRILC_DATA_DIR, '.env')
+    : (process.env.LOCALAPPDATA ? resolve(process.env.LOCALAPPDATA, 'trilc', '.env') : undefined);
+  const candidates: Array<string | undefined> = [
+    explicit ? resolve(explicit) : undefined,
+    resolve(scriptDir, '..', '..', '..', '.env'), // 工作区根 D:/Code/ai/.env（源码态）
+    resolve(scriptDir, '..', '..', '.env'),       // TriLC 根 .env
+    dataDirEnv,                                   // dataDir 相邻（安装态 schtasks 可达）
+    resolve(cwd, '.env'),
+  ];
+  return candidates.filter((p): p is string => !!p);
+}
+
+/**
  * r19 修复：dist 形态（node dist/cli.js）无 tsx 的 dotenv 自动加载，
  * schtasks ONLOGON 环境缺 TRIMODEL_API_TOKEN 等关键变量（keys fetch 401）。
- * 兜底加载工作区/仓库根 .env——不覆盖已存在的进程 env。
+ * 兜底加载 .env 候选——不覆盖已存在的进程 env（r19 口径不变）。
  */
 function loadEnvFileFallback(): void {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
-  const candidates = [
-    resolve(scriptDir, '..', '..', '..', '.env'), // 工作区根 D:/Code/ai/.env
-    resolve(scriptDir, '..', '..', '.env'),       // TriLC 根 .env
-    resolve(process.cwd(), '.env'),
-  ];
+  const candidates = buildEnvFileCandidates(scriptDir, process.cwd());
   for (const envPath of candidates) {
     if (!existsSync(envPath)) continue;
     try {

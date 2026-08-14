@@ -23,7 +23,14 @@ export type LocalBusEvent =
   | { type: 'cron:sweep'; count: number }
   | { type: 'cron:error'; error: string }
   | { type: 'cron:degraded'; consecutiveFailures: number }
-  | { type: 'cron:recovered' };
+  | { type: 'cron:recovered' }
+  // ── Init chain / selfcheck events（I1: init-collab-i1-statemachine）──
+  // init:chain-changed 的 eventSeq 与链路状态文件同帧（i1-1 §三）。
+  | { type: 'init:chain-changed'; chainState: string; from: string; to: string; eventSeq: number; sourceEntry: string | null }
+  | { type: 'init:selfcheck-started'; runId: string; checks: string[] }
+  | { type: 'init:selfcheck-progress'; runId: string; checkId: string; status: string; detail: string }
+  | { type: 'init:selfcheck-finished'; runId: string; summary: string; report: unknown }
+  | { type: 'init:step-event'; phase: string; step: string; entry: unknown; payload: unknown };
 
 // Singleton shared by daemon, planner, and event-queue
 export const localBus = new EventEmitter<{ event: [LocalBusEvent] }>();

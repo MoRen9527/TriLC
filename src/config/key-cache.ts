@@ -146,6 +146,42 @@ let _keyCache: KeyCache | null = null;
 let _refreshTimer: ReturnType<typeof setTimeout> | null = null;
 let _storage: KeyStorage | null = null;
 
+// ── Fetch status (r19-gate A1: 401 诊断面，供 init-selfcheck trimodel 探测) ──
+
+let _lastFetchAt: number | null = null;
+let _lastFetchError: string | null = null;
+
+function recordFetchFailure(err: unknown): void {
+  _lastFetchAt = Date.now();
+  _lastFetchError = err instanceof Error ? err.message : String(err);
+}
+
+function recordFetchSuccess(): void {
+  _lastFetchAt = Date.now();
+  _lastFetchError = null;
+}
+
+/** Key-cache 现状快照（init-selfcheck 探测数据源）。 */
+export interface KeyCacheStatus {
+  hasCache: boolean;
+  fetchedAt: number | null;
+  expiresAt: number | null;
+  providerCount: number;
+  lastFetchAt: number | null;
+  lastFetchError: string | null;
+}
+
+export function getKeyCacheStatus(): KeyCacheStatus {
+  return {
+    hasCache: !!_keyCache,
+    fetchedAt: _keyCache?.fetchedAt ?? null,
+    expiresAt: _keyCache?.expiresAt ?? null,
+    providerCount: _keyCache ? Object.keys(_keyCache.keys).length : 0,
+    lastFetchAt: _lastFetchAt,
+    lastFetchError: _lastFetchError,
+  };
+}
+
 // ── Callback for external consumers (TK-011) ──
 
 type KeyCacheUpdatedCallback = (cache: KeyCache) => void;
@@ -290,8 +326,10 @@ export async function initKeyCache(apiUrl: string, dataDir: string, apiToken?: s
       expiresAt: Date.now() + KEY_CACHE_TTL_MS,
     };
     _storage.write(_keyCache);
+    recordFetchSuccess();
     console.log(`[trilc:keys] fetched fresh keys (${Object.keys(fresh.keys).length} providers):`, sanitizeKeysForLog(_keyCache));
   } catch (err) {
+    recordFetchFailure(err);
     if (_keyCache) {
       console.warn(`[trilc:keys] fetch failed, using cached keys: ${err instanceof Error ? err.message : String(err)}`);
     } else {
@@ -333,6 +371,7 @@ async function doRefresh(apiUrl: string, apiToken?: string): Promise<void> {
       expiresAt: Date.now() + KEY_CACHE_TTL_MS,
     };
     _storage?.write(_keyCache);
+    recordFetchSuccess();
     console.log(`[trilc:keys] refreshed keys:`, sanitizeKeysForLog(_keyCache));
     // TK-011: Notify external consumers of updated key cache
     if (_onKeyCacheUpdated) {
@@ -343,6 +382,7 @@ async function doRefresh(apiUrl: string, apiToken?: string): Promise<void> {
       }
     }
   } catch (err) {
+    recordFetchFailure(err);
     console.warn(`[trilc:keys] refresh failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }

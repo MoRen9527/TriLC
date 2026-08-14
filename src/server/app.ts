@@ -55,6 +55,14 @@ import { createHeartbeatWake } from '../heartbeat/heartbeat-wake.js';
 import { createHeartbeatRunner, type TriLCHeartbeatRunner, type HeartbeatAgentConfig } from '../heartbeat/heartbeat-runner.js';
 import { CompanyInitState } from '../company/init-state.js';
 import { buildOnboardingAgent } from '../company/onboarding.js';
+import { InitChain } from '../company/init-chain.js';
+import {
+  beginSelfcheck,
+  isSelfcheckRunning,
+  getActiveRunId,
+  recordTaskSubmission,
+  type SelfcheckDeps,
+} from '../company/init-selfcheck.js';
 import { createSessionReaper } from '../cron/session-reaper.js';
 import { createMinimalCronEngine, type MinimalCronEngine } from '../cron/service.js';
 import { createUpdateCheckHandler, startUpdateCheckLoop } from '../update/update-check.js';
@@ -683,6 +691,19 @@ export function createTriLCApp(env: TriLCEnv) {
   });
   const sessionStore = createSessionStore(`${env.dataDir}/sessions.db`);
 
+  // ── Init Chain（链路进度状态机；与公司态 CompanyInitState 分离独立持久）──
+  // 事件经 publish 同通道发布（init:chain-changed / init:selfcheck-* / init:step-event 族）。
+  const initChain = new InitChain(env.dataDir, { onEvent: publish });
+  // SELFCHECK 依赖（第五探测构造 TriPilot 形态会话：客户端 systemPrompt 走
+  // tasks/submit 追加周平面提示的路径 — r4-1 B 族注入面）。
+  const selfcheckDeps: SelfcheckDeps = {
+    port: env.port,
+    projectRoot: env.projectRoot,
+    chain: initChain,
+    publish,
+    probeSystemPrompt: '你是 TriCade 的安装初始化自检会话（selfcheck 第五探测构造面）。',
+  };
+
   // ── Notifications (REQ-021) ──
   // In-memory + persisted to {dataDir}/notifications.json for client pulls.
   const noticeFile = join(env.dataDir, 'notifications.json');
@@ -956,6 +977,43 @@ export function createTriLCApp(env: TriLCEnv) {
               enabled: sessionReaper.isRunning(),
             },
           }));
+          return;
+        }
+
+        // ── GET /internal/v1/init/chain/status ──
+        // I1（init-collab-i1-statemachine）：链路进度状态机只读投影（两入口 +
+        // 诊断卡数据源）。载荷 = 状态文件当前帧（i1-1 §四契约字段）。
+        if (req.url === '/internal/v1/init/chain/status' && req.method === 'GET') {
+          try {
+            await initChain.load();
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(initChain.toStatusPayload()));
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'init_chain_unavailable', message: (err as Error).message }));
+          }
+          return;
+        }
+
+        // ── POST /internal/v1/init/selfcheck/run ──
+        // I1：触发五探测自检。202 { runId } 立即返回，检查过程经
+        // init:selfcheck-* 事件流发布；并发防重入：运行中再触发 409 { runId }。
+        if (req.url === '/internal/v1/init/selfcheck/run' && req.method === 'POST') {
+          try {
+            await initChain.load();
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'init_chain_unavailable', message: (err as Error).message }));
+            return;
+          }
+          if (isSelfcheckRunning()) {
+            res.writeHead(409, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ runId: getActiveRunId() }));
+            return;
+          }
+          const started = beginSelfcheck(selfcheckDeps);
+          res.writeHead(202, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ runId: started.runId }));
           return;
         }
 
@@ -1987,6 +2045,9 @@ export function createTriLCApp(env: TriLCEnv) {
           };
           taskStreams.set(sessionId, entry);
 
+          // I1 selfcheck tripilot 探测：TriPilot 形态任务提交存活计数（被动观察面）
+          recordTaskSubmission();
+
           // S7: Publish task:queued for mirror pusher
           publish({ type: 'task:queued', taskId: sessionId });
 
@@ -2114,17 +2175,25 @@ export function createTriLCApp(env: TriLCEnv) {
                   break;
                 }
                 case 'tool_result': {
+                  // r19-gate A2：agent-core 事件形为 { tool_call_id, content,
+                  // is_error }——旧映射读 name/tool_name/result 恒为空（装后态
+                  // 实测每条工具结果 unknown+空输出，TriPilot 渲染面全空）。
                   const tr = event as any;
+                  const content = tr.content ?? tr.result ?? '';
                   writeSSE('tool_result', {
                     toolName: tr.name ?? tr.tool_name ?? 'unknown',
-                    output: typeof tr.result === 'string' ? tr.result : JSON.stringify(tr.result ?? ''),
+                    output: typeof content === 'string' ? content : JSON.stringify(content),
                     durationMs: tr.durationMs ?? 0,
+                    isError: tr.is_error === true,
                   });
                   break;
                 }
                 case 'assistant_message': {
                   const am = event as any;
                   if (am.content && !deltaContent) {
+                    // r19-gate A3：deltaContent 是用户可见产出的唯一真源——
+                    // 批量形态的最终答复也要计入（否则伪成功误判）。
+                    deltaContent += am.content;
                     writeSSE('delta', { content: am.content });
                   }
                   break;
@@ -2195,12 +2264,15 @@ export function createTriLCApp(env: TriLCEnv) {
               return;
             }
 
-            // C13: Post-loop guard — if the loop completed without any content delta
-            // AND without any tool calls, this is a pseudo-success. Treat as error.
+            // C13 + r19-gate A3: Post-loop guard — 用户可见产出 = 文本内容。
+            // 仅工具调用、零文本收尾的回合是伪成功（r19 装后态问周面实测
+            // 3 工具调用 0 delta → 伪 task_done，TriPilot 显示空白）。
             // W30 lesson: provider 全挂时可能静默返回空内容，绝不能发伪 task_done。
-            const producedAnyOutput = deltaContent.length > 0 || toolCount > 0;
+            const producedAnyOutput = deltaContent.length > 0;
             if (!producedAnyOutput) {
-              const emptyError = 'Model loop completed without any content or tool calls — possible provider failure or empty reasoning-only response';
+              const emptyError = toolCount > 0
+                ? 'Model loop completed without any answer content — tool calls only, no final text (pseudo-success)'
+                : 'Model loop completed without any content or tool calls — possible provider failure or empty reasoning-only response';
               console.error(`[trilc:model] CRITICAL: all providers exhausted for task=${sessionId}: ${emptyError}`);
               entry.status = 'error';
               publish({ type: 'task:failed', taskId: sessionId, error: emptyError });
@@ -2808,6 +2880,21 @@ export function createTriLCApp(env: TriLCEnv) {
         res.end(JSON.stringify({ error: 'not_found' }));
       });
 
+      // ── Init Chain：启动 load（断点续跑）+ uninitialized 自动转 selfcheck ──
+      // 转移记录 + 发布 init:chain-changed；不自动执行探测（探测由
+      // POST /internal/v1/init/selfcheck/run 端点触发）。
+      try {
+        await initChain.load();
+        if (initChain.getState() === 'uninitialized') {
+          await initChain.transitionTo('selfcheck', 'daemon');
+          console.log('[trilc:init] chain uninitialized → selfcheck（daemon 启动转移；探测待端点触发）');
+        } else {
+          console.log(`[trilc:init] chain resumed: ${initChain.getState()}（断点续跑）`);
+        }
+      } catch (err) {
+        console.warn('[trilc:init] init chain load failed:', (err as Error).message);
+      }
+
       await new Promise<void>((resolve, reject) => {
         server!.on('error', reject);
         server!.listen(env.port, '127.0.0.1', () => resolve());
@@ -2839,7 +2926,9 @@ export function createTriLCApp(env: TriLCEnv) {
       const companyInit = new CompanyInitState(env.dataDir, env.projectRoot ?? env.cwd);
       const agents: HeartbeatAgentConfig[] = [DEFAULT_HEARTBEAT_AGENT];
       try {
-        if (await companyInit.isOnboardingPending()) {
+        // I1 行为等价扩展：公司态 onboarding 未完成 OR 链路状态机处于
+        // onboarding 阶段（公司态已 initialized 但链路未走完时仍注册）。
+        if ((await companyInit.isOnboardingPending()) || initChain.getState() === 'onboarding') {
           // REQ-014b: onboarding workspace = projectRoot (TRILC_PROJECT_ROOT), not daemon cwd
           // REQ-016: statePath so the agent reads the real progress file (dataDir), not workspace copies
           const companyStatePath = join(env.dataDir, 'company', 'state.json');
@@ -3417,7 +3506,7 @@ export function defaultSystemPrompt(cwd?: string): string {
  * client 显式传入 systemPrompt 的分支。新增调用点时必须二选一叠加，
  * 不得同时套用两处。
  */
-function buildWeeklyPlaneHint(): string {
+export function buildWeeklyPlaneHint(): string {
   const planeRoot = resolveWeeklyPlaneRoot();
   if (!planeRoot) return '';
   return `\n\n## Company Weekly Plane (read-only)\n\nThe company weekly operating plane lives at \`${planeRoot}\`. When asked about the current week, weekly indexes (OP-*.json), operating records, or unresolved items, read from this directory instead of any project-local operating-records path. The active week is the \`2026-Wnn\` directory whose OP index has \`status: "active"\` (its index also carries \`latestActiveWeek: true\`).`;
