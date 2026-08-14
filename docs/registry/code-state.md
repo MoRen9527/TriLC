@@ -247,6 +247,14 @@
 - 单测 +11：三面一致全绿 / repoUrl 错误仓 / worktree 指纹呈现 + 服务器侧不一致 / fleet 落后 / 降级口径 / 未 applied 未就绪 / 本地 bundle 缺失 / confirm 成功转移 ready + 快照 + 事件 / 409 notReady 附 check / 409 chainState / 防重入并发。全量 409/410（1 fail 同既有缺口）。
 - 两入口渲染：trilc chat CONFIRM 文本流程（L1-L4 呈现 + 红差异 + 诊断入口 + 确认问答）+ TriPilot 确认卡（三元素同显 + HEAD 徽标 + 未就绪提示 + 确认按钮门禁禁用态）；零本地执行。
 
+### firstCollab 推进写入面（`src/company/init-first-collab.ts`，I5）
+
+- **I5 新增（本树唯一代码增量，i5-1 §五）**：`POST /internal/v1/init/ready/first-collab`（internal localhost-only 面——daemon 只绑定 127.0.0.1）+ `init-chain.ts updateReady` 快照回写（与 updateSync/updateConfirm 同形态；零 schema 字段新增，ReadyPhase 三态 I1 已预留）。
+- 链态门：chainState == 'ready' 否则 409 { chainState }；载荷 `{ status: 'triggered' | 'passed', note?: string }`（note 不持久——零 schema 新增纪律，证据面归 OP/验收执行本 verify/ 留档）。
+- 合法转移：pending→triggered→passed 恰好 +1 步推进；跳级/回退 409 illegalTransition；同 status 重放幂等 no-op 200（不写状态、eventSeq 不增长）。
+- transitionTo 转移表零改动（门禁 7）；两入口（TriPilot/trilc chat）零执行增量，只读呈现 firstCollab 状态（门禁 6）。
+- 单测 +6：链态门 409 / 合法转移逐级 / 跳级拒绝 / 回退拒绝 / 重放幂等 / 载荷校验。全量 415/416（1 fail = test/tui/components.test.ts 环境缺口既有，基线 409/410 口径不退化）。
+
 ## Sources
 
 - `../../src/runtime/`

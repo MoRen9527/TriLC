@@ -373,6 +373,27 @@ export class InitChain {
     return frame;
   }
 
+  /**
+   * ready 阶段 firstCollab 推进回写（I5 first-collab 端点使用；非状态转移，
+   * 不发 chain-changed）。零 schema 字段新增（ReadyPhase 已预留，门禁 7：
+   * 仅此方法为 I5 增量，transitionTo 转移表零改动）。
+   */
+  async updateReady(patch: Partial<ReadyPhase>): Promise<InitChainFile> {
+    const current = this.cache ?? (await this.load());
+    const now = new Date().toISOString();
+    const frame: InitChainFile = {
+      ...current,
+      phaseDetail: {
+        ...current.phaseDetail,
+        ready: { ...current.phaseDetail.ready, ...patch },
+      },
+      lastUpdatedAt: now,
+      eventSeq: current.eventSeq + 1,
+    };
+    await this.persist(frame);
+    return frame;
+  }
+
   /** status 端点载荷（i1-1 §四契约字段：两入口只读投影 + 诊断卡数据源）。 */
   toStatusPayload(): {
     schemaVersion: 1;

@@ -90,6 +90,7 @@ import {
   type SyncEntry,
 } from '../company/init-sync.js';
 import { runConfirmCheck, runConfirm } from '../company/init-confirm.js';
+import { runFirstCollabUpdate } from '../company/init-first-collab.js';
 import { createSessionReaper } from '../cron/session-reaper.js';
 import { createMinimalCronEngine, type MinimalCronEngine } from '../cron/service.js';
 import { createUpdateCheckHandler, startUpdateCheckLoop } from '../update/update-check.js';
@@ -1396,6 +1397,36 @@ export function createTriLCApp(env: TriLCEnv) {
           const entry: SyncEntry =
             entryRaw === 'tripilot' || entryRaw === 'trilc-chat' ? entryRaw : 'daemon';
           const result = await runConfirm(initSyncDeps, entry);
+          res.writeHead(result.status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(result));
+          return;
+        }
+
+        // ── POST /internal/v1/init/ready/first-collab ──
+        // I5（i5-1 §五）：firstCollab 推进写入面——pending→triggered→passed
+        // 合法转移 + 重放幂等 + 链态门 ready。internal localhost-only 面
+        // （daemon 只绑定 127.0.0.1）；两入口零执行增量（只读呈现）。
+        if (req.url === '/internal/v1/init/ready/first-collab' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: Record<string, unknown> = {};
+          if (raw.trim()) {
+            try {
+              body = JSON.parse(raw) as Record<string, unknown>;
+            } catch {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+              return;
+            }
+          }
+          const result = await runFirstCollabUpdate(
+            { chain: initSyncDeps.chain },
+            body.status,
+            body.note,
+          );
           res.writeHead(result.status, { 'content-type': 'application/json' });
           res.end(JSON.stringify(result));
           return;
