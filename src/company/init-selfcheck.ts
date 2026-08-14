@@ -308,6 +308,14 @@ async function executeSelfcheck(runId: string, deps: SelfcheckDeps): Promise<voi
     const prev = (await deps.chain.load()).phaseDetail.selfcheck;
     await deps.chain.updateSelfcheck({ runId, summary, checks, finishedAt, retryCount: prev.retryCount + 1 });
     deps.publish({ type: 'init:selfcheck-finished', runId, summary, report: checks });
+    // I2 A' 裁决（CTO 2026-08-14）：自检完结（pass/degraded）→ 自动推进 onboarding。
+    // 发布顺序 = selfcheck-finished（绿/红卡汇总）先、chain-changed（阶段切换）后——
+    // 入口先看自检结果，再切选择界面；chain-changed 仍是两入口渲染阶段切换的唯一依据。
+    // blocked → 不推进（诊断卡保留，重跑自检幂等）；getState()==='selfcheck' 条件
+    // 本身即幂等守卫（onboarding 态重跑自检无转移无事件）。
+    if ((summary === 'pass' || summary === 'degraded') && deps.chain.getState() === 'selfcheck') {
+      await deps.chain.transitionTo('onboarding', 'daemon');
+    }
   } finally {
     _activeRunId = null;
   }

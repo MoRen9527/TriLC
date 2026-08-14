@@ -136,7 +136,7 @@ test("validate: catalog null → role_catalog_unavailable（不开天窗）", ()
 
 // ── 2. 阶段门禁 422 ──
 
-test("phase gate: 非 onboarding 且非「selfcheck 已完结」→ 422 { chainState }", async () => {
+test("phase gate: 非 onboarding → 422 { chainState }（A' 字面门禁）", async () => {
   // uninitialized：链未转移
   const h1 = await newHarness({ chainState: 'uninitialized' });
   try {
@@ -155,16 +155,26 @@ test("phase gate: 非 onboarding 且非「selfcheck 已完结」→ 422 { chainS
   } finally {
     await h2.cleanup();
   }
-  // project-link：已装配 → 422（防错阶段写）
-  const h3 = await newHarness();
+  // A' 裁决：assemble 只受理 onboarding——selfcheck 已完结（pass）也 422
+  // （推进点 = init-selfcheck 完成路径，不在本端点）
+  const h3 = await newHarness({ chainState: 'selfcheck-pass' });
   try {
     const r = await runAssemble(h3.deps, REQ);
+    assert.equal(r.status, 422, 'selfcheck 已完结仍 422（门禁字面 onboarding-only）');
+    assert.equal((r as { chainState: string }).chainState, 'selfcheck');
+  } finally {
+    await h3.cleanup();
+  }
+  // project-link：已装配 → 422（防错阶段写）
+  const h4 = await newHarness();
+  try {
+    const r = await runAssemble(h4.deps, REQ);
     assert.equal(r.status, 200);
-    const again = await runAssemble(h3.deps, REQ);
+    const again = await runAssemble(h4.deps, REQ);
     assert.equal(again.status, 422, 'project-link 重入 → 422');
     assert.equal((again as { chainState: string }).chainState, 'project-link');
   } finally {
-    await h3.cleanup();
+    await h4.cleanup();
   }
 });
 
@@ -340,7 +350,6 @@ test("whitelist artifacts written; existing business-state/AGENTS preserved; <5 
     assert.deepEqual(body.preserved, ['docs/registry/business-state.md', 'AGENTS.md'], 'preserved 报告');
     assert.equal(body.warning?.recommendedMin, 5, '<5 岗 warning');
     assert.equal(body.warning?.current, 1);
-    assert.equal(body.advancedFromSelfcheck, false);
 
     const agentMd = await readFile(join(h.ws, '.claude', 'agents', 'ceo-chief-of-staff.md'), 'utf-8');
     assert.ok(agentMd.includes('name: 小贾'), '员工名写入 agent md');
@@ -350,21 +359,6 @@ test("whitelist artifacts written; existing business-state/AGENTS preserved; <5 
     assert.deepEqual(companyJson.employees, [{ role: 'ceo-chief-of-staff', name: '小贾' }]);
     assert.equal(await readFile(join(h.ws, 'docs', 'registry', 'business-state.md'), 'utf-8'), 'REAL BUSINESS STATE', '既有内容不覆盖');
     assert.equal(await readFile(join(h.ws, 'AGENTS.md'), 'utf-8'), 'REAL AGENTS', '既有内容不覆盖');
-  } finally {
-    await h.cleanup();
-  }
-});
-
-test("selfcheck 已完结入口：advancedFromSelfcheck + 两次 chain-changed", async () => {
-  const h = await newHarness({ chainState: 'selfcheck-pass' });
-  try {
-    const r = await runAssemble(h.deps, REQ);
-    assert.equal(r.status, 200);
-    assert.equal((r as { advancedFromSelfcheck: boolean }).advancedFromSelfcheck, true);
-    assert.equal(h.deps.chain.getState(), 'project-link');
-    const changed = h.events.filter((e) => e.type === 'init:chain-changed') as Array<Extract<LocalBusEvent, { type: 'init:chain-changed' }>>;
-    assert.equal(changed.filter((e) => e.to === 'onboarding').length, 1, 'selfcheck→onboarding 补转移事件');
-    assert.equal(changed[changed.length - 1].to, 'project-link');
   } finally {
     await h.cleanup();
   }

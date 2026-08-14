@@ -282,12 +282,23 @@ export async function runInitCliFlow(port: number): Promise<InitCliFlowResult> {
           waited += 5_000;
           const poll = await getJson<ChainStatusPayload>(port, '/internal/v1/init/chain/status');
           const sc = poll.json?.phaseDetail?.selfcheck;
-          if (sc?.finishedAt && poll.json?.chainState === 'selfcheck') {
+          if (sc?.finishedAt) {
             console.log(renderSelfcheckCard(sc));
             if (sc.summary === 'blocked') {
               return { outcome: 'blocked', detail: 'selfcheck blocked' };
             }
-            return runOnboardingFlow(port);
+            // A' 裁决：自检完结（pass/degraded）→ daemon 已自动推进 onboarding，
+            // 直接进入开张流程（链态仍 selfcheck 的极端延迟给一次短等待重查）。
+            if (poll.json?.chainState === 'onboarding') {
+              return runOnboardingFlow(port);
+            }
+            await new Promise((r) => setTimeout(r, 2_000));
+            const again = await getJson<ChainStatusPayload>(port, '/internal/v1/init/chain/status');
+            if (again.json?.chainState === 'onboarding') {
+              return runOnboardingFlow(port);
+            }
+            console.log('[trilc:init] 自检完成但链路未推进 — 返回聊天。');
+            return { outcome: 'error', detail: 'chain did not advance after selfcheck' };
           }
         }
         console.log('[trilc:init] 自检轮询超时 — 返回聊天。');

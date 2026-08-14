@@ -370,3 +370,132 @@ test('anti-reentry: running 中再触发 → conflict + 同 runId；完成后复
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ── I2 A' 裁决（CTO 2026-08-14）：selfcheck 完成后自动推进 onboarding ──
+// 推进点 = executeSelfcheck 完成路径；summary ∈ {pass, degraded} 且链态
+// selfcheck → transitionTo('onboarding','daemon')；blocked 不推进；
+// 发布顺序 = selfcheck-finished 先、chain-changed 后。
+
+test("A': all-ok summary=pass → selfcheck→onboarding 自动转移 + 事件顺序", async () => {
+  const { dir, deps, events } = await newDeps();
+  try {
+    setMockFetch(allOkFetch(dir));
+    recordTaskSubmission();
+    await seedKeyCache(dir);
+    await deps.chain.transitionTo('selfcheck', 'daemon');
+
+    beginSelfcheck(deps);
+    await waitFor(() => !isSelfcheckRunning());
+
+    assert.equal(deps.chain.getState(), 'onboarding', 'pass → 自动推进 onboarding');
+    const finishedIdx = events.findIndex((e) => e.type === 'init:selfcheck-finished');
+    const changedIdx = events.findIndex(
+      (e) => e.type === 'init:chain-changed' && (e as { to?: string }).to === 'onboarding',
+    );
+    assert.ok(finishedIdx >= 0 && changedIdx > finishedIdx, 'selfcheck-finished 先于 chain-changed（入口先看自检结果）');
+    const changed = events.filter((e) => e.type === 'init:chain-changed') as Array<{ from?: string; to?: string }>;
+    assert.equal(changed[changed.length - 1].from, 'selfcheck');
+    assert.equal(changed[changed.length - 1].to, 'onboarding');
+  } finally {
+    restoreFetch();
+    stopKeyCache();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("A': degraded-only → 自动推进 onboarding", async () => {
+  const { dir, deps, events } = await newDeps();
+  try {
+    setMockFetch(async (url) => {
+      const u = String(url);
+      if (u.includes('/v1/config/keys')) return jsonRes(200, { keys: { deepseek: { api_key: 'k' } }, default_model: 'tmv-deepseek-v4-pro', refresh_interval_s: 900 });
+      if (u.includes('/healthz')) return jsonRes(200, { ok: true, service: 'trilc', uptime: 5 });
+      if (u.includes('127.0.0.1:3333/health')) return jsonRes(200, { ok: true });
+      if (u.includes('127.0.0.1:8008/v1/models')) throw new Error('ECONNREFUSED');
+      if (u.includes('/internal/v1/tasks/submit')) {
+        localBus.emit('event', { type: 'task:queued', taskId: 'sess_test' });
+        return jsonRes(201, { sessionId: 'sess_test' });
+      }
+      if (u.includes('/stream')) {
+        localBus.emit('event', { type: 'task:running', taskId: 'sess_test' });
+        localBus.emit('event', { type: 'task:succeeded', taskId: 'sess_test', result: { summary: 'ok' } });
+        return sseRes(SSE_OK);
+      }
+      return jsonRes(404, { error: 'unexpected ' + u });
+    });
+    recordTaskSubmission();
+    await seedKeyCache(dir);
+    await deps.chain.transitionTo('selfcheck', 'daemon');
+
+    beginSelfcheck(deps);
+    await waitFor(() => !isSelfcheckRunning());
+
+    assert.equal(deps.chain.getState(), 'onboarding', 'degraded → 自动推进');
+    assert.equal(deps.chain.getSnapshot().phaseDetail.selfcheck.summary, 'degraded');
+  } finally {
+    restoreFetch();
+    stopKeyCache();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("A': blocked → 不推进（诊断卡保留，重跑自检幂等）", async () => {
+  const { dir, deps, events } = await newDeps();
+  try {
+    setMockFetch(async (url) => {
+      const u = String(url);
+      if (u.includes('/v1/config/keys')) return jsonRes(401, { error: 'Unauthorized' });
+      if (u.includes('/healthz')) return jsonRes(200, { ok: true, service: 'trilc', uptime: 5 });
+      if (u.includes('127.0.0.1:3333/health')) return jsonRes(200, { ok: true });
+      if (u.includes('127.0.0.1:8008/v1/models')) return jsonRes(200, { data: [{ id: 'm' }] });
+      if (u.includes('/internal/v1/tasks/submit')) {
+        localBus.emit('event', { type: 'task:queued', taskId: 'sess_test' });
+        return jsonRes(201, { sessionId: 'sess_test' });
+      }
+      if (u.includes('/stream')) {
+        localBus.emit('event', { type: 'task:running', taskId: 'sess_test' });
+        localBus.emit('event', { type: 'task:succeeded', taskId: 'sess_test', result: { summary: 'ok' } });
+        return sseRes(SSE_OK);
+      }
+      return jsonRes(404, { error: 'unexpected ' + u });
+    });
+    recordTaskSubmission();
+    await seedKeyCache(dir);
+    await deps.chain.transitionTo('selfcheck', 'daemon');
+
+    beginSelfcheck(deps);
+    await waitFor(() => !isSelfcheckRunning());
+
+    assert.equal(deps.chain.getState(), 'selfcheck', 'blocked → 不推进');
+    const changed = events.filter((e) => e.type === 'init:chain-changed') as Array<{ to?: string }>;
+    assert.equal(changed.length, 1, '仅初始 uninitialized→selfcheck 一次转移');
+    assert.equal(changed[0].to, 'selfcheck');
+  } finally {
+    restoreFetch();
+    stopKeyCache();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("A': onboarding 态重跑自检 → 无转移无事件（守卫幂等）", async () => {
+  const { dir, deps, events } = await newDeps();
+  try {
+    setMockFetch(allOkFetch(dir));
+    recordTaskSubmission();
+    await seedKeyCache(dir);
+    await deps.chain.transitionTo('selfcheck', 'daemon');
+    await deps.chain.transitionTo('onboarding', 'daemon');
+    const changedBefore = events.filter((e) => e.type === 'init:chain-changed').length;
+
+    beginSelfcheck(deps);
+    await waitFor(() => !isSelfcheckRunning());
+
+    assert.equal(deps.chain.getState(), 'onboarding', '重跑不改链态');
+    const changedAfter = events.filter((e) => e.type === 'init:chain-changed').length;
+    assert.equal(changedAfter, changedBefore, '无新增 chain-changed（守卫生效）');
+  } finally {
+    restoreFetch();
+    stopKeyCache();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -116,6 +116,7 @@
 - summary 规则：任一 fail（blocked 级）→ blocked；仅 degraded → degraded；全 ok → pass。401/403/unauthorized = 认证失败族唯一 blocked 类（网络不可达 = degraded）。
 - 防重入：运行中再触发 → `{ conflict: true, runId }`（端点 409 同 runId）。
 - 事件族：`init:selfcheck-started/progress/finished`（均经 localbus publish 同通道）。
+- **I2 A' 裁决（CTO 2026-08-14）**：executeSelfcheck 完成路径加自动推进——summary ∈ {pass, degraded} 且链态 selfcheck → `transitionTo('onboarding', 'daemon')`；发布顺序 = selfcheck-finished 先、chain-changed 后（入口先看自检结果再切选择界面）；blocked 不推进（诊断卡保留，重跑幂等）；`getState()==='selfcheck'` 条件即幂等守卫（onboarding 态重跑无转移无事件）。
 
 ### I1 端点（`src/server/app.ts`）
 
@@ -130,7 +131,7 @@
 
 - **I2 新增**：`POST /internal/v1/init/assemble` 端点执行体（daemon 单执行体；两入口只发指令，零本地执行）。
 - 校验先行（400 族）：ceoName 必填（trim 1..64）、selections ≥1（A4 0 人拦截）、roleId 形状 + 岗位目录成员双校验（白名单逃逸直接拒绝）、去重、name 必填；阶段门禁 422 `{ chainState }`；防重入 409 `{ busy: true }`；<5 岗 warning 不拦截（CEO 裁决口径）。
-- 阶段门禁口径（候选 A，见 tree-op i2-2 checkpoint 记录）：onboarding 直接放行；selfcheck 且 summary ∈ {pass, degraded} → 提交段先补 selfcheck→onboarding 再装配；其余 422。
+- 阶段门禁口径（i2-1 §一.2 字面 + CTO A' 裁决 2026-08-14）：仅 `chainState === 'onboarding'` 放行，其余（uninitialized / selfcheck / project-link+）422 `{ chainState }`。selfcheck→onboarding 推进点在 init-selfcheck.ts executeSelfcheck 完成路径（见下节），不在本端点。
 - 预写段：白名单落点（`.claude/agents/<roleId>.md` / `docs/registry/company-state.json` / `docs/registry/business-state.md` / `AGENTS.md`）逐文件 tmp→rename + `.bak` 备份目录（`{dataDir}/company/assemble-bak/<runId>/`）；任一失败 → .bak 恢复 + 删新增文件 + 500 `{ rollback }`。
 - 提交段：`CompanyInitState.save({ state:'initialized', ... })` → `InitChain.transitionTo('project-link', entry)`（公司态先、链路态后；save 成功但 transition 失败不回滚文件，幂等重试路径承接）。
 - 幂等重试：公司态已 initialized 且链路态仍 onboarding/selfcheck → 跳过文件段与 state save，校验员工一致（不一致 409 `employees_mismatch`）后补 transition。
@@ -171,9 +172,9 @@
 
 ### 测试与冒烟
 
-- 单测：init-chain（load 三件套 + 既有 8）/ init-selfcheck（detail 实际错误串断言更新）/ init-assemble 15 用例（校验矩阵、逃逸拒绝、422/409 门禁、回滚注入、幂等重试、事件帧一致、preserved、selfcheck 入口、progress roundtrip、init 模式矩阵）/ contract-resolver（getRoleCatalog 2 用例）/ tasks-submit-weekly-hint（init 模式路由 1 用例）。
-- 全量基线：336/337（1 fail = test/tui/components.test.ts ink-testing-library 环境缺口，r19 基线既有非本树引入）。
-- 活体冒烟：TRILC_DATA_DIR 显式隔离实例 8726 全链 PASS（自检 202 → 五探测 → assemble 200 advancedFromSelfcheck → 工作区白名单产物 → 重入 422 → SSE 事件族 → init 模式会话 bootstrap → 8711 全程未扰动）。
+- 单测：init-chain（load 三件套 + 既有 8）/ init-selfcheck（detail 实际错误串断言更新 + A' 自动推进四用例：pass 转移 / degraded 转移 / blocked 不转移 / onboarding 重跑无转移）/ init-assemble 14 用例（校验矩阵、逃逸拒绝、422/409 门禁、回滚注入、幂等重试、事件帧一致、preserved、progress roundtrip、init 模式矩阵）/ contract-resolver（getRoleCatalog 2 用例）/ tasks-submit-weekly-hint（init 模式路由 1 用例）。
+- 全量基线：340/341（1 fail = test/tui/components.test.ts ink-testing-library 环境缺口，r19 基线既有非本树引入）。
+- 活体冒烟：TRILC_DATA_DIR 显式隔离实例 8726（候选 A 轮）+ 8727（A' 轮）全链 PASS。A' 轮实证：selfcheck 完成（degraded）→ 链态自动 onboarding（chain-changed from=selfcheck to=onboarding sourceEntry=daemon，SSE 序 selfcheck-finished 先于 chain-changed）→ assemble 200（响应与 §一.5 契约字面一致，无 advancedFromSelfcheck）→ 工作区白名单 8 产物 → 重入 422 → 8711 全程未扰动。
 
 ## Sources
 

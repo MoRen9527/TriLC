@@ -7,11 +7,12 @@
 // 零本地执行契约（W30 沿用）：装配动作只在 daemon 端点内发生；TriPilot /
 // trilc chat 两入口只发指令（本端点载荷），不写文件、不执行装配。
 //
-// 阶段门禁口径（i2-1 §一.2 + 候选 A）：
-//   - chainState === 'onboarding' → 直接放行；
-//   - chainState === 'selfcheck' 且自检已完结（summary ∈ {pass, degraded}）
-//     → 提交段先补 selfcheck→onboarding 转移再装配（两入口流程自洽）；
-//   - 其余（uninitialized / selfcheck 未完成或 blocked / project-link+）→ 422。
+// 阶段门禁口径（i2-1 §一.2 字面 + CTO A' 裁决 2026-08-14）：
+//   - chainState === 'onboarding' → 放行；
+//   - 其余（uninitialized / selfcheck / project-link+）→ 422 { chainState }。
+// selfcheck→onboarding 的推进点不在本模块：init-selfcheck.ts executeSelfcheck
+// 完成路径（summary ∈ {pass, degraded} 且链态 selfcheck）自动 transitionTo——
+// 装配端点只受理 onboarding，UI 与状态机真源无错位窗口（i1-1 §三）。
 //
 // 幂等重试（i2-1 §一.4）：公司态 save 成功但 transition 失败 → 不回滚文件；
 // 重入时公司态已 initialized 且链路态仍 onboarding → 跳过文件段与 state save，
@@ -70,7 +71,6 @@ export type AssembleResult =
       employees: CompanyEmployee[];
       /** 既有真实内容未覆盖的文件（白名单内、缺失才写的占位类产物）。 */
       preserved: string[];
-      advancedFromSelfcheck: boolean;
       warning?: { recommendedMin: number; current: number };
     }
   | { status: 409; busy: true }
@@ -404,9 +404,8 @@ export async function runAssemble(deps: AssembleDeps, req: AssembleRequest): Pro
 async function doAssemble(deps: AssembleDeps, req: AssembleRequest): Promise<AssembleResult> {
   const chainFrame = await deps.chain.load();
   const state = chainFrame.chainState;
-  const selfcheckSummary = chainFrame.phaseDetail.selfcheck.summary;
-  const fromSelfcheck = state === 'selfcheck' && (selfcheckSummary === 'pass' || selfcheckSummary === 'degraded');
-  if (state !== 'onboarding' && !fromSelfcheck) {
+  // A' 裁决后门禁回字面：仅 onboarding 放行（推进点 = selfcheck 完成路径）
+  if (state !== 'onboarding') {
     return { status: 422, chainState: state };
   }
 
@@ -426,10 +425,6 @@ async function doAssemble(deps: AssembleDeps, req: AssembleRequest): Promise<Ass
     }
     try {
       if (deps.failOnTransition) throw new Error('injected transition failure (retry path)');
-      // 前次可能在 selfcheck→onboarding 转移前即失败：重试补全缺的转移步
-      if (deps.chain.getState() === 'selfcheck') {
-        await deps.chain.transitionTo('onboarding', req.entry);
-      }
       await deps.chain.transitionTo('project-link', req.entry);
     } catch (err) {
       publishStepEvent(deps, 'assemble-failed', req.entry, { error: (err as Error).message });
@@ -443,7 +438,6 @@ async function doAssemble(deps: AssembleDeps, req: AssembleRequest): Promise<Ass
       companyState: 'initialized',
       employees,
       preserved: [],
-      advancedFromSelfcheck: false,
       ...(employees.length < 5 ? { warning: { recommendedMin: 5, current: employees.length } } : {}),
     };
   }
@@ -473,9 +467,6 @@ async function doAssemble(deps: AssembleDeps, req: AssembleRequest): Promise<Ass
   try {
     await deps.companyState.save({ state: 'initialized', ceoName, employees });
     if (deps.failOnTransition) throw new Error('injected transition failure');
-    if (fromSelfcheck) {
-      await deps.chain.transitionTo('onboarding', req.entry);
-    }
     await deps.chain.transitionTo('project-link', req.entry);
   } catch (err) {
     publishStepEvent(deps, 'assemble-failed', req.entry, { error: (err as Error).message });
@@ -497,7 +488,6 @@ async function doAssemble(deps: AssembleDeps, req: AssembleRequest): Promise<Ass
     companyState: 'initialized',
     employees,
     preserved: targets.filter((t) => t.preserved).map((t) => t.relPath),
-    advancedFromSelfcheck: fromSelfcheck,
     ...(employees.length < 5 ? { warning: { recommendedMin: 5, current: employees.length } } : {}),
   };
 }
