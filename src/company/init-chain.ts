@@ -309,6 +309,70 @@ export class InitChain {
     return frame;
   }
 
+  /**
+   * project-link 阶段快照回写（I3 link/claim 成功路径调用；非状态转移，不发
+   * chain-changed）。phaseDetail 只存显示快照；写真源（注册点 worktrees）归
+   * project-registry。护栏例外允许：init-chain.ts 仅此方法为 I3 增量。
+   */
+  async updateProjectLink(patch: Partial<ProjectLinkPhase>): Promise<InitChainFile> {
+    const current = this.cache ?? (await this.load());
+    const now = new Date().toISOString();
+    const frame: InitChainFile = {
+      ...current,
+      phaseDetail: {
+        ...current.phaseDetail,
+        'project-link': { ...current.phaseDetail['project-link'], ...patch },
+      },
+      lastUpdatedAt: now,
+      eventSeq: current.eventSeq + 1,
+    };
+    await this.persist(frame);
+    return frame;
+  }
+
+  /**
+   * sync 阶段快照回写（I4 sync/run 成功路径调用；非状态转移，不发
+   * chain-changed）。phaseDetail 只存指针快照；写真源（bundle 文件）归
+   * 项目仓 docs/registry/init-sync/。护栏例外允许：init-chain.ts 仅此方法
+   * 与 updateConfirm 为 I4 增量（SyncPhase/ConfirmPhase 字段已预留，零
+   * schema 字段新增——门禁 2 同规）。
+   */
+  async updateSync(patch: Partial<SyncPhase>): Promise<InitChainFile> {
+    const current = this.cache ?? (await this.load());
+    const now = new Date().toISOString();
+    const frame: InitChainFile = {
+      ...current,
+      phaseDetail: {
+        ...current.phaseDetail,
+        sync: { ...current.phaseDetail.sync, ...patch },
+      },
+      lastUpdatedAt: now,
+      eventSeq: current.eventSeq + 1,
+    };
+    await this.persist(frame);
+    return frame;
+  }
+
+  /**
+   * confirm 阶段快照回写（Phase D 确认卡使用；非状态转移，不发
+   * chain-changed）。零 schema 字段新增（ConfirmPhase 已预留）。
+   */
+  async updateConfirm(patch: Partial<ConfirmPhase>): Promise<InitChainFile> {
+    const current = this.cache ?? (await this.load());
+    const now = new Date().toISOString();
+    const frame: InitChainFile = {
+      ...current,
+      phaseDetail: {
+        ...current.phaseDetail,
+        confirm: { ...current.phaseDetail.confirm, ...patch },
+      },
+      lastUpdatedAt: now,
+      eventSeq: current.eventSeq + 1,
+    };
+    await this.persist(frame);
+    return frame;
+  }
+
   /** status 端点载荷（i1-1 §四契约字段：两入口只读投影 + 诊断卡数据源）。 */
   toStatusPayload(): {
     schemaVersion: 1;

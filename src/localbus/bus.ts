@@ -30,6 +30,17 @@ export type LocalBusEvent =
   | { type: 'init:selfcheck-started'; runId: string; checks: string[] }
   | { type: 'init:selfcheck-progress'; runId: string; checkId: string; status: string; detail: string }
   | { type: 'init:selfcheck-finished'; runId: string; summary: string; report: unknown }
+  // ── Init project-link 事件族（I3: init-collab-i3-project-registry）──
+  // 事件流 = 状态文件/注册点同帧投影；project-link→sync 转移不发布（归 I4）。
+  | { type: 'init:project-link-started'; runId: string; source: string; targetPath: string }
+  | { type: 'init:project-link-progress'; runId: string; step: string; status: string; detail: string }
+  | { type: 'init:project-link-finished'; runId: string; projectKey: string; worktreePath: string; branch: string; chainState: string; phaseDetail: unknown }
+  // ── Init sync 事件族（I4: init-collab-i4-five-dim-sync）──
+  // 逐维三态（未同步/同步中/已同步）+ 结果投影；经既有 init/events SSE 通道。
+  | { type: 'init:sync-started'; runId: string; entry: unknown; chainState: string }
+  | { type: 'init:sync-progress'; runId: string; dim: string; status: string; detail: string }
+  | { type: 'init:sync-finished'; runId: string; bundleId: string; generatedAt: string; chainState: string; phaseDetail: unknown; dims: unknown; rePushedOnly: boolean }
+  | { type: 'init:sync-failed'; runId: string; error: string; classification: string; message: string; retryable: boolean }
   | { type: 'init:step-event'; phase: string; step: string; entry: unknown; payload: unknown };
 
 // Singleton shared by daemon, planner, and event-queue

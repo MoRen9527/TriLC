@@ -72,6 +72,23 @@ import {
   buildInitModeSystemPrompt,
   type AssembleDeps,
 } from '../company/init-assemble.js';
+import { ProjectRegistry } from '../project/project-registry.js';
+import {
+  runLink,
+  runClaim,
+  inspectPath,
+  validateLinkPayload,
+  validateClaimPayload,
+  createGitRunner,
+  type ProjectLinkDeps,
+} from '../project/project-link.js';
+import {
+  runInitSync,
+  getSyncStatus,
+  runStartupResyncCheck,
+  type InitSyncDeps,
+  type SyncEntry,
+} from '../company/init-sync.js';
 import { createSessionReaper } from '../cron/session-reaper.js';
 import { createMinimalCronEngine, type MinimalCronEngine } from '../cron/service.js';
 import { createUpdateCheckHandler, startUpdateCheckLoop } from '../update/update-check.js';
@@ -730,6 +747,41 @@ export function createTriLCApp(env: TriLCEnv) {
     },
   };
 
+  // ── 项目面执行体（I3：注册点 + link/claim/inspect；daemon 单执行体，
+  // git 单身份）── 注册点固定路径 %LOCALAPPDATA%\trilc\project-registry.json
+  // （不随 TRILC_DATA_DIR 覆盖；TRILC_PROJECT_REGISTRY 仅测试隔离）。
+  const projectRegistry = new ProjectRegistry();
+  const projectLinkDeps: ProjectLinkDeps = {
+    registry: projectRegistry,
+    chain: initChain,
+    publish,
+    git: createGitRunner(),
+  };
+
+  // ── 五维同步执行体（I4：sync/run 生成/commit/push 链；daemon 单执行体，
+  // git 固定身份 D2）── 两入口只发指令，零本地执行。
+  const initSyncDeps: InitSyncDeps = {
+    dataDir: env.dataDir,
+    chain: initChain,
+    companyState: companyInitState,
+    registry: projectRegistry,
+    publish,
+    trimcBaseUrl: env.trimcBaseUrl,
+    trilcVersion: env.version,
+    nodeId: env.nodeId,
+    tricompanySourcePath: env.tricompanySourcePath,
+    git: createGitRunner(),
+    getKeyCache: () => getKeyCache(),
+    fetchModels: () => getAvailableModels(),
+    getRoleCatalog: () => {
+      try {
+        return getContractResolver().getRoleCatalog();
+      } catch {
+        return null; // resolver 未初始化 → employees 维 roleId 校验跳过
+      }
+    },
+  };
+
   // ── Notifications (REQ-021) ──
   // In-memory + persisted to {dataDir}/notifications.json for client pulls.
   const noticeFile = join(env.dataDir, 'notifications.json');
@@ -1171,6 +1223,134 @@ export function createTriLCApp(env: TriLCEnv) {
           } catch (err) {
             res.writeHead(500, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ error: 'progress_save_failed', message: (err as Error).message }));
+          }
+          return;
+        }
+
+        // ── POST /internal/v1/projects/link ──
+        // I3（init-collab-i3-project-registry）：项目链路建立端点（六步原子序
+        // 同一请求完成：检测→白名单关联→门禁→认领/建立→登记去重→链态快照+
+        // 内存态热更新；失败分类 + 回滚）。链态门：仅 chainState=project-link
+        // 生效，其他 409 { chainState }。进度经 init:project-link-* SSE 事件族
+        // （/internal/v1/init/events 同通道）。
+        if (req.url === '/internal/v1/projects/link' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: unknown = null;
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+            return;
+          }
+          const v = validateLinkPayload(body);
+          if (!v.ok) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: v.error, message: v.message }));
+            return;
+          }
+          const result = await runLink(projectLinkDeps, v.request);
+          res.writeHead(result.status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(result));
+          return;
+        }
+
+        // ── POST /internal/v1/projects/claim ──
+        // I3：打开文件夹认领路径（§4a 同构 + 认领登记；零 git/项目磁盘写）。
+        // 链态门同 link：仅 project-link 生效。
+        if (req.url === '/internal/v1/projects/claim' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: unknown = null;
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+            return;
+          }
+          const v = validateClaimPayload(body);
+          if (!v.ok) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: v.error, message: v.message }));
+            return;
+          }
+          const result = await runClaim(projectLinkDeps, v.path);
+          res.writeHead(result.status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(result));
+          return;
+        }
+
+        // ── GET /internal/v1/projects/inspect?path= ──
+        // I3：识别分流判定接口（design-v2 §2.5，两入口渲染共用；只读，不受
+        // 链态门限制）。判定：受管 worktree / 项目仓普通克隆 / 未关联。
+        if (req.url?.startsWith('/internal/v1/projects/inspect') && req.method === 'GET') {
+          try {
+            const url = new URL(req.url, 'http://127.0.0.1');
+            const pathParam = url.searchParams.get('path');
+            if (!pathParam) {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'bad_request', message: 'path query param is required' }));
+              return;
+            }
+            const result = await inspectPath(projectLinkDeps, pathParam);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'inspect_failed', message: (err as Error).message }));
+          }
+          return;
+        }
+
+        // ── POST /internal/v1/init/sync/run ──
+        // I4（init-collab-i4-five-dim-sync）：五维同步执行（daemon 单执行体；
+        // 两入口只发指令）。链态门 project-link/sync + 防重入 409 + 五维
+        // 收集单维降级 + 幂等重跑 + 固定身份 commit + 双远端 push。
+        // 进度经 init:sync-* 事件族（/internal/v1/init/events 同通道）。
+        if (req.url === '/internal/v1/init/sync/run' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: Record<string, unknown> = {};
+          if (raw.trim()) {
+            try {
+              body = JSON.parse(raw) as Record<string, unknown>;
+            } catch {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+              return;
+            }
+          }
+          const entryRaw = body.entry;
+          const entry: SyncEntry =
+            entryRaw === 'tripilot' || entryRaw === 'trilc-chat' ? entryRaw : 'daemon';
+          const result = await runInitSync(initSyncDeps, entry);
+          res.writeHead(result.status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(result));
+          return;
+        }
+
+        // ── GET /internal/v1/init/sync/status ──
+        // I4：五维同步状态投影（两入口渲染 + 诊断卡数据源）。remote = 拉取
+        // TriMC config/sync/status（超时 3s 降级 null，§6.8 降级口径）。
+        if (req.url === '/internal/v1/init/sync/status' && req.method === 'GET') {
+          try {
+            const payload = await getSyncStatus(initSyncDeps);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(payload));
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'sync_status_unavailable', message: (err as Error).message }));
           }
           return;
         }
@@ -3057,6 +3237,11 @@ export function createTriLCApp(env: TriLCEnv) {
       } catch (err) {
         console.warn('[trilc:init] init chain load failed:', (err as Error).message);
       }
+
+      // ── I4：daemon 重启 re-sync 检查（§6.6 尾部，只读 no-op）──
+      // 链态 sync/confirm → 读本地 bundle + 调一次 sync/status（远程不可达
+      // 静默）；不自动 push、不自动生成（启动期零写面）。
+      void runStartupResyncCheck(initSyncDeps);
 
       await new Promise<void>((resolve, reject) => {
         server!.on('error', reject);

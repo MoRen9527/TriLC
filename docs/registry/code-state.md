@@ -176,6 +176,38 @@
 - 全量基线：340/341（1 fail = test/tui/components.test.ts ink-testing-library 环境缺口，r19 基线既有非本树引入）。
 - 活体冒烟：TRILC_DATA_DIR 显式隔离实例 8726（候选 A 轮）+ 8727（A' 轮）全链 PASS。A' 轮实证：selfcheck 完成（degraded）→ 链态自动 onboarding（chain-changed from=selfcheck to=onboarding sourceEntry=daemon，SSE 序 selfcheck-finished 先于 chain-changed）→ assemble 200（响应与 §一.5 契约字面一致，无 advancedFromSelfcheck）→ 工作区白名单 8 产物 → 重入 422 → 8711 全程未扰动。
 
+## 五维同步 + 协同确认（W33，init-collab I4 — 本树，commit 见 tree-op i4-2 checkpoint）
+
+### bundle 契约（`src/company/sync-bundle.ts`，纯函数可单测）
+
+- **I4 新增（init-collab-i4-five-dim-sync）**：五维 bundle schema 契约（TriMC 接收侧 `src/config-sync/types.ts` 独立实现同一契约，跨仓共享包升级挂后续）。
+- 密钥纪律（SEC-20260813-001）：递归拒绝 `api_key`/`apiKey`/`secret`/`token` 字段（任意深度、非空字符串值）；keys 维白名单 `provider`/`ready`/`fingerprint`/`baseUrl`（额外字段拒绝）；指纹 = SHA-256(材料).slice(0,8)（内存内计算即刻丢弃）；contentHash = 五维语义哈希（不含 bundleId/generatedAt/generatedBy 元字段——元字段每次生成必然不同，纳入会使幂等重跑判定恒失效）；generatedAt 单调 = max(now, 现存 + 1ms)。
+- 测试门禁：构造含 `api_key: "sk-..."` 载荷 → 校验抛错；`assertNoSecretMaterial` 序列化全文断言（无 sk- 明文、无密钥字段名）。
+- Phase D 契约冻结：L1-L4 确认卡类型（ConfirmCheckPayload/ConfirmResult，§六）——实现待 I3 收官解锁信号。
+
+### 同步执行体（`src/company/init-sync.ts`）
+
+- `POST /internal/v1/init/sync/run` 执行体（daemon 单执行体；两入口只发指令）：链态门 `{project-link, sync}` 否则 409；project-link+linked → 先 `transitionTo('sync')`；防重入 409 busy。
+- 五维收集单维降级：company（无公司态 = 400 硬错误提示先开张）/ project（注册点主检出缺失 = 400；dev HEAD 读失败 = 422）为硬错误；model / keys / employees 失败 → 维段 `{status:'unavailable',reason}` 不阻塞全链。
+- 幂等：本地文件已存在且五维语义 hash 未变 → 不重新生成、不换 bundleId（重跑 = 纯重推，`diff --cached --quiet` 无变更跳过 commit）。
+- 写 + commit + push：原子写（tmp→rename）→ `git add docs/registry/init-sync/sync-config.json` → 固定身份 commit（`-c user.name="TriLC Init Sync" -c user.email="trilc@tri.company"`，D2）→ 双远端 push origin/sg-server dev；任一 push 失败 = 失败分类 + `phaseDetail.sync.status='failed'` 挂起（链态留 sync，重跑即重推）。
+- 成功路径：`updateSync({status:'pushed',bundleId})` 快照 → `transitionTo('confirm')`（D1：转移门槛 = pushed）→ 事件族 `init:sync-started/progress（逐维三态）/finished/failed` + `init:step-event {phase:'sync',step:'pushed'}`（经既有 /internal/v1/init/events SSE，零新通道）。
+- `GET /internal/v1/init/sync/status`：chainState + phaseDetail.sync + 本地 bundle 摘要 + remote（拉取 TriMC config/sync/status，超时 3s 降级 null）。
+- daemon 重启 re-sync 检查（§6.6 尾部）：链态 sync/confirm → 读本地 bundle + 调一次 sync/status（远程不可达静默）；只读 no-op，不自动 push/生成。
+- init-chain.ts 增量：`updateSync`/`updateConfirm` 快照方法（SyncPhase/ConfirmPhase 字段已预留，零 schema 字段新增——门禁 2 同规）。
+
+### I4 端点增量（`src/server/app.ts`）+ 入口渲染
+
+- `POST /internal/v1/init/sync/run`（链态门 + 防重入 + 400/409/422/500 分类）+ `GET /internal/v1/init/sync/status`；启动 re-sync 检查挂 start()（只读）。
+- localbus 事件族增 `init:sync-*` 四型（bus.ts）。
+- trilc chat 文本流程（`init-cli-flow.ts`）：SYNC 阶段状态呈现 + 触发问答 + 五维结果行 + applied 收敛轮询（≤90s）；零本地执行（只渲染 + 发 daemon 端点指令）。
+- TriPilot 初始化阶段卡（`TriPilot/src/extension.ts` + `media/main.js`）：syncStatus 数据面（sync/status 直通）+ initSyncRun 指令面（POST sync/run entry=tripilot）+ 逐维三态 live 行（init:sync-progress 事件驱动）+ applied 收敛徽标；零本地执行。
+
+### 测试与基线
+
+- 单测：sync-bundle 12 用例（校验矩阵/白名单/指纹/单调性/泄漏扫描）+ init-sync 16 用例（链态门 409/防重入 409/公司态 400/项目 400/422/五维降级矩阵/幂等重跑同 bundleId/内容变化新 bundleId/push 失败分类/事件序/git 固定身份/双远端/序列化无 sk-/status remote 降级/启动 re-sync 只读）。
+- 全量基线：398/399（1 fail = test/tui/components.test.ts 环境缺口既有，基线 340/341 口径不退化；+58 含 i3-2 同批）。
+
 ## Sources
 
 - `../../src/runtime/`

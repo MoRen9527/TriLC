@@ -9,6 +9,8 @@
 //
 // 员工 --agent 会话路径不动：cmdChat 仅在非 agent 模式调用本流程。
 
+import { resolve } from 'node:path';
+
 interface ChainStatusPayload {
   schemaVersion?: number;
   chainState: string;
@@ -45,6 +47,41 @@ interface OnboardingStatePayload {
   selectedRoles: string[];
   employeeNames: Record<string, string>;
   updatedAt?: string;
+}
+
+interface InspectPayload {
+  kind: 'managed-worktree' | 'project-clone' | 'unlinked';
+  projectKey?: string;
+  branch?: string;
+  worktree: boolean;
+}
+
+interface SyncStatusPayload {
+  chainState: string;
+  phaseDetail?: { status: string; bundleId: string | null };
+  localBundleId: string | null;
+  localBundleGeneratedAt: string | null;
+  remote: {
+    reachable: boolean;
+    appliedBundleId: string | null;
+    appliedGeneratedAt: string | null;
+    fleetHead: { branch: string; commit: string } | null;
+    dims: Record<string, string> | null;
+  } | null;
+}
+
+interface SyncRunPayload {
+  status: number;
+  bundleId?: string;
+  generatedAt?: string;
+  chainState?: string;
+  dims?: Record<string, 'synced' | 'unavailable'>;
+  rePushedOnly?: boolean;
+  busy?: boolean;
+  error?: string;
+  classification?: string;
+  message?: string;
+  retryable?: boolean;
 }
 
 export interface InitCliFlowResult {
@@ -240,12 +277,207 @@ async function runOnboardingFlow(port: number): Promise<InitCliFlowResult> {
   return { outcome: 'error', detail: `assemble ${assembleRes.status}` };
 }
 
+// ── project-link 流程（I3 增量：inspect 呈现 → 源选择问答 → POST link 收结果；
+// 零本地执行——不写文件、不执行 git，只渲染 + 发 daemon 端点指令）──
+
+async function runProjectLinkFlow(port: number): Promise<InitCliFlowResult> {
+  const cwd = process.cwd();
+  console.log(`[trilc:init] 当前目录：${cwd}`);
+
+  // inspect 呈现（识别分流：受管 worktree / 项目仓普通克隆 / 未关联）
+  const inspectRes = await getJson<InspectPayload>(
+    port,
+    `/internal/v1/projects/inspect?path=${encodeURIComponent(cwd)}`,
+  );
+  if (inspectRes.status !== 200 || !inspectRes.json) {
+    return { outcome: 'error', detail: `inspect 不可用（http ${inspectRes.status}）— daemon 项目面端点未就绪` };
+  }
+  const insp = inspectRes.json;
+
+  if (insp.kind === 'managed-worktree') {
+    console.log(`[trilc:init] 当前目录已是受管 worktree（${insp.projectKey} / ${insp.branch}）— 认领登记即可。`);
+    const claimRes = await postJson(port, '/internal/v1/projects/claim', { path: cwd });
+    if (claimRes.status === 200) {
+      console.log(`[trilc:init] 认领完成：${claimRes.json?.projectKey} / ${claimRes.json?.branch} — PROJECT-LINK 已 linked。`);
+      return { outcome: 'skipped', detail: 'project-link linked (claim)' };
+    }
+    console.log(`[trilc:init] 认领失败（http ${claimRes.status}）：${claimRes.json?.message ?? claimRes.json?.error ?? 'unknown'}`);
+    return { outcome: 'error', detail: `claim ${claimRes.status}` };
+  }
+  if (insp.kind === 'project-clone') {
+    console.log(
+      `[trilc:init] 当前目录是项目仓普通克隆（${insp.projectKey}，分支 ${insp.branch}）— 非受管形态；\n` +
+        '  升级引导：以本目录为主检出（local 源）建立受管 worktree，或走 GitHub 源重链。',
+    );
+  } else {
+    console.log('[trilc:init] 当前目录未关联项目仓（轻提示）— 可走以下两种源建立项目链路。');
+  }
+
+  // 源选择问答
+  console.log('\n[trilc:init] 项目源选择：');
+  console.log('  [1] 本地源：已有主检出（localPath），在其外建立 worktree');
+  console.log('  [2] GitHub 源：白名单校验后克隆建主检出（git 系统凭据管理器）');
+  console.log('  [3] 认领指定路径（已是受管 worktree 的目录）');
+  const choice = await ask('输入编号（其他键跳过进入聊天）> ');
+  if (choice === '1' || choice === '2') {
+    const isLocal = choice === '1';
+    let targetPath = '';
+    const payload: Record<string, unknown> = { source: isLocal ? 'local' : 'github', entry: 'trilc-chat' };
+    if (isLocal) {
+      const localPath = await ask('主检出路径（如 D:/Code/ai/TriMetaverse）> ');
+      if (!localPath) return { outcome: 'error', detail: 'localPath required' };
+      payload.localPath = resolve(localPath.trim());
+      targetPath = await ask('worktree 落点（空目录或不存在；不落主检出检出内）> ');
+      if (!targetPath) return { outcome: 'error', detail: 'targetPath required' };
+      payload.targetPath = resolve(targetPath.trim());
+    } else {
+      const repoUrl = await ask('仓库 URL（白名单校验；https/ssh 均可）> ');
+      if (!repoUrl) return { outcome: 'error', detail: 'repoUrl required' };
+      payload.repoUrl = repoUrl.trim();
+      const cloneTarget = await ask('克隆主检出落点（回车 = ~/trilc-projects/<key>）> ');
+      if (cloneTarget.trim()) payload.targetPath = resolve(cloneTarget.trim());
+    }
+    console.log(`[trilc:init] 提交 link（${isLocal ? 'local' : 'github'} 源）— daemon 端点执行（git 单身份），进度经 init:project-link-* 事件族…`);
+    const linkRes = await postJson(port, '/internal/v1/projects/link', payload);
+    if (linkRes.status === 200) {
+      const r = linkRes.json;
+      console.log(`[trilc:init] 项目链路建立完成：${r.projectKey} / ${r.branch}`);
+      console.log(`  worktree 落点：${r.worktreePath}`);
+      console.log('  PROJECT-LINK 已 linked — 请在 TriPilot 打开该 worktree 目录继续（同步阶段归后续流程）。');
+      return { outcome: 'skipped', detail: 'project-link linked' };
+    }
+    if (linkRes.status === 409 && linkRes.json?.chainState) {
+      console.log(`[trilc:init] 当前链路状态不允许 project-link（${linkRes.json?.chainState}）— 请先完成前置阶段。`);
+      return { outcome: 'error', detail: `link 409: ${linkRes.json?.chainState}` };
+    }
+    if (linkRes.status === 409 && linkRes.json?.busy) {
+      console.log('[trilc:init] 链路执行中（单执行体互斥）— 稍后重试。');
+      return { outcome: 'error', detail: 'link busy' };
+    }
+    console.log(
+      `[trilc:init] link 失败（http ${linkRes.status}，分类=${linkRes.json?.classification ?? 'unknown'}）：` +
+        `${linkRes.json?.message ?? linkRes.json?.error ?? 'unknown'}${linkRes.json?.rollback ? `（回滚=${linkRes.json?.rollback}）` : ''}`,
+    );
+    return { outcome: 'error', detail: `link ${linkRes.status}: ${linkRes.json?.classification ?? ''}` };
+  }
+  if (choice === '3') {
+    const claimPath = await ask('要认领的目录路径（已是受管 worktree）> ');
+    if (!claimPath.trim()) return { outcome: 'error', detail: 'path required' };
+    const claimRes = await postJson(port, '/internal/v1/projects/claim', { path: resolve(claimPath.trim()) });
+    if (claimRes.status === 200) {
+      console.log(`[trilc:init] 认领完成：${claimRes.json?.projectKey} / ${claimRes.json?.branch} — PROJECT-LINK 已 linked。`);
+      return { outcome: 'skipped', detail: 'project-link linked (claim)' };
+    }
+    console.log(`[trilc:init] 认领失败（http ${claimRes.status}）：${claimRes.json?.message ?? claimRes.json?.error ?? 'unknown'}`);
+    return { outcome: 'error', detail: `claim ${claimRes.status}` };
+  }
+  return { outcome: 'skipped', detail: 'project-link flow skipped' };
+}
+
+// ── sync 流程（I4 增量：五维同步状态呈现 + 触发问答 + applied 收敛轮询；
+// 零本地执行——不写文件、不执行 git、不生成 bundle，只渲染 + 发 daemon
+// 端点指令）──
+
+const SYNC_DIM_LABELS: Record<string, string> = {
+  company: '公司',
+  model: '模型',
+  keys: '密钥（仅指纹）',
+  employees: '员工',
+  project: '项目',
+};
+
+function renderSyncStatus(status: SyncStatusPayload): string {
+  const lines: string[] = [];
+  const phase = status.phaseDetail?.status ?? 'pending';
+  const local = status.localBundleId ? status.localBundleId.slice(0, 8) : null;
+  lines.push(`  链态：${status.chainState}（sync=${phase}${local ? `，bundle=${local}` : ''}）`);
+  if (status.remote) {
+    const applied = status.remote.appliedBundleId ? status.remote.appliedBundleId.slice(0, 8) : null;
+    const head = status.remote.fleetHead?.commit.slice(0, 8) ?? '?';
+    lines.push(
+      `  服务器面：${status.remote.reachable ? '可达' : '不可达'}${applied ? `，已应用 bundle=${applied}` : '，未应用'}` +
+        `（fleetHead=${head}）`,
+    );
+  } else {
+    lines.push('  服务器面：不可达（同步仍可推送，applied 收敛由 fleet 每 15min 拉取）');
+  }
+  return lines.join('\n');
+}
+
+async function runSyncFlow(port: number): Promise<InitCliFlowResult> {
+  // 状态呈现（诊断数据源 = daemon sync/status）
+  const statusRes = await getJson<SyncStatusPayload>(port, '/internal/v1/init/sync/status');
+  if (statusRes.status !== 200 || !statusRes.json) {
+    return { outcome: 'error', detail: `sync/status 不可用（http ${statusRes.status}）— daemon 同步端点未就绪` };
+  }
+  console.log(renderSyncStatus(statusRes.json));
+
+  const trigger = await ask('输入 s 触发五维同步（其他键跳过进入聊天）> ');
+  if (trigger.toLowerCase() !== 's') {
+    return { outcome: 'skipped', detail: 'sync not triggered（面板常驻「待补」入口，随时可重跑 sync/run）' };
+  }
+
+  console.log('[trilc:init] 提交同步（entry=trilc-chat）— daemon 端点执行（git 固定身份 + 双远端 push），进度经 init:sync-* 事件族…');
+  const runRes = await postJson(port, '/internal/v1/init/sync/run', { entry: 'trilc-chat' });
+  const body = runRes.json as SyncRunPayload | null;
+  if (runRes.status === 200 && body) {
+    console.log('\n[trilc:init] 五维同步完成（bundle 已生成 + 已推送）：');
+    const dims = body.dims ?? {};
+    for (const dim of ['company', 'model', 'keys', 'employees', 'project']) {
+      const state = dims[dim] ?? 'synced';
+      const mark = state === 'unavailable' ? '[降级]' : '[OK]';
+      console.log(`  ${mark} ${SYNC_DIM_LABELS[dim] ?? dim}：${state}`);
+    }
+    console.log(`  bundleId：${body.bundleId?.slice(0, 8)}…（${body.rePushedOnly ? '内容未变，纯重推' : '新生成'}）`);
+    // applied 收敛轮询（fleet 每 15min apply；同步提交即探针，无需额外文件）
+    console.log('[trilc:init] 等待服务器 applied 收敛（每 5s 轮询，最多 90s）…');
+    let waited = 0;
+    while (waited < 90_000) {
+      await new Promise((r) => setTimeout(r, 5_000));
+      waited += 5_000;
+      const poll = await getJson<SyncStatusPayload>(port, '/internal/v1/init/sync/status');
+      const remote = poll.json?.remote;
+      if (remote?.reachable && remote.appliedBundleId && poll.json?.localBundleId === remote.appliedBundleId) {
+        console.log('[trilc:init] 服务器已应用同 bundleId — SYNC 全链闭环（协同确认卡可继续）。');
+        return { outcome: 'skipped', detail: 'sync applied' };
+      }
+      if (poll.json?.chainState === 'confirm') continue; // 已转移 confirm，继续等 applied
+    }
+    console.log('[trilc:init] 已推送待应用（fleet 每 15min 拉取收敛；稍后在确认卡查看）。');
+    return { outcome: 'skipped', detail: 'sync pushed, applied pending' };
+  }
+  if (runRes.status === 409 && body?.busy) {
+    console.log('[trilc:init] 同步进行中（单执行体互斥）— 稍后重试同一入口。');
+    return { outcome: 'error', detail: 'sync busy' };
+  }
+  if (runRes.status === 409 && body?.chainState) {
+    console.log(`[trilc:init] 当前链路状态不允许同步（${body.chainState}）— 请先完成前置阶段。`);
+    return { outcome: 'error', detail: `sync 409: ${body.chainState}` };
+  }
+  if (body?.classification === 'company-not-initialized') {
+    console.log('[trilc:init] 公司态未开张 — 请先完成 ONBOARDING 开张流程再同步。');
+    return { outcome: 'error', detail: 'sync: company-not-initialized' };
+  }
+  if (body?.classification === 'project-not-linked' || body?.classification === 'project-link-not-linked') {
+    console.log('[trilc:init] 项目链路未就绪 — 请先走 PROJECT-LINK 流程（link/claim）再同步。');
+    return { outcome: 'error', detail: `sync: ${body.classification}` };
+  }
+  if (body?.retryable) {
+    console.log(`[trilc:init] 同步可重试失败（${body.classification}）：${body.message ?? ''} — 重新提交同一入口即续跑（幂等重跑）。`);
+    return { outcome: 'error', detail: `sync retryable: ${body.classification}` };
+  }
+  console.log(`[trilc:init] 同步失败（http ${runRes.status}）：${body?.message ?? body?.error ?? 'unknown'}`);
+  return { outcome: 'error', detail: `sync ${runRes.status}` };
+}
+
 /**
  * chat 启动入口：chain/status 呈初始化阶段 → 文本化流程。
  * - selfcheck：诊断卡（blocked → 流程结束返回聊天；pass/degraded → 继续开张；
  *   未运行 → 提示可触发自检「r」并轮询结果）
  * - onboarding：结构化开张流程 → assemble 提交
- * - project-link/sync/confirm：打印当前阶段提示，返回聊天（后续树承接）
+ * - project-link：inspect 呈现 + 源选择问答 + POST link/claim（零本地执行）
+ * - sync：五维同步状态呈现 + 触发问答 + POST sync/run + applied 收敛轮询
+ * - confirm：打印当前阶段提示，返回聊天（Phase D 确认卡承接）
  * - ready / uninitialized：跳过（普通聊天）
  */
 export async function runInitCliFlow(port: number): Promise<InitCliFlowResult> {
@@ -310,11 +542,11 @@ export async function runInitCliFlow(port: number): Promise<InitCliFlowResult> {
       console.log('\n[trilc:init] 初始化阶段：ONBOARDING（公司开张）');
       return runOnboardingFlow(port);
     case 'project-link':
-      console.log('\n[trilc:init] 初始化阶段：PROJECT-LINK（项目面初始化）— 由面板/后续流程承接，进入聊天。');
-      return { outcome: 'skipped', detail: 'project-link phase' };
+      console.log('\n[trilc:init] 初始化阶段：PROJECT-LINK（项目面初始化）');
+      return runProjectLinkFlow(port);
     case 'sync':
-      console.log('\n[trilc:init] 初始化阶段：SYNC（五维同步）— 由后续流程承接，进入聊天。');
-      return { outcome: 'skipped', detail: 'sync phase' };
+      console.log('\n[trilc:init] 初始化阶段：SYNC（五维同步）');
+      return runSyncFlow(port);
     case 'confirm':
       console.log('\n[trilc:init] 初始化阶段：CONFIRM（协同确认）— 由后续流程承接，进入聊天。');
       return { outcome: 'skipped', detail: 'confirm phase' };
