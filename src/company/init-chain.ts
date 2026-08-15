@@ -428,7 +428,7 @@ export class InitChain {
    * 复用 dev-reset-init.mjs 验证过的清理白名单 + 占位保护逻辑。
    */
   async reset(opts: { includeProject?: boolean; workspaceRoot?: string }): Promise<{
-    chainState: 'uninitialized';
+    chainState: 'selfcheck';
     cleared: string[];
   }> {
     const dataDir = dirname(this.statePath);
@@ -518,14 +518,14 @@ export class InitChain {
     // ⑥ 发布 init:chain-changed 事件
     this.publishFn?.({
       type: 'init:chain-changed',
-      chainState: 'uninitialized',
-      from: this.cache.chainState,
-      to: 'uninitialized',
-      eventSeq: 0,
-      sourceEntry: null,
+      chainState: 'selfcheck',
+      from: 'uninitialized',
+      to: 'selfcheck',
+      eventSeq: 1,
+      sourceEntry: 'daemon',
     });
 
     // ⑦ 返回清理清单
-    return { chainState: 'uninitialized', cleared };
+    return { chainState: 'selfcheck', cleared };
   }
 }
