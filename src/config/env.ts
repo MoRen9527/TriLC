@@ -29,6 +29,11 @@ export type TriLCEnv = {
    * src/project/weekly-plane-root.ts. Unset = legacy project-track behavior.
    */
   weeklyPlaneRoot?: string;
+  /**
+   * Debug mode flag (TRILC_DEBUG=1). Unlocks reset endpoint and UI controls.
+   * Production default: false (env var unset).
+   */
+  debugMode: boolean;
 };
 
 import { hostname } from 'node:os';
@@ -145,6 +150,10 @@ export function readEnv(): TriLCEnv {
   const nodeId = process.env.TRILC_NODE_ID ?? `${hostname()}-${process.pid}`;
   const dataDir = process.env.TRILC_DATA_DIR ?? `${process.env.LOCALAPPDATA ?? process.env.HOME ?? '/tmp'}/trilc`;
   const projectRoot = process.env.TRILC_PROJECT_ROOT ?? process.cwd();
+  const debugMode = process.env.TRILC_DEBUG === '1';
+  if (debugMode) {
+    console.log('[trilc] debug mode: enabled (TRILC_DEBUG=1)');
+  }
   return {
     nodeId,
     port: Number(process.env.TRILC_PORT ?? 8711),
@@ -160,5 +169,6 @@ export function readEnv(): TriLCEnv {
     tricompanySourcePath: process.env.TRICOMPANY_SOURCE_PATH ?? resolveFromWorkspace(),
     projectRoot,
     weeklyPlaneRoot: process.env.TRILC_WEEKLY_PLANE_ROOT || undefined,
+    debugMode,
   };
 }

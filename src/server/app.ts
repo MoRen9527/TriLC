@@ -1067,7 +1067,7 @@ export function createTriLCApp(env: TriLCEnv) {
           try {
             await initChain.load();
             res.writeHead(200, { 'content-type': 'application/json' });
-            res.end(JSON.stringify(initChain.toStatusPayload()));
+            res.end(JSON.stringify(initChain.toStatusPayload(env.debugMode)));
           } catch (err) {
             res.writeHead(500, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ error: 'init_chain_unavailable', message: (err as Error).message }));
@@ -1430,6 +1430,56 @@ export function createTriLCApp(env: TriLCEnv) {
           );
           res.writeHead(result.status, { 'content-type': 'application/json' });
           res.end(JSON.stringify(result));
+          return;
+        }
+
+        // ── POST /internal/v1/init/reset ──
+        // Debug reset: 任意链态 → uninitialized（绕过转移表）。
+        // 清理面 = 运行态 + 装配产物白名单反查 + 可选项目关联。
+        // debug 门禁：TRILC_DEBUG 未设置时返回 403。
+        if (req.url === '/internal/v1/init/reset' && req.method === 'POST') {
+          // Debug 门禁检查
+          if (!env.debugMode) {
+            res.writeHead(403, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+              error: 'debug_mode_required',
+              message: 'debug mode is not enabled (set TRILC_DEBUG=1 and restart daemon)',
+            }));
+            return;
+          }
+
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          let body: { includeProject?: boolean } = {};
+          if (raw.trim()) {
+            try {
+              body = JSON.parse(raw) as { includeProject?: boolean };
+            } catch {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+              return;
+            }
+          }
+
+          try {
+            const result = await initChain.reset({
+              includeProject: body.includeProject,
+              workspaceRoot: env.projectRoot ?? env.cwd,
+            });
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: true,
+              chainState: result.chainState,
+              cleared: result.cleared,
+            }));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'reset_failed', message: msg }));
+          }
           return;
         }
 

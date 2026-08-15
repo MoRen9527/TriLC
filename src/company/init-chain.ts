@@ -395,13 +395,17 @@ export class InitChain {
   }
 
   /** status 端点载荷（i1-1 §四契约字段：两入口只读投影 + 诊断卡数据源）。 */
-  toStatusPayload(): {
+  toStatusPayload(debugMode: boolean = false): {
     schemaVersion: 1;
     chainState: ChainState;
     phaseDetail: PhaseDetail;
     lastTransitionAt: string | null;
     eventSeq: number;
     sourceEntry: SourceEntry;
+    /** Debug mode flag（TRILC_DEBUG=1），解锁 reset 端点 + UI 控制。 */
+    debugMode: boolean;
+    /** 是否可 reset（= debugMode）。 */
+    canReset: boolean;
   } {
     const snap = this.getSnapshot();
     return {
@@ -411,6 +415,117 @@ export class InitChain {
       lastTransitionAt: snap.lastTransitionAt,
       eventSeq: snap.eventSeq,
       sourceEntry: snap.sourceEntry,
+      debugMode,
+      canReset: debugMode,
     };
+  }
+
+  /**
+   * Debug reset: 任意链态 → uninitialized（绕过转移表）。
+   * 清理面 = 运行态 + 装配产物白名单反查 + 可选项目关联。
+   * 护栏: 仅当 TRILC_DEBUG=1 时调用（app.ts 端点层检查）。
+   *
+   * 复用 dev-reset-init.mjs 验证过的清理白名单 + 占位保护逻辑。
+   */
+  async reset(opts: { includeProject?: boolean; workspaceRoot?: string }): Promise<{
+    chainState: 'uninitialized';
+    cleared: string[];
+  }> {
+    const dataDir = dirname(this.statePath);
+    const workspaceRoot = opts.workspaceRoot ?? process.cwd();
+    const cleared: string[] = [];
+
+    // ① 读取现有 state.json 提取 employees（如存在）
+    let employees: string[] = [];
+    const statePath = resolve(dataDir, 'company', 'state.json');
+    try {
+      await access(statePath);
+      const raw = await readFile(statePath, 'utf-8');
+      const state = JSON.parse(raw) as { employees?: Array<{ role: string }> };
+      if (Array.isArray(state.employees)) {
+        employees = state.employees.map((e) => e.role);
+      }
+    } catch { /* state.json 不存在或损坏 → 跳过 */ }
+
+    // ② 清运行态文件
+    const chainPath = resolve(dataDir, 'company', 'init-chain.json');
+    for (const f of [chainPath, statePath]) {
+      try {
+        await access(f);
+        await import('node:fs/promises').then(({ unlink }) => unlink(f));
+        cleared.push(f);
+      } catch { /* 文件不存在 → 跳过 */ }
+    }
+
+    // ③ 清装配产物（精确白名单：按 employees 反查）
+    const artifacts = [
+      ...employees.map((r) => resolve(workspaceRoot, '.claude', 'agents', `${r}.md`)),
+      resolve(workspaceRoot, 'docs', 'registry', 'company-state.json'),
+    ];
+    for (const f of artifacts) {
+      try {
+        await access(f);
+        await import('node:fs/promises').then(({ unlink }) => unlink(f));
+        cleared.push(f);
+      } catch { /* 文件不存在 → 跳过 */ }
+    }
+
+    // 占位文件：仅装配占位特征（小文件 + 标记词）才删
+    for (const f of [
+      resolve(workspaceRoot, 'AGENTS.md'),
+      resolve(workspaceRoot, 'docs', 'registry', 'business-state.md'),
+    ]) {
+      try {
+        await access(f);
+        let content = '';
+        try {
+          content = await readFile(f, 'utf-8');
+        } catch { continue; }
+        const isPlaceholder = content.length < 1024 && /TriCade|TriMetaverse|占位|placeholder/i.test(content);
+        if (isPlaceholder) {
+          await import('node:fs/promises').then(({ unlink }) => unlink(f));
+          cleared.push(f);
+        } else {
+          console.log(`[trilc:init] reset: 保留（非占位，真实内容）: ${f}`);
+        }
+      } catch { /* 文件不存在 → 跳过 */ }
+    }
+
+    // ④ 项目关联（可选）
+    if (opts.includeProject) {
+      const projectRegPath = resolve(dataDir, 'project-registry.json');
+      try {
+        await access(projectRegPath);
+        await import('node:fs/promises').then(({ unlink }) => unlink(projectRegPath));
+        cleared.push(projectRegPath);
+      } catch { /* 文件不存在 → 跳过 */ }
+    }
+
+    // ⑤ 重写 init-chain.json 为 defaultChainFrame()
+    this.cache = null; // 清缓存以便重新加载
+    const now = new Date().toISOString();
+    const frame: InitChainFile = {
+      ...defaultChainFile(),
+      lastUpdatedAt: now,
+      eventSeq: 0, // reset 重置序号
+    };
+    await mkdir(dirname(this.statePath), { recursive: true });
+    const tmp = `${this.statePath}.tmp`;
+    await writeFile(tmp, JSON.stringify(frame, null, 2), 'utf-8');
+    await rename(tmp, this.statePath);
+    this.cache = frame;
+
+    // ⑥ 发布 init:chain-changed 事件
+    this.publishFn?.({
+      type: 'init:chain-changed',
+      chainState: 'uninitialized',
+      from: this.cache.chainState,
+      to: 'uninitialized',
+      eventSeq: 0,
+      sourceEntry: null,
+    });
+
+    // ⑦ 返回清理清单
+    return { chainState: 'uninitialized', cleared };
   }
 }
