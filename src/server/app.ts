@@ -727,6 +727,7 @@ export function createTriLCApp(env: TriLCEnv) {
   const selfcheckDeps: SelfcheckDeps = {
     port: env.port,
     projectRoot: env.projectRoot,
+    dataDir: env.dataDir,
     chain: initChain,
     publish,
     probeSystemPrompt: '你是 TriCade 的安装初始化自检会话（selfcheck 第五探测构造面）。',

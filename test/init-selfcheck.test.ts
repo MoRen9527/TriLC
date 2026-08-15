@@ -80,6 +80,7 @@ async function newDeps(): Promise<{ dir: string; deps: SelfcheckDeps; events: Ar
   const deps: SelfcheckDeps = {
     port: PORT,
     projectRoot: dir,
+    dataDir: dir,
     chain,
     publish: (e) => events.push(e as { type: string } & Record<string, unknown>),
     probeSystemPrompt: 'TEST-PROMPT',

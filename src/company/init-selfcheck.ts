@@ -14,6 +14,8 @@
 // 事件流（i1-1 §三）：init:selfcheck-started / init:selfcheck-progress /
 // init:selfcheck-finished——全部经注入 publisher（app.ts publish 同通道）。
 
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { getKeyCacheStatus } from '../config/key-cache.js';
 import { localBus, type LocalBusEvent } from '../localbus/bus.js';
 import type { InitChain, SelfcheckCheck, SelfcheckSummary } from './init-chain.js';
@@ -24,6 +26,8 @@ export type SelfcheckPublisher = (event: LocalBusEvent) => void;
 export interface SelfcheckDeps {
   port: number;
   projectRoot: string;
+  /** dataDir（2026-08-15：第五探测专用工作区落点，防家目录巨量文件） */
+  dataDir: string;
   chain: InitChain;
   publish: SelfcheckPublisher;
   /** 第五探测构造 TriPilot 形态会话的客户端 systemPrompt（tasks/submit 会追加周平面提示）。 */
@@ -191,6 +195,12 @@ const probePlaneHint: Probe = async (deps) => {
   try {
     // TriPilot 形态：POST tasks/submit 带客户端 systemPrompt + workspaceRoot
     // （daemon 会追加周平面提示 — r4-1 B 族注入路径）
+    // 2026-08-15 修复：探测工作区 = dataDir 专用小目录（原 projectRoot 装后态 = 进程 cwd = 用户家目录，
+    // 模型 LS 巨量文件 → 无最终文本伪失败 + 工具执行阻塞事件循环 60s——CEO 手测实证）。
+    // 探测语义 = 验证任务链路端到端健康（非真问周内容），工作区可控即可。
+    const probeWs = join(deps.dataDir, 'selfcheck-probe-ws');
+    await mkdir(probeWs, { recursive: true });
+    await writeFile(join(probeWs, 'README.txt'), 'TriCade SELFCHECK probe workspace — safe to inspect.', 'utf-8');
     const submitRes = await fetch(`http://127.0.0.1:${deps.port}/internal/v1/tasks/submit`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -198,7 +208,7 @@ const probePlaneHint: Probe = async (deps) => {
         message: PLANE_HINT_QUESTION,
         systemPrompt: deps.probeSystemPrompt,
         conversationId: `selfcheck-plane-hint-${Date.now().toString(36)}`,
-        context: { workspaceRoot: deps.projectRoot },
+        context: { workspaceRoot: probeWs },
       }),
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     });
