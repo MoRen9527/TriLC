@@ -447,9 +447,11 @@ export class InitChain {
       }
     } catch { /* state.json 不存在或损坏 → 跳过 */ }
 
-    // ② 清运行态文件
+    // ② 清运行态文件（2026-08-15 竞态修复：init-chain.json 不 unlink——由 ⑤ 原子覆写；
+    // unlink 开「文件不存在窗口」→ 并发 load() 命中 catch 写回 default uninitialized 帧，
+    // 覆盖 reset 的 selfcheck 终态——CEO 手测「重置后自检卡不出现」根因）
     const chainPath = resolve(dataDir, 'company', 'init-chain.json');
-    for (const f of [chainPath, statePath]) {
+    for (const f of [statePath]) {
       try {
         await access(f);
         await import('node:fs/promises').then(({ unlink }) => unlink(f));
