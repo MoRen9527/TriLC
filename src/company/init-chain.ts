@@ -508,8 +508,11 @@ export class InitChain {
     const now = new Date().toISOString();
     const frame: InitChainFile = {
       ...defaultChainFile(),
+      // 2026-08-15：直接落 selfcheck（等价 daemon 启动转移语义）——落 uninitialized 呈现层隐藏卡片
+      chainState: 'selfcheck',
+      lastTransitionAt: now,
       lastUpdatedAt: now,
-      eventSeq: 0, // reset 重置序号
+      eventSeq: 1,
     };
     await mkdir(dirname(this.statePath), { recursive: true });
     const tmp = `${this.statePath}.tmp`;

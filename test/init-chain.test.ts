@@ -278,3 +278,20 @@ test("status payload matches last published event frame", async () => {
   assert.equal(payload.schemaVersion, 1);
   await rm(dir, { recursive: true, force: true });
 });
+
+// 2026-08-15：reset 落盘链态断言（此前假通过教训——⑤ 替换未命中被 ⑥⑦ 验证掩盖）
+test('reset 落盘帧 chainState=selfcheck（UI 卡起点，防假通过）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'chain-reset-e2e-'));
+  const c = new InitChain(dir, { onEvent: () => {} });
+  await c.load();
+  await c.transitionTo('selfcheck', 'daemon');
+  const r = await c.reset({ workspaceRoot: dir });
+  assert.equal(r.chainState, 'selfcheck', 'reset 返回 selfcheck');
+  const onDisk = JSON.parse(await readFile(join(dir, 'company', 'init-chain.json'), 'utf-8'));
+  assert.equal(onDisk.chainState, 'selfcheck', 'reset 落盘帧 chainState=selfcheck（防假通过断言）');
+  assert.equal(onDisk.eventSeq, 1, 'reset 帧 eventSeq=1');
+  const fresh = new InitChain(dir);
+  await fresh.load();
+  assert.equal(fresh.getState(), 'selfcheck', '新实例读盘 = selfcheck（UI 卡起点）');
+  await rm(dir, { recursive: true, force: true });
+});
