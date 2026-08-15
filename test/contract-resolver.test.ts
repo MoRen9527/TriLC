@@ -227,14 +227,14 @@ describe('AgentContractResolver', () => {
     assert.equal(chief.isGovernance, true, 'C-suite → isGovernance');
     assert.equal(chief.defaultSelected, true, 'D1 常量含 ceo-chief-of-staff → defaultSelected');
     assert.equal(
-      DEFAULT_SELECTED_ROLES.length, 5,
-      'D1 常量 = 5 岗（4 playbook 员工岗 + chief-technology-officer）',
+      DEFAULT_SELECTED_ROLES.length, 7,
+      'D1 修订（CEO 2026-08-15）：默认最小上岗 7 岗（总助/CPO/CTO/开发/测试/CAO/CHO）',
     );
 
     const testEng = catalog.roles.find((r) => r.roleId === 'test-engineer');
     assert.ok(testEng);
     assert.equal(testEng.isGovernance, false, 'Execution → 非治理');
-    assert.equal(testEng.defaultSelected, false, '非 D1 常量岗 → 默认不勾选');
+    assert.equal(testEng.defaultSelected, true, 'D1 修订：test-engineer 进默认集');
   });
 
   it('getRoleCatalog: roster 未加载 → null（端点 503 兜底，不开天窗）', async () => {

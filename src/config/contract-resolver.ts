@@ -69,13 +69,20 @@ export interface EmployeeRoster {
  * chief-human-resources-officer）+ chief-technology-officer 为第 5 岗（技术
  * 交付链必要、C-suite 治理岗、与「含治理角色」原则一致）。默认值仅影响初始
  * 勾选（CEO 裁决：≥1 岗可开张，<5 岗提示不拦截）。
+ *
+ * D1 修订（2026-08-15，CEO 裁决）：默认最小上岗 7 岗 = 总助 / CPO / CTO /
+ * 开发 / 测试 / CAO / CHO（在 5 岗基础上 + chief-product-officer + test-engineer
+ * ——产品与测试职能进默认骨架）。硬下限不变（≥1 岗可开张），提示阈值随默认集
+ * 同步为 <7 岗 warning（recommendedMin=7）。
  */
 export const DEFAULT_SELECTED_ROLES: readonly string[] = [
   'ceo-chief-of-staff',
+  'chief-product-officer',
+  'chief-technology-officer',
   'full-stack-developer',
+  'test-engineer',
   'chief-administrative-officer',
   'chief-human-resources-officer',
-  'chief-technology-officer',
 ];
 
 export interface RoleCatalogEntry {

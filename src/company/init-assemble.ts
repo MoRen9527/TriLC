@@ -438,7 +438,7 @@ async function doAssemble(deps: AssembleDeps, req: AssembleRequest): Promise<Ass
       companyState: 'initialized',
       employees,
       preserved: [],
-      ...(employees.length < 5 ? { warning: { recommendedMin: 5, current: employees.length } } : {}),
+      ...(employees.length < 7 ? { warning: { recommendedMin: 7, current: employees.length } } : {}),
     };
   }
 
@@ -488,7 +488,7 @@ async function doAssemble(deps: AssembleDeps, req: AssembleRequest): Promise<Ass
     companyState: 'initialized',
     employees,
     preserved: targets.filter((t) => t.preserved).map((t) => t.relPath),
-    ...(employees.length < 5 ? { warning: { recommendedMin: 5, current: employees.length } } : {}),
+    ...(employees.length < 7 ? { warning: { recommendedMin: 7, current: employees.length } } : {}),
   };
 }
 

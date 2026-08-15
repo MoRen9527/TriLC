@@ -348,7 +348,7 @@ test("whitelist artifacts written; existing business-state/AGENTS preserved; <5 
     assert.equal(r.status, 200);
     const body = r as Extract<Awaited<ReturnType<typeof runAssemble>>, { status: 200 }>;
     assert.deepEqual(body.preserved, ['docs/registry/business-state.md', 'AGENTS.md'], 'preserved 报告');
-    assert.equal(body.warning?.recommendedMin, 5, '<5 岗 warning');
+    assert.equal(body.warning?.recommendedMin, 7, '<7 岗 warning（D1 修订）');
     assert.equal(body.warning?.current, 1);
 
     const agentMd = await readFile(join(h.ws, '.claude', 'agents', 'ceo-chief-of-staff.md'), 'utf-8');
