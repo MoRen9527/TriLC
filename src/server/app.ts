@@ -730,7 +730,7 @@ export function createTriLCApp(env: TriLCEnv) {
     dataDir: env.dataDir,
     chain: initChain,
     publish,
-    probeSystemPrompt: '你是 TriCade 的安装初始化自检会话（selfcheck 第五探测构造面）。',
+    probeSystemPrompt: '你是 TriCade 的安装初始化自检会话（selfcheck 第五探测构造面）。完成必要的检查后，务必以一段简短中文文字总结你观察到的内容作为最终回答——绝不要以工具调用结束（无最终文本=伪失败）。',
   };
 
   // ── 公司态 + 装配执行体（i2-1 §一：daemon 端点单执行体；两入口只发指令）──
