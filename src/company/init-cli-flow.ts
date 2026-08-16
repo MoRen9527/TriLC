@@ -631,9 +631,11 @@ export async function resetChain(port: number, includeProject = false, purgeWork
   console.log(`[trilc:init] 已重置 → SELFCHECK 起点（清理 ${cleared.length} 项；includeProject=${includeProject}）`);
 }
 
+let __argvResetConsumed = false;
 export async function runInitCliFlow(port: number): Promise<InitCliFlowResult> {
   // trilc chat reset（CLI 参数形态）：先重置再走流程
-  if (process.argv.includes('reset') || process.argv.includes('reset-company')) {
+  if (!__argvResetConsumed && (process.argv.includes('reset') || process.argv.includes('reset-company'))) {
+    __argvResetConsumed = true; // 2026-08-16 修复：只消费一次——自动衔接递归重进不得再次 reset（CEO 手测：面板开张被 chat 衔接意外回退）
     await resetChain(port, process.argv.includes('--include-project'), process.argv.includes('--purge-worktree'));
   }
   const statusRes = await getJson<ChainStatusPayload>(port, '/internal/v1/init/chain/status');
