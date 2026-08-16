@@ -526,6 +526,7 @@ async function cmdChat(port: number, agent?: string, resume?: string, permission
   if (!agent) {
     try {
       const { runInitCliFlow } = await import('./company/init-cli-flow.js');
+      console.log('[trilc:init] 提示：任意阶段想重来，退出后运行 trilc chat reset（或 trilc chat reset --include-project 同时清项目关联）');
       const flow = await runInitCliFlow(port);
       if (flow.outcome === 'assembled') {
         console.log('\n[trilc] 公司开张完成 — 进入聊天。');

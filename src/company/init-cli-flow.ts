@@ -594,7 +594,27 @@ async function runConfirmFlow(port: number): Promise<InitCliFlowResult> {
  * - confirm：打印当前阶段提示，返回聊天（Phase D 确认卡承接）
  * - ready / uninitialized：跳过（普通聊天）
  */
+/** Debug 重置指令（2026-08-15，trilc chat reset / 流程内输入 reset）：
+ * POST /internal/v1/init/reset（daemon 单执行体；debug 门禁在服务端）→ 链回 selfcheck 起点。 */
+export async function resetChain(port: number, includeProject = false): Promise<void> {
+  const res = await postJson(port, '/internal/v1/init/reset', { includeProject });
+  if (res.status === 403) {
+    console.log('[trilc:init] 重置不可用（debug 未开启 — TRILC_DEBUG=1 后重启 daemon）');
+    return;
+  }
+  if (res.status !== 200) {
+    console.log(`[trilc:init] 重置失败（http ${res.status}）：${JSON.stringify(res.json)}`);
+    return;
+  }
+  const cleared = (res.json as { cleared?: string[] })?.cleared ?? [];
+  console.log(`[trilc:init] 已重置 → SELFCHECK 起点（清理 ${cleared.length} 项；includeProject=${includeProject}）`);
+}
+
 export async function runInitCliFlow(port: number): Promise<InitCliFlowResult> {
+  // trilc chat reset（CLI 参数形态）：先重置再走流程
+  if (process.argv.includes('reset') || process.argv.includes('reset-company')) {
+    await resetChain(port, process.argv.includes('--include-project'));
+  }
   const statusRes = await getJson<ChainStatusPayload>(port, '/internal/v1/init/chain/status');
   if (!statusRes.json || statusRes.status !== 200) {
     return { outcome: 'error', detail: `chain/status 不可用（http ${statusRes.status}）` };
