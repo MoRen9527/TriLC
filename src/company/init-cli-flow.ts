@@ -634,7 +634,7 @@ export async function runInitCliFlow(port: number): Promise<InitCliFlowResult> {
         console.log('[trilc:init] 自检已完结 — 进入公司开张流程。');
         return runOnboardingFlow(port);
       }
-      const trigger = await ask('自检未运行 — 输入 r 触发自检（其他键跳过进入聊天）> ');
+      const trigger = await ask('自检未运行 — 输入 r 触发自检（其他键=重新检查链态，另一入口推进了就直接衔接）> ');
       if (trigger.toLowerCase() === 'r') {
         const runRes = await postJson(port, '/internal/v1/init/selfcheck/run', {});
         if (runRes.status !== 202) {
@@ -669,6 +669,12 @@ export async function runInitCliFlow(port: number): Promise<InitCliFlowResult> {
         }
         console.log('[trilc:init] 自检轮询超时 — 返回聊天。');
         return { outcome: 'error', detail: 'selfcheck poll timeout' };
+      }
+      // 2026-08-16：其他键 = 重拉链态——另一入口（TriPilot 面板）可能已推进（自检/开张），
+      // 直接衔接对应阶段而非硬进聊天（CEO 手测：面板完成开业 chat 停在旧提示的缺口）
+      const recheck = await getJson<ChainStatusPayload>(port, '/internal/v1/init/chain/status');
+      if (recheck.json && recheck.json.chainState && recheck.json.chainState !== 'selfcheck') {
+        return runInitCliFlow(port);
       }
       return { outcome: 'skipped', detail: 'selfcheck not triggered' };
     }
