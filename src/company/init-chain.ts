@@ -427,7 +427,7 @@ export class InitChain {
    *
    * 复用 dev-reset-init.mjs 验证过的清理白名单 + 占位保护逻辑。
    */
-  async reset(opts: { includeProject?: boolean; workspaceRoot?: string }): Promise<{
+  async reset(opts: { includeProject?: boolean; workspaceRoot?: string; purgeWorktree?: boolean }): Promise<{
     chainState: 'selfcheck';
     cleared: string[];
   }> {
@@ -496,6 +496,25 @@ export class InitChain {
     // ④ 项目关联（可选）
     if (opts.includeProject) {
       const projectRegPath = resolve(dataDir, 'project-registry.json');
+      // ④B purgeWorktree（2026-08-16 CEO 需求）：物理移除登记的 worktree——
+      // git worktree remove 非 --force（INCIDENT-20260814-001 纪律）；失败保留磁盘仅清登记
+      if (opts.purgeWorktree) {
+        try {
+          const regRaw = await readFile(projectRegPath, 'utf-8');
+          const reg = JSON.parse(regRaw) as { projects?: Record<string, { worktrees?: Array<{ path: string }> }> };
+          for (const proj of Object.values(reg.projects ?? {})) {
+            for (const wt of proj.worktrees ?? []) {
+              if (!wt.path) continue;
+              await new Promise<void>((res) => {
+                import('node:child_process').then(({ execFile }) => {
+                  execFile('git', ['worktree', 'remove', wt.path!], { timeout: 60_000 }, () => res());
+                }).catch(() => res());
+              });
+              cleared.push(wt.path + ' (worktree removed)');
+            }
+          }
+        } catch { /* registry 不存在或损坏 → 跳过 */ }
+      }
       try {
         await access(projectRegPath);
         await import('node:fs/promises').then(({ unlink }) => unlink(projectRegPath));

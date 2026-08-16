@@ -103,9 +103,9 @@ export interface InitCliFlowResult {
   detail?: string;
 }
 
-async function getJson<T>(port: number, path: string): Promise<{ status: number; json: T | null }> {
+async function getJson<T>(port: number, path: string, timeoutMs = 8000): Promise<{ status: number; json: T | null }> {
   try {
-    const res = await fetch(`http://127.0.0.1:${port}${path}`);
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, { signal: AbortSignal.timeout(timeoutMs) });
     const text = await res.text();
     let json: T | null = null;
     try { json = JSON.parse(text) as T; } catch { /* keep null */ }
@@ -131,14 +131,35 @@ async function postJson(port: number, path: string, body: unknown): Promise<{ st
   }
 }
 
-async function ask(question: string): Promise<string> {
+async function ask(question: string, opts?: { watchChain?: { port: number; skipStates?: string[] } }): Promise<string> {
   const { createInterface } = await import('node:readline');
   return new Promise((resolve) => {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
+    let settled = false;
+    const finish = (answer: string) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearInterval(timer);
+      try { rl.close(); } catch { /* ignore */ }
+      resolve(answer);
+    };
+    // 2026-08-16：等待期链态监听——另一入口（TriPilot）推进链后自动中断等待并衔接（CEO 手测缺口）
+    let timer: ReturnType<typeof setInterval> | undefined;
+    if (opts?.watchChain) {
+      const skip = new Set(opts.watchChain.skipStates ?? []);
+      timer = setInterval(async () => {
+        try {
+          const r = await getJson<ChainStatusPayload>(opts.watchChain!.port, '/internal/v1/init/chain/status', 4000);
+          const cs = r.json?.chainState;
+          if (cs && !skip.has(cs)) {
+            console.log('\n[trilc:init] 检测到另一入口已推进链（→' + cs + '）— 自动衔接…');
+            finish('__CHAIN_ADVANCED__');
+          }
+        } catch { /* daemon 暂不可达忽略 */ }
+      }, 5000);
+    }
+    rl.question(question, (answer) => finish(answer.trim()));
+    rl.on('close', () => finish(''));
   });
 }
 
@@ -596,8 +617,8 @@ async function runConfirmFlow(port: number): Promise<InitCliFlowResult> {
  */
 /** Debug 重置指令（2026-08-15，trilc chat reset / 流程内输入 reset）：
  * POST /internal/v1/init/reset（daemon 单执行体；debug 门禁在服务端）→ 链回 selfcheck 起点。 */
-export async function resetChain(port: number, includeProject = false): Promise<void> {
-  const res = await postJson(port, '/internal/v1/init/reset', { includeProject });
+export async function resetChain(port: number, includeProject = false, purgeWorktree = false): Promise<void> {
+  const res = await postJson(port, '/internal/v1/init/reset', { includeProject, purgeWorktree });
   if (res.status === 403) {
     console.log('[trilc:init] 重置不可用（debug 未开启 — TRILC_DEBUG=1 后重启 daemon）');
     return;
@@ -613,7 +634,7 @@ export async function resetChain(port: number, includeProject = false): Promise<
 export async function runInitCliFlow(port: number): Promise<InitCliFlowResult> {
   // trilc chat reset（CLI 参数形态）：先重置再走流程
   if (process.argv.includes('reset') || process.argv.includes('reset-company')) {
-    await resetChain(port, process.argv.includes('--include-project'));
+    await resetChain(port, process.argv.includes('--include-project'), process.argv.includes('--purge-worktree'));
   }
   const statusRes = await getJson<ChainStatusPayload>(port, '/internal/v1/init/chain/status');
   if (!statusRes.json || statusRes.status !== 200) {
@@ -634,7 +655,7 @@ export async function runInitCliFlow(port: number): Promise<InitCliFlowResult> {
         console.log('[trilc:init] 自检已完结 — 进入公司开张流程。');
         return runOnboardingFlow(port);
       }
-      const trigger = await ask('自检未运行 — 输入 r 触发自检（其他键=重新检查链态，另一入口推进了就直接衔接）> ');
+      const trigger = await ask('自检未运行 — 输入 r 触发自检（其他键=重新检查链态；等待期间另一入口推进会自动衔接）> ', { watchChain: { port, skipStates: ['selfcheck'] } });
       if (trigger.toLowerCase() === 'r') {
         const runRes = await postJson(port, '/internal/v1/init/selfcheck/run', {});
         if (runRes.status !== 202) {
@@ -672,6 +693,7 @@ export async function runInitCliFlow(port: number): Promise<InitCliFlowResult> {
       }
       // 2026-08-16：其他键 = 重拉链态——另一入口（TriPilot 面板）可能已推进（自检/开张），
       // 直接衔接对应阶段而非硬进聊天（CEO 手测：面板完成开业 chat 停在旧提示的缺口）
+      void trigger;
       const recheck = await getJson<ChainStatusPayload>(port, '/internal/v1/init/chain/status');
       if (recheck.json && recheck.json.chainState && recheck.json.chainState !== 'selfcheck') {
         return runInitCliFlow(port);

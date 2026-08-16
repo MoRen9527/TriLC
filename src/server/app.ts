@@ -1453,7 +1453,7 @@ export function createTriLCApp(env: TriLCEnv) {
             chunks.push(chunk);
           }
           const raw = Buffer.concat(chunks).toString('utf-8');
-          let body: { includeProject?: boolean } = {};
+          let body: { includeProject?: boolean; purgeWorktree?: boolean } = {};
           if (raw.trim()) {
             try {
               body = JSON.parse(raw) as { includeProject?: boolean };
@@ -1467,6 +1467,7 @@ export function createTriLCApp(env: TriLCEnv) {
           try {
             const result = await initChain.reset({
               includeProject: body.includeProject,
+              purgeWorktree: body.purgeWorktree,
               workspaceRoot: env.projectRoot ?? env.cwd,
             });
             res.writeHead(200, { 'content-type': 'application/json' });

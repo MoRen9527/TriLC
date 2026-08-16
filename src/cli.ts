@@ -528,6 +528,11 @@ async function cmdChat(port: number, agent?: string, resume?: string, permission
       const { runInitCliFlow } = await import('./company/init-cli-flow.js');
       console.log('[trilc:init] 提示：任意阶段想重来，退出后运行 trilc chat reset（或 trilc chat reset --include-project 同时清项目关联）');
       const flow = await runInitCliFlow(port);
+      // 2026-08-16 CEO UX：链在 selfcheck 未触发即跳过 → 留在 shell（不进 TUI 聊天）
+      if (flow.outcome === 'skipped' && String(flow.detail || '').includes('selfcheck not triggered')) {
+        console.log('[trilc:init] 未触发自检 — 退出（回到终端；trilc chat 随时再进）。');
+        return;
+      }
       if (flow.outcome === 'assembled') {
         console.log('\n[trilc] 公司开张完成 ✓ — 自动衔接项目初始化…');
         // v2.1 衔接（2026-08-16）：开张后链态已 project-link——直接串联项目流程（免重启 chat）
@@ -551,6 +556,8 @@ async function cmdChat(port: number, agent?: string, resume?: string, permission
       : { messages: notificationMessages };
     const root = await startTUI(opts);
     await root.waitUntilExit();
+      // 2026-08-16 CEO UX：/exit 花屏——退出时 ANSI 清屏 + 光标复位（Ink 残留边框清理）
+      process.stdout.write('[2J[H[0J');
     console.log('[trilc] TUI closed.');
   } catch (err) {
     console.error('[trilc] TUI error:', (err as Error).message);
