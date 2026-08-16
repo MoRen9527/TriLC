@@ -529,7 +529,11 @@ async function cmdChat(port: number, agent?: string, resume?: string, permission
       console.log('[trilc:init] 提示：任意阶段想重来，退出后运行 trilc chat reset（或 trilc chat reset --include-project 同时清项目关联）');
       const flow = await runInitCliFlow(port);
       if (flow.outcome === 'assembled') {
-        console.log('\n[trilc] 公司开张完成 — 进入聊天。');
+        console.log('\n[trilc] 公司开张完成 ✓ — 自动衔接项目初始化…');
+        // v2.1 衔接（2026-08-16）：开张后链态已 project-link——直接串联项目流程（免重启 chat）
+        const { runInitCliFlow: continueFlow } = await import('./company/init-cli-flow.js');
+        const next = await continueFlow(port);
+        console.log(`[trilc] 项目流程结束（outcome=${next.outcome}）— 五维同步/确认请重新运行 trilc chat 继续。`);
       }
     } catch (err) {
       console.warn('[trilc] init cli flow failed, falling back to chat:', (err as Error).message);
