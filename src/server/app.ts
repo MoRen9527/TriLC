@@ -3198,6 +3198,15 @@ export function createTriLCApp(env: TriLCEnv) {
             // user needs text AFTER tools finish. Old gate (deltaContent.length) counted pre-tool
             // narration as output, so "narrate → tools → silence" passed as success.
             let contentAfterLastTool = '';
+            // DEFECT-PSEUDO-CHAT v2a (2026-08-18 复测·翻倍): agent-core 每轮同时发
+            // content_delta（流式增量）和 assistant_message（完整内容）。旧代码无条件把
+            // assistant_message 再发射一遍 → 面板每句话收到两次。标志位按轮去重。
+            let hadDeltaSinceLastTool = false;
+            // DEFECT-PSEUDO-CHAT v2b (2026-08-18 复测·无结论): 模型多次真工具调用后，
+            // 最后一轮把工具调用写成文本 "[tool_use name=X]"（非真函数调用）→ loop 视为
+            // 最终回答结束。用观测事件重建 transcript，检测到伪文本/静默时以无工具模式
+            // 补一轮强制收尾调用，逼出真实结论。
+            const rebuilt: Message[] = [{ role: 'user', content: entry.message }];
             let terminalError: string | undefined;
 
             const taskSessionRules = buildSessionPermissionRules();
@@ -3221,14 +3230,17 @@ export function createTriLCApp(env: TriLCEnv) {
               // Map agent events to W30 SSE event types
               switch (event.type as string) {
                 case 'content_delta': {
-                  deltaContent += (event as any).delta ?? '';
-                  contentAfterLastTool += (event as any).delta ?? '';
-                  writeSSE('delta', { content: (event as any).delta ?? '' });
+                  const d = (event as any).delta ?? '';
+                  deltaContent += d;
+                  contentAfterLastTool += d;
+                  hadDeltaSinceLastTool = true;
+                  writeSSE('delta', { content: d });
                   break;
                 }
                 case 'tool_call': {
                   toolCount++;
                   contentAfterLastTool = ''; // reset — text after this tool is what counts
+                  hadDeltaSinceLastTool = false;
                   const tc = event as any;
                   writeSSE('tool_use', {
                     toolName: tc.name ?? tc.tool_name ?? 'unknown',
@@ -3249,6 +3261,11 @@ export function createTriLCApp(env: TriLCEnv) {
                   // 实测每条工具结果 unknown+空输出，TriPilot 渲染面全空）。
                   const tr = event as any;
                   const content = tr.content ?? tr.result ?? '';
+                  rebuilt.push({
+                    role: 'tool',
+                    content: typeof content === 'string' ? content : JSON.stringify(content),
+                    tool_call_id: tr.tool_call_id ?? '',
+                  });
                   writeSSE('tool_result', {
                     toolName: tr.name ?? tr.tool_name ?? 'unknown',
                     output: typeof content === 'string' ? content : JSON.stringify(content),
@@ -3259,13 +3276,28 @@ export function createTriLCApp(env: TriLCEnv) {
                 }
                 case 'assistant_message': {
                   const am = event as any;
-                  if (am.content) {
-                    // r19-gate A3：deltaContent 是用户可见产出的唯一真源——
-                    // 批量形态的最终答复也要计入（否则伪成功误判）。
-                    if (!deltaContent) deltaContent += am.content;
-                    contentAfterLastTool += am.content; // DEFECT-PSEUDO-CHAT: always track post-tool
-                    writeSSE('delta', { content: am.content });
+                  // v2b transcript rebuild: assistant turn with content and/or tool_calls
+                  const tcs = Array.isArray(am.tool_calls) && am.tool_calls.length > 0
+                    ? am.tool_calls.map((tc: any) => ({
+                        id: tc.id,
+                        type: 'function' as const,
+                        function: { name: tc.function.name, arguments: tc.function.arguments },
+                      }))
+                    : undefined;
+                  if ((am.content && String(am.content).trim()) || tcs) {
+                    rebuilt.push({ role: 'assistant', content: am.content ?? '', ...(tcs ? { tool_calls: tcs } : {}) });
                   }
+                  if (am.content) {
+                    // v2a per-turn dedupe: only emit when this turn had NO streamed
+                    // deltas (batch mode). Streamed turns already reached the client
+                    // via content_delta — re-emitting here doubled every sentence.
+                    if (!hadDeltaSinceLastTool) {
+                      deltaContent += am.content;
+                      contentAfterLastTool += am.content;
+                      writeSSE('delta', { content: am.content });
+                    }
+                  }
+                  hadDeltaSinceLastTool = false; // per-turn boundary reset
                   break;
                 }
                 case 'loop_start': {
@@ -3334,15 +3366,49 @@ export function createTriLCApp(env: TriLCEnv) {
               return;
             }
 
-            // C13 + r19-gate A3 + DEFECT-PSEUDO-CHAT: Post-loop guard — 用户可见产出 =
-            // 最后一次工具调用之后的文本结论。模型在工具前说「让我先看看...」是叙述，
-            // 不是结论——用户需要的是工具执行完后的总结文字。旧门禁（deltaContent.length）
-            // 把工具前叙述也算产出，导致「叙述→工具→沉默」被判成功（CEO 实测 2026-08-18）。
-            const producedAnyOutput = toolCount === 0 ? deltaContent.length > 0 : contentAfterLastTool.trim().length > 0;
+            // C13 + r19-gate A3 + DEFECT-PSEUDO-CHAT v2: Post-loop guard — 用户可见产出 =
+            // 最后一次工具调用之后的文本结论；纯 "[tool_use name=X]" 文本（模型以文本形式
+            // 模拟工具调用，非真函数调用）同样不算产出。两种情况都以无工具模式补一轮
+            // 强制收尾调用，逼出真实结论（CEO 复测 2026-08-18：翻倍 + 无结论双缺陷）。
+            const PSEUDO_TOOL_TEXT_RE = /^\s*(\[tool_use[^\]]*\]\s*)*$/;
+            let userVisibleText = (toolCount === 0 ? deltaContent : contentAfterLastTool).trim();
+            let isPseudoToolText = PSEUDO_TOOL_TEXT_RE.test(userVisibleText);
+            if (userVisibleText && isPseudoToolText) {
+              console.warn(`[trilc:chat] model emitted pseudo tool-call text instead of a conclusion (task=${sessionId}) — forcing conclusion turn`);
+            }
+            if (!userVisibleText || isPseudoToolText) {
+              let forced = '';
+              try {
+                if (!_modelClient) _modelClient = createModelClient();
+                const nudge = isPseudoToolText
+                  ? '（系统纠偏：你上一条消息以文本形式输出了 "[tool_use name=...]"，这不是有效的工具调用，系统无法执行。请不要再调用任何工具，直接基于已获取的信息，用一段完整的中文给出最终结论。）'
+                  : '（系统要求：请基于以上已完成的工具调用结果，用一段完整的中文直接给出最终结论，不要再调用任何工具。）';
+                const resp = await Promise.race([
+                  _modelClient.chat(entry.model, [...rebuilt, { role: 'user', content: nudge }]),
+                  new Promise<never>((_, rej) => setTimeout(() => rej(new Error('forced-conclusion timeout (60s)')), 60_000)),
+                ]);
+                if (resp?.content && resp.content.trim() && !PSEUDO_TOOL_TEXT_RE.test(resp.content)) {
+                  forced = resp.content.trim();
+                }
+              } catch (fErr) {
+                console.warn('[trilc:chat] forced conclusion call failed:', (fErr as Error).message);
+              }
+              if (forced) {
+                const prefix = userVisibleText ? '\n\n' : '';
+                deltaContent += prefix + forced;
+                contentAfterLastTool += prefix + forced;
+                writeSSE('delta', { content: prefix + forced });
+                userVisibleText = forced;
+                isPseudoToolText = false;
+              }
+            }
+            const producedAnyOutput = userVisibleText.length > 0 && !isPseudoToolText;
             if (!producedAnyOutput) {
-              const emptyError = toolCount > 0
-                ? 'Model called tools but produced no final answer text after tools completed (pseudo-success: narrate → tools → silence)'
-                : 'Model loop completed without any content or tool calls — possible provider failure or empty reasoning-only response';
+              const emptyError = isPseudoToolText
+                ? 'Model ended with pseudo tool-call text ("[tool_use name=...]") instead of a conclusion, and the forced conclusion turn also failed'
+                : toolCount > 0
+                  ? 'Model called tools but produced no final answer text after tools completed (pseudo-success: narrate → tools → silence)'
+                  : 'Model loop completed without any content or tool calls — possible provider failure or empty reasoning-only response';
               console.error(`[trilc:model] CRITICAL: all providers exhausted for task=${sessionId}: ${emptyError}`);
               entry.status = 'error';
               publish({ type: 'task:failed', taskId: sessionId, error: emptyError });
