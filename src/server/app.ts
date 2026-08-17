@@ -2606,6 +2606,11 @@ export function createTriLCApp(env: TriLCEnv) {
             // Track tool states for progress reporting
             let toolCount = 0;
             let deltaContent = '';
+            // DEFECT-PSEUDO-CHAT fix (CEO US-002 2026-08-18): track text produced AFTER the
+            // last tool call. Model narrating "让我先看看..." before tools is NOT a conclusion —
+            // user needs text AFTER tools finish. Old gate (deltaContent.length) counted pre-tool
+            // narration as output, so "narrate → tools → silence" passed as success.
+            let contentAfterLastTool = '';
             let terminalError: string | undefined;
 
             const taskSessionRules = buildSessionPermissionRules();
@@ -2630,11 +2635,13 @@ export function createTriLCApp(env: TriLCEnv) {
               switch (event.type as string) {
                 case 'content_delta': {
                   deltaContent += (event as any).delta ?? '';
+                  contentAfterLastTool += (event as any).delta ?? '';
                   writeSSE('delta', { content: (event as any).delta ?? '' });
                   break;
                 }
                 case 'tool_call': {
                   toolCount++;
+                  contentAfterLastTool = ''; // reset — text after this tool is what counts
                   const tc = event as any;
                   writeSSE('tool_use', {
                     toolName: tc.name ?? tc.tool_name ?? 'unknown',
@@ -2665,10 +2672,11 @@ export function createTriLCApp(env: TriLCEnv) {
                 }
                 case 'assistant_message': {
                   const am = event as any;
-                  if (am.content && !deltaContent) {
+                  if (am.content) {
                     // r19-gate A3：deltaContent 是用户可见产出的唯一真源——
                     // 批量形态的最终答复也要计入（否则伪成功误判）。
-                    deltaContent += am.content;
+                    if (!deltaContent) deltaContent += am.content;
+                    contentAfterLastTool += am.content; // DEFECT-PSEUDO-CHAT: always track post-tool
                     writeSSE('delta', { content: am.content });
                   }
                   break;
@@ -2739,14 +2747,14 @@ export function createTriLCApp(env: TriLCEnv) {
               return;
             }
 
-            // C13 + r19-gate A3: Post-loop guard — 用户可见产出 = 文本内容。
-            // 仅工具调用、零文本收尾的回合是伪成功（r19 装后态问周面实测
-            // 3 工具调用 0 delta → 伪 task_done，TriPilot 显示空白）。
-            // W30 lesson: provider 全挂时可能静默返回空内容，绝不能发伪 task_done。
-            const producedAnyOutput = deltaContent.length > 0;
+            // C13 + r19-gate A3 + DEFECT-PSEUDO-CHAT: Post-loop guard — 用户可见产出 =
+            // 最后一次工具调用之后的文本结论。模型在工具前说「让我先看看...」是叙述，
+            // 不是结论——用户需要的是工具执行完后的总结文字。旧门禁（deltaContent.length）
+            // 把工具前叙述也算产出，导致「叙述→工具→沉默」被判成功（CEO 实测 2026-08-18）。
+            const producedAnyOutput = toolCount === 0 ? deltaContent.length > 0 : contentAfterLastTool.trim().length > 0;
             if (!producedAnyOutput) {
               const emptyError = toolCount > 0
-                ? 'Model loop completed without any answer content — tool calls only, no final text (pseudo-success)'
+                ? 'Model called tools but produced no final answer text after tools completed (pseudo-success: narrate → tools → silence)'
                 : 'Model loop completed without any content or tool calls — possible provider failure or empty reasoning-only response';
               console.error(`[trilc:model] CRITICAL: all providers exhausted for task=${sessionId}: ${emptyError}`);
               entry.status = 'error';
