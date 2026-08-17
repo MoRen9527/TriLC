@@ -2779,13 +2779,16 @@ export function createTriLCApp(env: TriLCEnv) {
               return;
             }
 
-            // C13 + r19-gate A3 + DEFECT-PSEUDO-CHAT v2: Post-loop guard — 用户可见产出 =
-            // 最后一次工具调用之后的文本结论；纯 "[tool_use name=X]" 文本（模型以文本形式
-            // 模拟工具调用，非真函数调用）同样不算产出。两种情况都以无工具模式补一轮
-            // 强制收尾调用，逼出真实结论（CEO 复测 2026-08-18：翻倍 + 无结论双缺陷）。
-            const PSEUDO_TOOL_TEXT_RE = /^\s*(\[tool_use[^\]]*\]\s*)*$/;
+            // C13 + r19-gate A3 + DEFECT-PSEUDO-CHAT v2/v2c: Post-loop guard — 用户可见产出 =
+            // 最后一次工具调用之后的文本结论；模型以文本形式模拟工具调用不算产出。
+            // v2 只认 "[tool_use name=X]" 整段纯匹配；v2c 放宽为「包含任意工具语法
+            // token 即触发」——模型每场会话都在发明新变体（"[｜｜DSML｜｜tool_use LS]"、
+            // "[工具输入] {...}"，CEO 复测 2 2026-08-18），枚举整段格式必被绕过。
+            // 含 token = 模型还想调工具但已无法真调 = 不是结论 → 强制收尾轮。
+            const PSEUDO_TOOL_TOKEN_RE =
+              /\[[^\]\n]*tool_use[^\]]*\]|\[工具输入\]|\[工具输出\]|\[tool_result[^\]]*\]|<tool_call>/;
             let userVisibleText = (toolCount === 0 ? deltaContent : contentAfterLastTool).trim();
-            let isPseudoToolText = PSEUDO_TOOL_TEXT_RE.test(userVisibleText);
+            let isPseudoToolText = PSEUDO_TOOL_TOKEN_RE.test(userVisibleText);
             if (userVisibleText && isPseudoToolText) {
               console.warn(`[trilc:chat] model emitted pseudo tool-call text instead of a conclusion (task=${sessionId}) — forcing conclusion turn`);
             }
@@ -2794,13 +2797,13 @@ export function createTriLCApp(env: TriLCEnv) {
               try {
                 if (!_modelClient) _modelClient = createModelClient();
                 const nudge = isPseudoToolText
-                  ? '（系统纠偏：你上一条消息以文本形式输出了 "[tool_use name=...]"，这不是有效的工具调用，系统无法执行。请不要再调用任何工具，直接基于已获取的信息，用一段完整的中文给出最终结论。）'
+                  ? '（系统纠偏：你最后一条消息把工具调用写成了文本（如 "[tool_use ...]"、"[工具输入] {...}" 等），这不是有效的工具调用，系统无法执行。请不要再调用任何工具，直接基于已获取的信息，用一段完整的中文给出最终结论。）'
                   : '（系统要求：请基于以上已完成的工具调用结果，用一段完整的中文直接给出最终结论，不要再调用任何工具。）';
                 const resp = await Promise.race([
                   _modelClient.chat(entry.model, [...rebuilt, { role: 'user', content: nudge }]),
                   new Promise<never>((_, rej) => setTimeout(() => rej(new Error('forced-conclusion timeout (60s)')), 60_000)),
                 ]);
-                if (resp?.content && resp.content.trim() && !PSEUDO_TOOL_TEXT_RE.test(resp.content)) {
+                if (resp?.content && resp.content.trim() && !PSEUDO_TOOL_TOKEN_RE.test(resp.content)) {
                   forced = resp.content.trim();
                 }
               } catch (fErr) {
@@ -2818,7 +2821,7 @@ export function createTriLCApp(env: TriLCEnv) {
             const producedAnyOutput = userVisibleText.length > 0 && !isPseudoToolText;
             if (!producedAnyOutput) {
               const emptyError = isPseudoToolText
-                ? 'Model ended with pseudo tool-call text ("[tool_use name=...]") instead of a conclusion, and the forced conclusion turn also failed'
+                ? 'Model ended with tool-call-as-text (e.g. "[tool_use ...]", "[工具输入] ...") instead of a conclusion, and the forced conclusion turn also failed'
                 : toolCount > 0
                   ? 'Model called tools but produced no final answer text after tools completed (pseudo-success: narrate → tools → silence)'
                   : 'Model loop completed without any content or tool calls — possible provider failure or empty reasoning-only response';
