@@ -78,6 +78,11 @@ export class CompanyInitState {
     return s.state;
   }
 
+  /** 2026-08-17 DEFECT-RESET-CACHE: reset deletes the state file — invalidate the in-memory
+   * cache so the next load() re-reads from disk. Without this, assemble's idempotency
+   * check (employees_mismatch 409) reads stale cached employees after a reset. */
+  invalidateCache(): void { this.cache = null; }
+
   /** Persist state file (atomic write: tmp → rename). */
   async save(state: Partial<CompanyStateFile>): Promise<CompanyStateFile> {
     const current = await this.load();

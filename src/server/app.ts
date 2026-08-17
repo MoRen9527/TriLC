@@ -1470,6 +1470,9 @@ export function createTriLCApp(env: TriLCEnv) {
               purgeWorktree: body.purgeWorktree,
               workspaceRoot: env.projectRoot ?? env.cwd,
             });
+            // DEFECT-RESET-CACHE: reset deleted state.json — invalidate daemon's in-memory
+            // CompanyInitState cache, otherwise assemble's idempotency check reads stale employees.
+            companyInitState.invalidateCache();
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({
               ok: true,

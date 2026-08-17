@@ -431,7 +431,10 @@ export class InitChain {
     chainState: 'selfcheck';
     cleared: string[];
   }> {
-    const dataDir = dirname(this.statePath);
+    // DEFECT-RESET-PATH (E2E 2026-08-17): dirname(init-chain.json) = company/ — using it as
+    // dataDir made every sibling path double-nested (company/company/state.json), so reset
+    // never deleted state.json (cleared always []) and purge-worktree never fired.
+    const dataDir = dirname(dirname(this.statePath));
     const workspaceRoot = opts.workspaceRoot ?? process.cwd();
     const cleared: string[] = [];
 
