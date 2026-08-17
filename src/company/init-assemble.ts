@@ -266,7 +266,10 @@ function buildTargets(
       tmpPath: `${absPath}.tmp`,
       bakPath: null,
       applied: false,
-      onlyIfMissing: false,
+      // BUG-001 修复（E2E C1-002 实证 2026-08-17）：worktree 内 .claude/agents 可能已有
+      // Claude Code 子代理定义（或前次装配产物）——同名文件视为既有真实内容，缺失才写（preserved 报告）。
+      // 双源冲突的根本解法归落点迁移设计（clone/collab 协议），此处先守不静默覆盖。
+      onlyIfMissing: true,
       preserved: false,
     });
   }
