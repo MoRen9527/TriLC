@@ -2633,6 +2633,9 @@ export function createTriLCApp(env: TriLCEnv) {
             let pseudoDetectedMidStream = false;
             let turnDeltaBuf = '';
             let leakedThisTurn = 0; // v2g：掐断前已转发的字符数（结论需分隔前缀）
+            // durationMs 真值（CEO 十一轮）：agent-core 的 tool_result 事件不带耗时字段，
+            // 旧代码发 `?? 0` → 所有卡显示 0ms。daemon 侧按 tool_call→tool_result 时间差计时。
+            const toolStartTimes = new Map<string, number>();
 
             const taskSessionRules = buildSessionPermissionRules();
             eventLoop: for await (const event of runCompactingAgentLoop({
@@ -2687,6 +2690,8 @@ export function createTriLCApp(env: TriLCEnv) {
                   // agent-core 的 arguments 是 JSON 字符串——daemon 侧解析成对象再发，
                   // 否则客户端二次 stringify 后 parse 回字符串，参数展示退化为逐字符索引
                   // （"LS: 0: {, 1: \""，CEO 五轮复测 2026-08-18）。
+                  const tcId = String(tc.id ?? tc.tool_call_id ?? `#${toolCount}`);
+                  toolStartTimes.set(tcId, Date.now());
                   const rawInput = tc.input ?? tc.arguments ?? {};
                   let toolInput: Record<string, unknown> = {};
                   if (typeof rawInput === 'string') {
@@ -2719,11 +2724,15 @@ export function createTriLCApp(env: TriLCEnv) {
                     content: typeof content === 'string' ? content : JSON.stringify(content),
                     tool_call_id: tr.tool_call_id ?? '',
                   });
+                  const trId = String(tr.tool_call_id ?? '');
+                  const toolStart = toolStartTimes.get(trId);
+                  const realDuration = toolStart != null ? Math.max(1, Date.now() - toolStart) : (tr.durationMs ?? 0);
+                  toolStartTimes.delete(trId);
                   writeSSE('tool_result', {
-                    id: tr.tool_call_id ?? '', // pairs with tool_use.id for card matching
+                    id: trId, // pairs with tool_use.id for card matching
                     toolName: tr.name ?? tr.tool_name ?? 'unknown',
                     output: typeof content === 'string' ? content : JSON.stringify(content),
-                    durationMs: tr.durationMs ?? 0,
+                    durationMs: realDuration,
                     isError: tr.is_error === true,
                   });
                   break;
