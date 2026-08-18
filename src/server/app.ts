@@ -2621,9 +2621,16 @@ export function createTriLCApp(env: TriLCEnv) {
             // 补一轮强制收尾调用，逼出真实结论。
             const rebuilt: Message[] = [{ role: 'user', content: entry.message }];
             let terminalError: string | undefined;
+            // v2d（CEO 三轮复测·闭合标签洪水）：模型会以「闭合标签无限重复」 floods
+            // （"</｜｜DSML｜｜parameter>" ×N）。RE 前移到流中，检测到伪工具语法即 break
+            // 当前流（不等回合自然结束），直接进强制收尾。等待自然结束 = 用户看着死循环。
+            const PSEUDO_TOOL_TOKEN_RE =
+              /\[[^\]\n]*tool_use[^\]]*\]|\[工具输入\]|\[工具输出\]|\[tool_result[^\]]*\]|<tool_call>|<parameter\s+name=|｜｜DSML｜｜/;
+            let pseudoDetectedMidStream = false;
+            let turnDeltaBuf = '';
 
             const taskSessionRules = buildSessionPermissionRules();
-            for await (const event of runCompactingAgentLoop({
+            eventLoop: for await (const event of runCompactingAgentLoop({
               model: entry.model,
               systemPrompt,
               messages,
@@ -2646,14 +2653,30 @@ export function createTriLCApp(env: TriLCEnv) {
                   const d = (event as any).delta ?? '';
                   deltaContent += d;
                   contentAfterLastTool += d;
+                  turnDeltaBuf += d;
                   hadDeltaSinceLastTool = true;
-                  writeSSE('delta', { content: d });
+                  // v2d mid-stream abort: 当前回合已在以文本形式模拟工具调用（含闭合标签
+                  // 洪水）——立即掐断，不再转发后续 delta（等自然结束 = 死循环观感）。
+                  if (!pseudoDetectedMidStream && turnDeltaBuf.length > 20 && PSEUDO_TOOL_TOKEN_RE.test(turnDeltaBuf)) {
+                    pseudoDetectedMidStream = true;
+                    console.warn(`[trilc:chat] pseudo tool-text detected mid-stream (task=${sessionId}, turn buf ${turnDeltaBuf.length} chars) — aborting turn, forcing conclusion`);
+                    writeSSE('task_progress', {
+                      step: toolCount,
+                      totalSteps: toolCount + 1,
+                      description: '检测到模型以文本模拟工具调用，已提前收口并强制生成结论',
+                    });
+                    break eventLoop;
+                  }
+                  if (!pseudoDetectedMidStream) {
+                    writeSSE('delta', { content: d });
+                  }
                   break;
                 }
                 case 'tool_call': {
                   toolCount++;
                   contentAfterLastTool = ''; // reset — text after this tool is what counts
                   hadDeltaSinceLastTool = false;
+                  turnDeltaBuf = ''; // v2d per-turn reset
                   const tc = event as any;
                   writeSSE('tool_use', {
                     id: tc.id ?? tc.tool_call_id, // agent-core tool_call.id — clients match result→card
@@ -2713,6 +2736,7 @@ export function createTriLCApp(env: TriLCEnv) {
                     }
                   }
                   hadDeltaSinceLastTool = false; // per-turn boundary reset
+                  turnDeltaBuf = ''; // v2d per-turn reset
                   break;
                 }
                 case 'loop_start': {
@@ -2781,16 +2805,20 @@ export function createTriLCApp(env: TriLCEnv) {
               return;
             }
 
-            // C13 + r19-gate A3 + DEFECT-PSEUDO-CHAT v2/v2c: Post-loop guard — 用户可见产出 =
+            // C13 + r19-gate A3 + DEFECT-PSEUDO-CHAT v2c/v2d: Post-loop guard — 用户可见产出 =
             // 最后一次工具调用之后的文本结论；模型以文本形式模拟工具调用不算产出。
             // v2 只认 "[tool_use name=X]" 整段纯匹配；v2c 放宽为「包含任意工具语法
-            // token 即触发」——模型每场会话都在发明新变体（"[｜｜DSML｜｜tool_use LS]"、
-            // "[工具输入] {...}"，CEO 复测 2 2026-08-18），枚举整段格式必被绕过。
-            // 含 token = 模型还想调工具但已无法真调 = 不是结论 → 强制收尾轮。
-            const PSEUDO_TOOL_TOKEN_RE =
-              /\[[^\]\n]*tool_use[^\]]*\]|\[工具输入\]|\[工具输出\]|\[tool_result[^\]]*\]|<tool_call>/;
+            // token 即触发」（枚举整段格式必被变体绕过）；v2d 前移到流中——闭合标签洪水
+            // 必须当场掐断（break eventLoop），等回合自然结束 = 用户看着死循环。
+            // PSEUDO_TOOL_TOKEN_RE 已在事件循环前声明（v2d）。
+            if (pseudoDetectedMidStream) {
+              // 剥除当前回合已累计的伪文本（面板可能已泄漏前几十字符，无法撤回，
+              // 但 transcript 与 session 落盘保持干净）。
+              deltaContent = deltaContent.slice(0, Math.max(0, deltaContent.length - turnDeltaBuf.length));
+              contentAfterLastTool = contentAfterLastTool.slice(0, Math.max(0, contentAfterLastTool.length - turnDeltaBuf.length));
+            }
             let userVisibleText = (toolCount === 0 ? deltaContent : contentAfterLastTool).trim();
-            let isPseudoToolText = PSEUDO_TOOL_TOKEN_RE.test(userVisibleText);
+            let isPseudoToolText = pseudoDetectedMidStream || PSEUDO_TOOL_TOKEN_RE.test(userVisibleText);
             if (userVisibleText && isPseudoToolText) {
               console.warn(`[trilc:chat] model emitted pseudo tool-call text instead of a conclusion (task=${sessionId}) — forcing conclusion turn`);
             }
@@ -2799,8 +2827,8 @@ export function createTriLCApp(env: TriLCEnv) {
               try {
                 if (!_modelClient) _modelClient = createModelClient();
                 const nudge = isPseudoToolText
-                  ? '（系统纠偏：你最后一条消息把工具调用写成了文本（如 "[tool_use ...]"、"[工具输入] {...}" 等），这不是有效的工具调用，系统无法执行。请不要再调用任何工具，直接基于已获取的信息，用一段完整的中文给出最终结论。）'
-                  : '（系统要求：请基于以上已完成的工具调用结果，用一段完整的中文直接给出最终结论，不要再调用任何工具。）';
+                  ? '（系统纠偏：你最后一条消息把工具调用写成了文本（如 "[tool_use ...]"、"[工具输入] {...}" 等），这不是有效的工具调用，系统无法执行。请不要再调用任何工具，也不要再描述你接下来打算做什么，直接基于已获取的信息，用一段完整的中文给出最终结论。）'
+                  : '（系统要求：请基于以上已完成的工具调用结果，用一段完整的中文直接给出最终结论。不要再调用任何工具，也不要描述接下来的计划。）';
                 const resp = await Promise.race([
                   _modelClient.chat(entry.model, [...rebuilt, { role: 'user', content: nudge }]),
                   new Promise<never>((_, rej) => setTimeout(() => rej(new Error('forced-conclusion timeout (60s)')), 60_000)),
