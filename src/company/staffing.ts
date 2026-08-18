@@ -20,6 +20,7 @@ interface StaffingRequest {
   runId: string;
   roleId: string;
   displayName: string;
+  employeeName?: string; // CEO 勾选时输入的员工名（审批通过后写入名册）
   requester: string;
   requestedAt: string;
   status: 'pending-cho' | 'approved' | 'rejected';
@@ -66,6 +67,7 @@ export async function getStaffingRoster(deps: StaffingDeps) {
       // CEO 2026-08-18：个人名是开业/上岗时赋予的实例属性——未在岗一律 null（呈现「无名字」），
       // 不从 TriCompany roster 默认名带出（岗位=固定资产，名字=流动资产，见 clone-dispatch §1.2）。
       employeeName: emp?.name ?? null,
+      instanceName: r.instanceName ?? null, // 起名默认建议（JD 登记层遗留参考）
       status: emp ? 'active' : req ? 'pending-cho' : 'candidate',
       onboardedAt: company.onboardedAt ?? null,
       requestId: req?.requestId ?? null,
@@ -84,7 +86,7 @@ export async function getStaffingRoster(deps: StaffingDeps) {
 }
 
 /** POST onboard：开业后勾选候选 → 登记 pending-cho 请求（CHO 审批门）。 */
-export async function requestOnboarding(deps: StaffingDeps, roleId: string, requester: string) {
+export async function requestOnboarding(deps: StaffingDeps, roleId: string, requester: string, employeeName?: string) {
   const chainState = deps.chain.getState();
   if (chainState !== 'ready' && chainState !== 'confirm' && chainState !== 'sync') {
     return { status: 409, error: 'chain_state_gate', message: `链态 ${chainState} 不可上岗（开业完成后才允许增员）` };
@@ -107,6 +109,7 @@ export async function requestOnboarding(deps: StaffingDeps, roleId: string, requ
     roleId,
     displayName: role.displayName ?? roleId,
     requester: requester || 'ceo-panel',
+    employeeName: (employeeName ?? '').trim() || undefined,
     requestedAt: new Date().toISOString(),
     status: 'pending-cho',
   };
@@ -142,7 +145,7 @@ export async function decideOnboarding(
     const company = await deps.companyState.load();
     const employees = [...(company.employees ?? [])];
     if (!employees.some((e: any) => e.role === req.roleId)) {
-      employees.push({ role: req.roleId, name: req.displayName });
+      employees.push({ role: req.roleId, name: req.employeeName || req.displayName });
     }
     await deps.companyState.save({ ...company, employees });
     // 审计 json（对齐 CHO-clone-staffing 形态）
