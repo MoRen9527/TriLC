@@ -2624,8 +2624,11 @@ export function createTriLCApp(env: TriLCEnv) {
             // v2d（CEO 三轮复测·闭合标签洪水）：模型会以「闭合标签无限重复」 floods
             // （"</｜｜DSML｜｜parameter>" ×N）。RE 前移到流中，检测到伪工具语法即 break
             // 当前流（不等回合自然结束），直接进强制收尾。等待自然结束 = 用户看着死循环。
+            // v2e（CEO 七轮）：新增 XML 族变体 "<invoke name=...>"（Qwen 风格）——
+            // 收敛为「XML 标签族」单分支：<(tool_call|invoke|parameter|function_call)[\s>]
+            // + 方括号族（[tool_use...]/[工具输入]/[工具输出]/[tool_result...]）+ DSML 标记。
             const PSEUDO_TOOL_TOKEN_RE =
-              /\[[^\]\n]*tool_use[^\]]*\]|\[工具输入\]|\[工具输出\]|\[tool_result[^\]]*\]|<tool_call>|<parameter\s+name=|｜｜DSML｜｜/;
+              /\[[^\]\n]*tool_use[^\]]*\]|\[工具输入\]|\[工具输出\]|\[tool_result[^\]]*\]|<(tool_call|invoke|parameter|function_call)[\s>]|\[Z\s*<\/?[a-z]|｜｜DSML｜｜/;
             let pseudoDetectedMidStream = false;
             let turnDeltaBuf = '';
 
