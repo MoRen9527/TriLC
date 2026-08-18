@@ -91,6 +91,12 @@ import {
 } from '../company/init-sync.js';
 import { runConfirmCheck, runConfirm } from '../company/init-confirm.js';
 import { runFirstCollabUpdate } from '../company/init-first-collab.js';
+import {
+  getStaffingRoster,
+  requestOnboarding,
+  decideOnboarding,
+  type StaffingDeps,
+} from '../company/staffing.js';
 import { createSessionReaper } from '../cron/session-reaper.js';
 import { createMinimalCronEngine, type MinimalCronEngine } from '../cron/service.js';
 import { createUpdateCheckHandler, startUpdateCheckLoop } from '../update/update-check.js';
@@ -759,6 +765,26 @@ export function createTriLCApp(env: TriLCEnv) {
     chain: initChain,
     publish,
     git: createGitRunner(),
+  };
+
+  // ── 候选岗位发布执行体（FADE-004：员工上岗 = JD 进在岗名册；分身另走 clone 协议）──
+  const staffingDeps: StaffingDeps = {
+    dataDir: env.dataDir,
+    companyState: {
+      load: () => companyInitState.load(),
+      save: (next) => companyInitState.save(next),
+    },
+    chain: {
+      getState: () => initChain.getState(),
+    },
+    getRoleCatalog: () => {
+      try {
+        return getContractResolver().getRoleCatalog();
+      } catch {
+        return null;
+      }
+    },
+    publish,
   };
 
   // ── 五维同步执行体（I4：sync/run 生成/commit/push 链；daemon 单执行体，
@@ -1484,6 +1510,65 @@ export function createTriLCApp(env: TriLCEnv) {
             res.writeHead(500, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ error: 'reset_failed', message: msg }));
           }
+          return;
+        }
+
+        // ── GET /internal/v1/staffing/roster ──
+        // FADE-004 候选岗位发布：13 岗 JD 全集 + 在岗（开业选定/后补上岗）+ 待审。
+        if (req.url === '/internal/v1/staffing/roster' && req.method === 'GET') {
+          try {
+            await initChain.load();
+            const payload = await getStaffingRoster(staffingDeps);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(payload));
+          } catch (err) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'roster_unavailable', message: (err as Error).message }));
+          }
+          return;
+        }
+
+        // ── POST /internal/v1/staffing/onboard ──
+        // 勾选候选 → 登记 pending-cho 请求（CHO 审批门）。链态门：开业完成后才可增员。
+        if (req.url === '/internal/v1/staffing/onboard' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) chunks.push(chunk);
+          let body: Record<string, unknown> = {};
+          try { body = JSON.parse(Buffer.concat(chunks).toString('utf-8')); } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid_json' }));
+            return;
+          }
+          await initChain.load();
+          const result = await requestOnboarding(
+            staffingDeps, String(body.roleId ?? ''), String(body.requester ?? 'ceo-panel'),
+          );
+          res.writeHead(result.status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(result));
+          return;
+        }
+
+        // ── POST /internal/v1/staffing/decide ──
+        // CHO 审批：approved → CompanyInitState.employees 写入 + 审计 json；rejected → 终态记录。
+        if (req.url === '/internal/v1/staffing/decide' && req.method === 'POST') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) chunks.push(chunk);
+          let body: Record<string, unknown> = {};
+          try { body = JSON.parse(Buffer.concat(chunks).toString('utf-8')); } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid_json' }));
+            return;
+          }
+          const decision = body.decision === 'rejected' ? 'rejected' : 'approved';
+          const result = await decideOnboarding(
+            staffingDeps,
+            String(body.requestId ?? ''),
+            decision,
+            String(body.approver ?? ''),
+            typeof body.note === 'string' ? body.note : undefined,
+          );
+          res.writeHead(result.status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(result));
           return;
         }
 
