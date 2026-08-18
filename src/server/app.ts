@@ -2632,6 +2632,7 @@ export function createTriLCApp(env: TriLCEnv) {
               /\[[^\]\n]*tool_use[^\]]*\]|\[(工具输入|工具输出|调用)[^\]]*\]|\[tool_result[^\]]*\]|<(tool_call|invoke|parameter|function_call)[\s>]|\[[A-Za-z_一-鿿][A-Za-z0-9_ 一-鿿]{0,31}\]\s*\{|｜｜DSML｜｜/;
             let pseudoDetectedMidStream = false;
             let turnDeltaBuf = '';
+            let leakedThisTurn = 0; // v2g：掐断前已转发的字符数（结论需分隔前缀）
 
             const taskSessionRules = buildSessionPermissionRules();
             eventLoop: for await (const event of runCompactingAgentLoop({
@@ -2659,9 +2660,9 @@ export function createTriLCApp(env: TriLCEnv) {
                   contentAfterLastTool += d;
                   turnDeltaBuf += d;
                   hadDeltaSinceLastTool = true;
-                  // v2d mid-stream abort: 当前回合已在以文本形式模拟工具调用（含闭合标签
-                  // 洪水）——立即掐断，不再转发后续 delta（等自然结束 = 死循环观感）。
-                  if (!pseudoDetectedMidStream && turnDeltaBuf.length > 20 && PSEUDO_TOOL_TOKEN_RE.test(turnDeltaBuf)) {
+                  // v2d/v2g mid-stream abort: 当前回合已在以文本形式模拟工具调用——
+                  // 模式一成形立即掐断（旧 >20 字符阈值让前缀多泄漏十几字符，CEO 九轮）。
+                  if (!pseudoDetectedMidStream && PSEUDO_TOOL_TOKEN_RE.test(turnDeltaBuf)) {
                     pseudoDetectedMidStream = true;
                     console.warn(`[trilc:chat] pseudo tool-text detected mid-stream (task=${sessionId}, turn buf ${turnDeltaBuf.length} chars) — aborting turn, forcing conclusion`);
                     writeSSE('task_progress', {
@@ -2673,6 +2674,7 @@ export function createTriLCApp(env: TriLCEnv) {
                   }
                   if (!pseudoDetectedMidStream) {
                     writeSSE('delta', { content: d });
+                    leakedThisTurn += d.length;
                   }
                   break;
                 }
@@ -2854,7 +2856,9 @@ export function createTriLCApp(env: TriLCEnv) {
                 console.warn('[trilc:chat] forced conclusion call failed:', (fErr as Error).message);
               }
               if (forced) {
-                const prefix = userVisibleText ? '\n\n' : '';
+                // v2g：面板上可能有已泄漏的伪文本碎片——只要本回合或累计产出非空，
+                // 结论一律带 \n\n 分隔，避免「{"path":"d从当前工作树结构看…」粘接。
+                const prefix = (userVisibleText || leakedThisTurn > 0) ? '\n\n' : '';
                 deltaContent += prefix + forced;
                 contentAfterLastTool += prefix + forced;
                 writeSSE('delta', { content: prefix + forced });
