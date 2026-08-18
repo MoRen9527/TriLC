@@ -41,6 +41,9 @@ export interface AgentContract {
 export interface EmployeeRosterEntry {
   id: string;
   displayName: string;
+  /** 个人名（实例属性参考；运行态真源 = 各部署 CompanyInitState.employees）。 */
+  instanceName?: string;
+
   family: 'Role' | 'Registry';
   role: string;
   tier: string;
@@ -90,6 +93,8 @@ export interface RoleCatalogEntry {
   roleName: string;
   /** 岗位显示名（JD 层，如 "CEO 总助"）——个人名是实例属性，不经 catalog 传递。 */
   displayName?: string;
+  /** 个人名建议（roster instanceName，开业/上岗起名时的默认值）。 */
+  instanceName?: string;
   /** 一句话定位 = 合同 identity.description（employee-standard-capabilities.md:50 映射）。 */
   oneLinePositioning: string;
   /** roster tier === 'C-suite'（8 C-suite 岗 true / 5 Execution 岗 false）。 */
@@ -337,6 +342,7 @@ class AgentContractResolver {
         roleId: entry.id,
         roleName: contract.identity.role || entry.role,
         displayName: entry.displayName,
+        instanceName: entry.instanceName,
         oneLinePositioning: contract.identity.description,
         isGovernance: entry.tier === 'C-suite',
         defaultSelected: DEFAULT_SELECTED_ROLES.includes(entry.id),

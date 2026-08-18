@@ -2105,6 +2105,7 @@ export function createTriLCApp(env: TriLCEnv) {
           await initChain.load();
           const result = await requestOnboarding(
             staffingDeps, String(body.roleId ?? ''), String(body.requester ?? 'ceo-panel'),
+            typeof body.employeeName === 'string' ? body.employeeName : undefined,
           );
           res.writeHead(result.status, { 'content-type': 'application/json' });
           res.end(JSON.stringify(result));
