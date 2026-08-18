@@ -60,9 +60,12 @@ export async function getStaffingRoster(deps: StaffingDeps) {
     const req = pending.get(r.roleId);
     return {
       roleId: r.roleId,
-      displayName: r.displayName ?? r.roleId,
-      role: r.role ?? r.roleId,
-      description: r.description ?? '',
+      displayName: r.displayName ?? r.roleName ?? r.roleId, // 岗位中文名（roster displayName，JD 层）
+      role: r.roleName ?? r.role ?? r.roleId,
+      description: r.oneLinePositioning ?? r.description ?? '',
+      // CEO 2026-08-18：个人名是开业/上岗时赋予的实例属性——未在岗一律 null（呈现「无名字」），
+      // 不从 TriCompany roster 默认名带出（岗位=固定资产，名字=流动资产，见 clone-dispatch §1.2）。
+      employeeName: emp?.name ?? null,
       status: emp ? 'active' : req ? 'pending-cho' : 'candidate',
       onboardedAt: company.onboardedAt ?? null,
       requestId: req?.requestId ?? null,

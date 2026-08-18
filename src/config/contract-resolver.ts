@@ -88,6 +88,8 @@ export const DEFAULT_SELECTED_ROLES: readonly string[] = [
 export interface RoleCatalogEntry {
   roleId: string;
   roleName: string;
+  /** 岗位显示名（JD 层，如 "CEO 总助"）——个人名是实例属性，不经 catalog 传递。 */
+  displayName?: string;
   /** 一句话定位 = 合同 identity.description（employee-standard-capabilities.md:50 映射）。 */
   oneLinePositioning: string;
   /** roster tier === 'C-suite'（8 C-suite 岗 true / 5 Execution 岗 false）。 */
@@ -334,6 +336,7 @@ class AgentContractResolver {
       roles.push({
         roleId: entry.id,
         roleName: contract.identity.role || entry.role,
+        displayName: entry.displayName,
         oneLinePositioning: contract.identity.description,
         isGovernance: entry.tier === 'C-suite',
         defaultSelected: DEFAULT_SELECTED_ROLES.includes(entry.id),

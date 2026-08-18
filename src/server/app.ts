@@ -1621,10 +1621,19 @@ export function createTriLCApp(env: TriLCEnv) {
                 const rights = resolver.getDecisionRights(id);
                 const tools = resolver.getToolControl(id);
                 const rosterInfo = resolver.getEmployeeInfo(id);
+                // 岗位-实例分离（CEO 2026-08-18）：displayName=岗位名（JD 层）；
+                // 个人名是实例属性——仅当该岗位在本部署已上岗（公司态 employees）
+                // 才以「岗位名 · 人名」呈现，未在岗不带个人名。
+                let displayWithInstance = rosterInfo?.displayName ??
+                  (typeof tools?.name === 'string' ? tools.name : id);
+                try {
+                  const companyFile = await companyInitState.load();
+                  const emp = (companyFile.employees ?? []).find((e: any) => e.role === id);
+                  if (emp?.name) displayWithInstance = `${displayWithInstance} · ${emp.name}`;
+                } catch { /* 公司态不可达 → 仅岗位名 */ }
                 agents.push({
                   id,
-                  displayName: rosterInfo?.displayName ??
-                    (typeof tools?.name === 'string' ? tools.name : id),
+                  displayName: displayWithInstance,
                   role: rosterInfo?.role,
                   supervisor: rosterInfo?.reportsTo,
                   description: typeof tools?.description === 'string' ? tools.description : undefined,
