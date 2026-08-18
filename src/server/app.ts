@@ -3265,10 +3265,20 @@ export function createTriLCApp(env: TriLCEnv) {
                   hadDeltaSinceLastTool = false;
                   turnDeltaBuf = ''; // v2d per-turn reset
                   const tc = event as any;
+                  // agent-core 的 arguments 是 JSON 字符串——daemon 侧解析成对象再发，
+                  // 否则客户端二次 stringify 后 parse 回字符串，参数展示退化为逐字符索引
+                  // （"LS: 0: {, 1: \""，CEO 五轮复测 2026-08-18）。
+                  const rawInput = tc.input ?? tc.arguments ?? {};
+                  let toolInput: Record<string, unknown> = {};
+                  if (typeof rawInput === 'string') {
+                    try { toolInput = JSON.parse(rawInput); } catch { toolInput = { raw: rawInput }; }
+                  } else if (rawInput && typeof rawInput === 'object') {
+                    toolInput = rawInput;
+                  }
                   writeSSE('tool_use', {
                     id: tc.id ?? tc.tool_call_id, // agent-core tool_call.id — clients match result→card
                     toolName: tc.name ?? tc.tool_name ?? 'unknown',
-                    input: tc.input ?? tc.arguments ?? {},
+                    input: toolInput,
                   });
                   // Update progress
                   entry.progress = {
