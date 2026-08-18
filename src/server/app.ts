@@ -3243,6 +3243,7 @@ export function createTriLCApp(env: TriLCEnv) {
                   hadDeltaSinceLastTool = false;
                   const tc = event as any;
                   writeSSE('tool_use', {
+                    id: tc.id ?? tc.tool_call_id, // agent-core tool_call.id — clients match result→card
                     toolName: tc.name ?? tc.tool_name ?? 'unknown',
                     input: tc.input ?? tc.arguments ?? {},
                   });
@@ -3267,6 +3268,7 @@ export function createTriLCApp(env: TriLCEnv) {
                     tool_call_id: tr.tool_call_id ?? '',
                   });
                   writeSSE('tool_result', {
+                    id: tr.tool_call_id ?? '', // pairs with tool_use.id for card matching
                     toolName: tr.name ?? tr.tool_name ?? 'unknown',
                     output: typeof content === 'string' ? content : JSON.stringify(content),
                     durationMs: tr.durationMs ?? 0,
