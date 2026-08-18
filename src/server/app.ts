@@ -3422,16 +3422,29 @@ export function createTriLCApp(env: TriLCEnv) {
             }
             let userVisibleText = (toolCount === 0 ? deltaContent : contentAfterLastTool).trim();
             let isPseudoToolText = pseudoDetectedMidStream || PSEUDO_TOOL_TOKEN_RE.test(userVisibleText);
+            // v2h（CEO 十轮）：最终回合只有「承诺式叙述」（"最后确认一下 git 工作区"），
+            // 无伪工具语法也能骗过门禁——短文本 + 尾缀行动意图 + 无结论标记 → 视为无结论。
+            const TRAILING_INTENT_RE = /(让我|我来|我先|我要|我会|接下来|继续|最后|再去|再看|再查|还需|下一步)[^。；;]{0,30}[。…]?\s*$/;
+            const CONCLUSION_MARKERS_RE = /(结论|总结|综上|以上[就是]|已完成|完成验收|一切正常|就绪|通过)/;
+            const isTrailingIntent = !isPseudoToolText && userVisibleText.length > 0
+              && userVisibleText.length < 150
+              && TRAILING_INTENT_RE.test(userVisibleText)
+              && !CONCLUSION_MARKERS_RE.test(userVisibleText);
+            if (isTrailingIntent) {
+              console.warn(`[trilc:chat] model ended with a trailing intent instead of a conclusion (task=${sessionId}) — forcing conclusion turn`);
+            }
             if (userVisibleText && isPseudoToolText) {
               console.warn(`[trilc:chat] model emitted pseudo tool-call text instead of a conclusion (task=${sessionId}) — forcing conclusion turn`);
             }
-            if (!userVisibleText || isPseudoToolText) {
+            if (!userVisibleText || isPseudoToolText || isTrailingIntent) {
               let forced = '';
               try {
                 if (!_modelClient) _modelClient = createModelClient();
                 const nudge = isPseudoToolText
                   ? '（系统纠偏：你最后一条消息把工具调用写成了文本（如 "[tool_use ...]"、"[工具输入] {...}" 等），这不是有效的工具调用，系统无法执行。请不要再调用任何工具，也不要再描述你接下来打算做什么，直接基于已获取的信息，用一段完整的中文给出最终结论。）'
-                  : '（系统要求：请基于以上已完成的工具调用结果，用一段完整的中文直接给出最终结论。不要再调用任何工具，也不要描述接下来的计划。）';
+                  : isTrailingIntent
+                    ? '（系统纠偏：你最后一条消息只描述了接下来还要确认什么，没有给出结论。请立即基于以上已获取的信息，用一段完整的中文给出最终结论。不要再调用任何工具，不要再描述接下来的计划。）'
+                    : '（系统要求：请基于以上已完成的工具调用结果，用一段完整的中文直接给出最终结论。不要再调用任何工具，也不要描述接下来的计划。）';
                 const resp = await Promise.race([
                   _modelClient.chat(entry.model, [...rebuilt, { role: 'user', content: nudge }]),
                   new Promise<never>((_, rej) => setTimeout(() => rej(new Error('forced-conclusion timeout (60s)')), 60_000)),
