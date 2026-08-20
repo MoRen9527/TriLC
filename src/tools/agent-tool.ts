@@ -21,11 +21,16 @@ export async function listAgentsForDisplay(): Promise<string> {
     const trimcBase = process.env.TRIMC_BASE_URL ?? 'http://127.0.0.1:8710';
     const res = await fetch(`${trimcBase}/internal/v1/agents`);
     const json = await res.json() as {
-      ok: boolean;
+      ok?: boolean;
       agents?: Array<{ agentId?: string; name?: string; sessionId?: string }>;
     };
-    if (json.ok && json.agents) {
-      contractAgents = json.agents.map(a => ({
+    // 兼容实际响应形状：daemon /internal/v1/agents 返回 {agents,count,scope}
+    // （无 ok 字段，曾致合同员工列表永远为空）——以 agents 数组为准，ok 仅可选兼容。
+    const agentList = parseAgentsResponse(json) as Array<{
+      agentId?: string; name?: string; sessionId?: string;
+    }>;
+    if (agentList.length > 0) {
+      contractAgents = agentList.map(a => ({
         name: a.agentId ?? a.name ?? 'unknown',
         description: a.name || a.agentId || 'company agent',
       }));
@@ -38,6 +43,20 @@ export async function listAgentsForDisplay(): Promise<string> {
   const header = 'Available Sub-Agents:\n';
   const lines = all.map(a => `  • ${a.name} — ${a.description}`);
   return header + lines.join('\n');
+}
+
+/**
+ * 解析 /internal/v1/agents 响应（可测纯函数）。
+ *
+ * 实际形状兼容（2026-08-20 spawn 端到端实跑抓到的生产 bug）：daemon 端点
+ * 返回 {agents, count, scope, tricompanyEnabled}（无 ok 字段），TriMC 面
+ * 可能带 ok —— 以 agents 数组为准，ok 仅可选兼容。非数组/缺失 → []（调用方
+ * 保持 built-in 优先 / fallback 逻辑不变）。
+ */
+export function parseAgentsResponse(json: unknown): Array<Record<string, unknown>> {
+  if (!json || typeof json !== 'object') return [];
+  const agents = (json as { agents?: unknown }).agents;
+  return Array.isArray(agents) ? agents : [];
 }
 
 // ── FADE-ASSESS-005：分身门禁（上岗 gating）──
@@ -134,14 +153,28 @@ export function registerAgentTool(): void {
         // Try contract-resolver agents loaded by the daemon (12 TriCompany employees)
         try {
           const res = await fetch('http://localhost:8711/internal/v1/agents');
-          const json = await res.json() as { ok: boolean; agents?: Array<{ id: string; name?: string; systemPrompt?: string }> };
-          if (json.ok && json.agents) {
-            const match = json.agents.find(a => a.id === agentType);
+          const json = await res.json() as {
+            ok?: boolean;
+            agents?: Array<{
+              id?: string; name?: string; displayName?: string;
+              description?: string; systemPrompt?: string;
+            }>;
+          };
+          // 兼容实际响应形状：daemon 返回 {agents,count,scope,tricompanyEnabled}
+          // （无 ok 字段，agent 项含 displayName/description 而非 name/systemPrompt）——
+          // 旧判 `json.ok && json.agents` 恒 false，合同员工岗 spawn 永远
+          // "Unknown agent type"（FADE-005 门禁在生产链路从未实际生效）。
+          const agentList = parseAgentsResponse(json) as Array<{
+            id?: string; name?: string; displayName?: string;
+            description?: string; systemPrompt?: string;
+          }>;
+          if (agentList.length > 0) {
+            const match = agentList.find(a => a.id === agentType);
             if (match) {
               // Synthesize a basic AgentDefinition for the contract agent
               agentDef = {
-                name: match.id,
-                description: match.name || match.id,
+                name: match.id ?? agentType,
+                description: match.description ?? match.displayName ?? match.name ?? match.id ?? agentType,
                 systemPrompt: match.systemPrompt,
               } as AgentDefinition;
             }
