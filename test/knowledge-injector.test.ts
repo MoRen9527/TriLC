@@ -3,10 +3,12 @@
 //   1. 幂等重入（hash 相同跳过）
 //   2. hash 变更重写（按 source_path 替换）
 //   3. 项目隔离（multi-project-router + enforceProjectIsolation）
-//   4. 注入块正确性（<knowledge-context> 三层顺序）
+//   4. 注入块正确性（<knowledge-context> 层顺序 + 来源语义标签）
 //   5. 消费记录（knowledge_consumption 行）
 //   6. dry-run（不写库）
 //   7. 增量同步（agentFilter）+ 主路径挂接（session-initializer）
+//   8. 内容层接入（批次 3-2）：wiki/inbox 注入、inbox 过滤与字段裁剪、
+//      来源标签、schema v2→v3 迁移
 //
 // Run: npx tsx --test test/knowledge-injector.test.ts
 
@@ -20,8 +22,15 @@ import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getKnowledgeDbPath, enforceProjectIsolation } from '../src/project/multi-project-router.js';
-import { createKnowledgeStore } from '../src/knowledge-injector/knowledge-db.js';
-import { syncKnowledgeFromSource } from '../src/knowledge-injector/sync.js';
+import { createKnowledgeStore, layerDomain } from '../src/knowledge-injector/knowledge-db.js';
+import {
+  syncKnowledgeFromSource,
+  resolveContentRoot,
+  parseInboxRecord,
+  shouldInjectInboxRecord,
+  serializeInboxContent,
+  INBOX_CLOSED_WINDOW_DAYS,
+} from '../src/knowledge-injector/sync.js';
 import {
   buildKnowledgeContextBlock,
   injectKnowledgeContext,
@@ -287,20 +296,27 @@ describe('knowledge-injector — injection', () => {
     await rm(projectRoot, { recursive: true, force: true });
   });
 
-  it('注入块组装：<knowledge-context> 内 Memory → Colleagues → Social 顺序', () => {
+  it('注入块组装：<knowledge-context> 内 Memory → Colleagues → Social 顺序 + sources 标签', () => {
     const block = buildKnowledgeContextBlock('employee/alpha', [
       { layer: 'memory', content: 'M1 内容' },
       { layer: 'colleagues', content: 'C1 内容' },
       { layer: 'social', content: 'S1 内容' },
     ]);
 
-    assert.ok(block.startsWith('<knowledge-context namespace="employee/alpha">'));
+    // 批次 3-2：块头带 sources 来源语义标签（实际注入层列表）
+    assert.ok(
+      block.startsWith('<knowledge-context namespace="employee/alpha" sources="memory,colleagues,social">'),
+    );
     assert.ok(block.endsWith('</knowledge-context>'));
     const memIdx = block.indexOf('## Memory');
     const colIdx = block.indexOf('## Colleagues');
     const socIdx = block.indexOf('## Social');
     assert.ok(memIdx > -1 && colIdx > memIdx && socIdx > colIdx, '三层顺序固定');
     assert.ok(block.includes('M1 内容') && block.includes('C1 内容') && block.includes('S1 内容'));
+    // 域后缀：契约层标 (contract)，防与内容层 curated 混淆
+    assert.ok(block.includes('## Memory (contract)'));
+    assert.ok(block.includes('## Colleagues (contract)'));
+    assert.ok(block.includes('## Social (contract)'));
   });
 
   it('注入：追加知识块到 prompt 并按层写消费记录', () => {
@@ -313,7 +329,8 @@ describe('knowledge-injector — injection', () => {
 
     assert.equal(result.injected, true);
     assert.ok(result.prompt.startsWith('SOUL+BODY'));
-    assert.ok(result.prompt.includes('<knowledge-context namespace="employee/alpha">'));
+    // 批次 3-2：块头带 sources 来源语义标签（实际注入层）
+    assert.ok(result.prompt.includes('<knowledge-context namespace="employee/alpha" sources="memory,colleagues,social">'));
     assert.deepEqual(result.layers, ['memory', 'colleagues', 'social']);
     assert.equal(result.consumed, 3);
 
@@ -396,8 +413,9 @@ describe('knowledge-injector — behavior metrics (小乔验证指标)', () => {
     await rm(projectRoot, { recursive: true, force: true });
   });
 
-  it('v1 旧库打开自动迁移 v2：knowledge_metrics 表可用', () => {
-    // 手工建 v1 库（user_version=1，无 metrics 表）→ 打开 → v2 表出现
+  it('v1 旧库打开自动迁移 v3：knowledge_metrics 表可用 + layer CHECK 放宽', () => {
+    // 手工建 v1 库（user_version=1，无 metrics 表、三层 CHECK）→ 打开 → 迁移到
+    // v3（v2 建 metrics 表 + v3 重建 knowledge_documents 放宽 layer CHECK）
     mkdirSync(dirname(dbPath), { recursive: true });
     const raw = new DatabaseSync(dbPath);
     raw.exec(`
@@ -416,14 +434,26 @@ describe('knowledge-injector — behavior metrics (小乔验证指标)', () => {
 
     const store = createKnowledgeStore(dbPath, { projectRoot });
     try {
-      // v2 显式断言：user_version 已升到 2（schema 同步）
+      // 批次 3-2 显式断言：user_version 已升到 3（v1→v2→v3 全链迁移）
       const probe = new DatabaseSync(dbPath, { readOnly: true });
       try {
         const v = probe.prepare('PRAGMA user_version').get() as { user_version: number };
-        assert.equal(v.user_version, 2, '迁移后 user_version 应为 2');
+        assert.equal(v.user_version, 3, '迁移后 user_version 应为 3');
       } finally {
         probe.close();
       }
+      // v3 后 layer CHECK 放宽：wiki 层可写入（内容层注入面就绪）
+      const wiki = store.upsertDocument({
+        namespace: 'employee/alpha',
+        layer: 'wiki',
+        agentId: 'alpha',
+        sourcePath: 'wiki/alpha.md',
+        content: '# wiki',
+        contentHash: 'hash-wiki-v1mig',
+        sourceMtime: '2026-08-20T00:00:00Z',
+        syncedAt: new Date().toISOString(),
+      });
+      assert.equal(wiki.status, 'inserted');
       store.recordMetric({
         event: 'routing_error',
         agentId: 'chief-financial-officer',
@@ -606,7 +636,8 @@ describe('knowledge-injector — session-initializer main path', () => {
     const config = await initializeSession('sample-agent', workspaceRoot);
 
     assert.ok(config.systemPrompt.startsWith('Sample soul\n\nSample soul'));
-    assert.ok(config.systemPrompt.includes('<knowledge-context namespace="employee/sample-agent">'));
+    // 批次 3-2：块头 sources 标签（三层契约）
+    assert.ok(config.systemPrompt.includes('<knowledge-context namespace="employee/sample-agent" sources="memory,colleagues,social">'));
     const memIdx = config.systemPrompt.indexOf('## Memory');
     const colIdx = config.systemPrompt.indexOf('## Colleagues');
     const socIdx = config.systemPrompt.indexOf('## Social');
@@ -663,7 +694,8 @@ describe('knowledge-injector — heartbeat 会话注入挂接点 (agent-runner s
 
     assert.equal(result.injected, true);
     assert.ok(result.prompt.startsWith(defaultPrompt), '注入只追加不替换原 prompt');
-    assert.ok(result.prompt.includes('<knowledge-context namespace="employee/alpha">'));
+    // 批次 3-2：块头 sources 标签（三层契约）
+    assert.ok(result.prompt.includes('<knowledge-context namespace="employee/alpha" sources="memory,colleagues,social">'));
     assert.deepEqual(result.layers, ['memory', 'colleagues', 'social']);
     assert.equal(result.consumed, 3);
 
@@ -708,5 +740,509 @@ describe('knowledge-injector — heartbeat 会话注入挂接点 (agent-runner s
       if (prev === undefined) delete process.env.TRILC_PROJECT_ROOT;
       else process.env.TRILC_PROJECT_ROOT = prev;
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 8. 内容层接入（批次 3-2）：wiki 消费记录（主）+ inbox（辅）
+// ═══════════════════════════════════════════════════════════════════
+// 产品输入（CPO 小乔定案 2026-08-20）：
+//   - 首批 = wiki 消费记录 + inbox，namespace 均落 employee/<id>
+//   - wiki 页 md 形态复用 hash/upsert/幂等链路；layer='wiki'
+//   - inbox JSON 单据：仅注入 open 或近 N 天（7 天）closed；
+//     字段裁剪 summary/objectType/sender/priority/createdAt/
+//     routingPackagePath/linkedNextAction（剥离 unread/resolution）
+//   - audit 写回显式排除；org/shared 只预留不接入
+
+/** 建内容资产树：<ws>/TriMetaverse/TriCompany-copilot-host-assets/knowledge/employees/<id>/{wiki,inbox,audit}。 */
+async function makeContentRoot(ws: string, agents: Array<{
+  id: string;
+  wiki?: string[];
+  inbox?: string[];
+  audit?: boolean;
+}>): Promise<string> {
+  const contentRoot = join(ws, 'TriMetaverse', 'TriCompany-copilot-host-assets');
+  for (const agent of agents) {
+    const base = join(contentRoot, 'knowledge', 'employees', agent.id);
+    if (agent.wiki) {
+      const wikiDir = join(base, 'wiki');
+      await mkdir(wikiDir, { recursive: true });
+      for (const [name, content] of agent.wiki) {
+        await writeFile(join(wikiDir, name), content, 'utf-8');
+      }
+    }
+    if (agent.inbox) {
+      const inboxDir = join(base, 'inbox');
+      await mkdir(inboxDir, { recursive: true });
+      for (const [name, content] of agent.inbox) {
+        await writeFile(join(inboxDir, name), content, 'utf-8');
+      }
+    }
+    if (agent.audit) {
+      await mkdir(join(base, 'audit'), { recursive: true });
+      await writeFile(join(base, 'audit', 'record-template.json'), '{"audit":true}', 'utf-8');
+    }
+  }
+  return contentRoot;
+}
+
+describe('knowledge-injector — content layer sync (批次 3-2)', () => {
+  let ws: string;
+  let sourceRoot: string; // <ws>/TriCompany/source-agents（生产形态）
+  let projectRoot: string;
+  let dbPath: string;
+  const recentClosedIso = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString(); // 近 1 天
+  const staleClosedIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(); // 30 天前
+
+  before(async () => {
+    ws = await mkdtemp(join(tmpdir(), 'trilc-kn-content-ws-'));
+    sourceRoot = join(ws, 'TriCompany', 'source-agents');
+    const alphaDir = join(sourceRoot, 'alpha');
+    await mkdir(alphaDir, { recursive: true });
+    await writeFile(join(alphaDir, 'alpha.memory.md'), '# alpha memory\n契约层内容', 'utf-8');
+
+    await makeContentRoot(ws, [
+      {
+        id: 'alpha',
+        wiki: [
+          ['README.md', '# Wiki 说明\n不注入'],
+          ['page-template.md', '---\npageId: template\n---\n模板不注入'],
+          ['employee-consumption-records.md', '# Alpha Consumption Records\n\n阶段记忆：2026-08-01 上岗。'],
+          ['chief-of-staff-current-state.md', '---\npageId: alpha-state\ntitle: 当前状态\npageStatus: working\n---\n\n## 当前整理事实\n\n消费记录已迁移。'],
+        ],
+        inbox: [
+          // open 单据（缺省 status）
+          ['2026-08-10-facts.json', JSON.stringify({
+            sourceId: 'note-001',
+            title: '事实清单（旧形态）',
+            sourceType: 'json-record',
+            topicHints: ['alpha'],
+            trustLevel: 'curated',
+            capturedAt: '2026-08-10T10:00:00+08:00',
+            facts: ['事实 A', '事实 B'],
+          }, null, 2)],
+          // 近 N 天 closed
+          ['2026-08-15-routing.json', JSON.stringify({
+            summary: '路由包归档',
+            objectType: 'routing-package',
+            sender: 'chief-of-staff',
+            priority: 'high',
+            createdAt: '2026-08-15T09:00:00+08:00',
+            status: 'closed',
+            closedAt: recentClosedIso,
+            routingPackagePath: 'docs/execution/routing/pack-001.json',
+            linkedNextAction: 'review by CTO',
+            unread: true,
+            resolution: 'accepted',
+            payload: { route: 'cto' },
+          }, null, 2)],
+          // 陈旧 closed（30 天前）→ 过滤
+          ['2026-07-01-stale.json', JSON.stringify({
+            summary: '陈旧单据',
+            objectType: 'note',
+            sender: 'ceo',
+            priority: 'low',
+            createdAt: '2026-07-01T09:00:00+08:00',
+            status: 'closed',
+            closedAt: staleClosedIso,
+            unread: false,
+            resolution: 'closed-out',
+          }, null, 2)],
+          // 模板不注入
+          ['source-template.json', '{"summary":"模板"}'],
+          // md 笔记：产品语义首批只注入 JSON 单据 → 跳过
+          ['2026-08-11-meeting-note.md', '# 会议笔记\n内容不注入'],
+        ],
+        audit: true,
+      },
+    ]);
+
+    projectRoot = await mkdtemp(join(tmpdir(), 'trilc-kn-content-proj-'));
+    dbPath = getKnowledgeDbPath(projectRoot);
+  });
+  after(async () => {
+    await rm(ws, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+
+  it('resolveContentRoot：从 TriCompany/source-agents 推导到 <ws>/TriMetaverse/TriCompany-copilot-host-assets', () => {
+    const resolved = resolveContentRoot(sourceRoot);
+    assert.ok(resolved, '内容资产根应被推导到');
+    assert.equal(resolved, join(ws, 'TriMetaverse', 'TriCompany-copilot-host-assets'));
+  });
+
+  it('内容层同步：wiki 页注入（layer=wiki，模板排除）+ inbox 过滤与裁剪 + audit 不注入', () => {
+    const report = syncKnowledgeFromSource({ sourceRoot, projectRoot });
+
+    // 契约层：alpha.memory 1 文件
+    // 内容层：wiki 2 页（README/page-template 排除）+ inbox 3 单（模板/md 排除，
+    //        stale closed 过滤掉但计入 scanned）→ 实际插入 5
+    assert.equal(report.scanned, 6);
+    assert.equal(report.inserted, 5); // memory + wiki×2 + inbox open + inbox 近 closed
+    assert.equal(report.filtered, 1); // 仅陈旧 closed 过滤
+    assert.equal(report.errors.length, 0);
+    assert.equal(report.contentRoot, join(ws, 'TriMetaverse', 'TriCompany-copilot-host-assets'));
+
+    const store = createKnowledgeStore(dbPath, { projectRoot });
+    try {
+      assert.equal(store.countDocuments(), 5);
+      const docs = store.listLatestDocuments('employee/alpha', 'alpha');
+      assert.deepEqual(docs.map((d) => d.layer), ['memory', 'wiki', 'wiki', 'inbox', 'inbox']);
+
+      // wiki 层：md 全文注入（幂等 hash 键，多页全量），README/模板排除
+      const wikiDocs = docs.filter((d) => d.layer === 'wiki');
+      assert.equal(wikiDocs.length, 2);
+      assert.ok(wikiDocs.some((d) => d.content.includes('Alpha Consumption Records')));
+      assert.ok(wikiDocs.some((d) => d.content.includes('pageStatus: working')));
+      assert.ok(!wikiDocs.some((d) => d.content.includes('模板不注入')));
+
+      // inbox 层：3 单据 → open + 近 1 天 closed 注入，陈旧 closed 过滤
+      const inboxDocs = docs.filter((d) => d.layer === 'inbox');
+      assert.equal(inboxDocs.length, 2);
+      const content = inboxDocs.map((d) => d.content).join('\n');
+      assert.ok(content.includes('事实 A'), 'open 单据知识正文（facts）保留');
+      assert.ok(content.includes('路由包归档'), '近 N 天 closed 单据注入');
+      assert.ok(content.includes('docs/execution/routing/pack-001.json'), 'routingPackagePath 保留');
+      assert.ok(content.includes('review by CTO'), 'linkedNextAction 保留');
+      // 字段裁剪：运行态字段一律不注入
+      assert.ok(!content.includes('unread'), 'unread 运行态剥离');
+      assert.ok(!content.includes('resolution'), 'resolution 运行态剥离');
+      assert.ok(!content.includes('"status"'), 'status 运行态剥离');
+      assert.ok(!content.includes('陈旧单据'), '陈旧 closed 不注入');
+
+      // audit 写回显式排除：不注入
+      assert.ok(!docs.some((d) => d.content.includes('audit')));
+    } finally {
+      store.close();
+    }
+  });
+
+  it('内容层幂等重入：hash 相同全部跳过', () => {
+    const report = syncKnowledgeFromSource({ sourceRoot, projectRoot });
+    assert.equal(report.inserted, 0);
+    assert.equal(report.skipped, 5); // 6 scanned - 1 filtered
+    assert.equal(report.filtered, 1);
+  });
+
+  it('陈旧 closed 单据注入过后再过期：既有行移除（防陈旧知识注入）', async () => {
+    // 先把 stale 单据改成 open 注入 → 再改回陈旧 closed → 重同步 → 行被移除
+    const stalePath = join(ws, 'TriMetaverse', 'TriCompany-copilot-host-assets', 'knowledge', 'employees', 'alpha', 'inbox', '2026-07-01-stale.json');
+    await writeFile(stalePath, JSON.stringify({
+      summary: '陈旧单据（临时 open）',
+      objectType: 'note',
+      sender: 'ceo',
+      priority: 'low',
+      createdAt: '2026-07-01T09:00:00+08:00',
+    }, null, 2), 'utf-8');
+    let report = syncKnowledgeFromSource({ sourceRoot, projectRoot });
+    assert.equal(report.inserted, 1, '临时 open 单据注入');
+
+    const store0 = createKnowledgeStore(dbPath, { projectRoot });
+    try {
+      assert.equal(store0.countDocuments(), 6); // 5 + 临时 open 1
+    } finally {
+      store0.close();
+    }
+
+    // 还原为陈旧 closed → 既有行移除
+    await writeFile(stalePath, JSON.stringify({
+      summary: '陈旧单据',
+      objectType: 'note',
+      sender: 'ceo',
+      priority: 'low',
+      createdAt: '2026-07-01T09:00:00+08:00',
+      status: 'closed',
+      closedAt: staleClosedIso,
+    }, null, 2), 'utf-8');
+    report = syncKnowledgeFromSource({ sourceRoot, projectRoot });
+    assert.equal(report.filtered, 1);
+    assert.equal(report.removed, 1, '陈旧 closed 单据既有行移除');
+
+    const store = createKnowledgeStore(dbPath, { projectRoot });
+    try {
+      assert.equal(store.countDocuments(), 5);
+      const inboxDocs = store.listLatestDocuments('employee/alpha', 'alpha').filter((d) => d.layer === 'inbox');
+      assert.ok(!inboxDocs.some((d) => d.content.includes('陈旧单据')));
+    } finally {
+      store.close();
+    }
+  });
+
+  it('agentFilter 增量：内容层同过滤（只同步指定 agent）', () => {
+    const report = syncKnowledgeFromSource({ sourceRoot, projectRoot, agentFilter: ['alpha'] });
+    // 全部已落库 → 跳过；stale 单据过滤仍计
+    assert.equal(report.inserted, 0);
+    assert.equal(report.scanned, 6);
+  });
+
+  it('inbox 窗口天数可配置：nowMs 注入 + 窗口边界判定（独立库，不污染主库）', async () => {
+    // 独立 projectRoot：窗口=0 会 remove 近 1 天 closed 行，避免影响注入块用例
+    const windowRoot = await mkdtemp(join(tmpdir(), 'trilc-kn-window-'));
+    try {
+      // nowMs 取 recent closedAt + 1 天整（边界相等 → <= 成立 → 注入）
+      const boundaryNow = Date.parse(recentClosedIso) + 1 * 24 * 60 * 60 * 1000;
+      const report = syncKnowledgeFromSource({
+        sourceRoot,
+        projectRoot: windowRoot,
+        inboxClosedWindowDays: 1,
+        nowMs: boundaryNow,
+      });
+      assert.equal(report.filtered, 1, '近 1 天 closed 边界内注入，仅 stale 过滤');
+      // 窗口=0：近 1 天 closed 超出窗口 → filtered=2
+      const report0 = syncKnowledgeFromSource({
+        sourceRoot,
+        projectRoot: windowRoot,
+        inboxClosedWindowDays: 0,
+        nowMs: boundaryNow,
+      });
+      assert.equal(report0.filtered, 2);
+    } finally {
+      await rm(windowRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('dry-run：内容层不写库（不创建 DB 文件）', () => {
+    const isolatedRoot = join(tmpdir(), `trilc-kn-content-dry-${Date.now()}`);
+    const report = syncKnowledgeFromSource({ sourceRoot, projectRoot: isolatedRoot, dryRun: true });
+    assert.equal(report.dryRun, true);
+    assert.equal(report.inserted, 0);
+    assert.equal(report.wouldInsert, 5); // 6 scanned - 1 filtered
+    assert.equal(report.filtered, 1);
+    assert.ok(!existsSync(getKnowledgeDbPath(isolatedRoot)), 'dry-run 不得创建 DB 文件');
+  });
+
+  it('contentRoot 未部署：契约层照常同步，内容层跳过不报错', async () => {
+    const isolatedWs = await mkdtemp(join(tmpdir(), 'trilc-kn-nocontent-'));
+    const isolatedSource = join(isolatedWs, 'TriCompany', 'source-agents');
+    await mkdir(join(isolatedSource, 'beta'), { recursive: true });
+    await writeFile(join(isolatedSource, 'beta', 'beta.memory.md'), '# beta memory\n内容', 'utf-8');
+    const report = syncKnowledgeFromSource({ sourceRoot: isolatedSource, projectRoot });
+    assert.equal(report.contentRoot, null);
+    assert.equal(report.scanned, 1);
+    assert.equal(report.inserted, 1);
+    assert.equal(report.errors.length, 0);
+    await rm(isolatedWs, { recursive: true, force: true });
+  });
+
+  it('parseInboxRecord / shouldInjectInboxRecord / serializeInboxContent 纯函数语义', () => {
+    // 旧形态 facts 单据 → 字段归一化（status 缺省 open；facts 进 body）
+    const legacy = parseInboxRecord(JSON.stringify({
+      title: '旧标题',
+      sourceType: 'meeting-note',
+      capturedAt: '2026-08-01T08:00:00Z',
+      facts: ['事实 1'],
+    }), '2026-08-01T00:00:00Z');
+    assert.ok(legacy);
+    assert.equal(legacy.summary, '旧标题');
+    assert.equal(legacy.objectType, 'meeting-note');
+    assert.equal(legacy.status, 'open');
+    assert.equal(legacy.priority, 'normal');
+    assert.deepEqual(legacy.body, { facts: ['事实 1'] });
+    assert.equal(shouldInjectInboxRecord(legacy, Date.now()), true, 'open 恒注入');
+
+    // closed 近 N 天注入 / 陈旧过滤
+    const recent = parseInboxRecord(JSON.stringify({
+      summary: '近关', objectType: 'routing-package',
+      createdAt: '2026-08-15T00:00:00Z',
+      status: 'closed', closedAt: recentClosedIso,
+    }), '');
+    assert.ok(recent && shouldInjectInboxRecord(recent, Date.now(), 7), '近 7 天 closed 注入');
+    assert.ok(recent && !shouldInjectInboxRecord(recent, Date.now(), 0), '窗口 0 天 closed 过滤');
+
+    const stale = parseInboxRecord(JSON.stringify({
+      summary: '陈关', objectType: 'note',
+      createdAt: '2026-07-01T00:00:00Z',
+      status: 'closed', closedAt: staleClosedIso,
+    }), '');
+    assert.ok(stale && !shouldInjectInboxRecord(stale, Date.now(), 7), '陈旧 closed 过滤');
+
+    // closed 无关闭时间 → 过滤（保守）
+    const noClosedAt = parseInboxRecord(JSON.stringify({
+      summary: '无时间', objectType: 'note', status: 'closed',
+    }), '');
+    assert.ok(noClosedAt && !shouldInjectInboxRecord(noClosedAt, Date.now()), 'closed 无时间戳不注入');
+
+    // 不可解析 → null
+    assert.equal(parseInboxRecord('not json', ''), null);
+
+    // 序列化：稳定字段序 + 无运行态
+    const serialized = serializeInboxContent(legacy!);
+    const parsed = JSON.parse(serialized);
+    assert.deepEqual(Object.keys(parsed), [
+      'summary', 'objectType', 'sender', 'priority', 'createdAt',
+      'routingPackagePath', 'linkedNextAction', 'body',
+    ]);
+    assert.ok(!serialized.includes('unread'));
+    assert.ok(!serialized.includes('resolution'));
+    assert.equal(INBOX_CLOSED_WINDOW_DAYS, 7);
+  });
+
+  it('inbox 注入块消费链路：wiki/inbox 层进注入块（sources 标签 + 域后缀 + 多页全量）', () => {
+    const result = injectKnowledgeContext({
+      projectRoot,
+      agentId: 'alpha',
+      systemPrompt: 'SOUL',
+      sessionId: 's_content',
+    });
+    assert.equal(result.injected, true);
+    // 契约层 1 + wiki 2 页 + inbox 2 单 = 5 文档全量注入
+    assert.deepEqual(result.layers, ['memory', 'wiki', 'wiki', 'inbox', 'inbox']);
+    assert.equal(result.consumed, 5);
+
+    const block = result.prompt.slice(result.prompt.indexOf('<knowledge-context'));
+    assert.ok(
+      block.startsWith('<knowledge-context namespace="employee/alpha" sources="memory,wiki,inbox">'),
+      '块头 sources 列出实际注入层（来源语义标签，去重）',
+    );
+    assert.ok(block.includes('## Wiki (content)'), 'wiki 节标内容层域');
+    assert.ok(block.includes('## Inbox (content)'), 'inbox 节标内容层域');
+    assert.ok(block.includes('## Memory (contract)'), 'memory 节标契约层域');
+    assert.ok(block.includes('Alpha Consumption Records'), 'wiki 多页全量注入');
+    assert.ok(block.includes('pageStatus: working'), 'wiki 页 frontmatter 保留');
+    const memIdx = block.indexOf('## Memory');
+    const wikiIdx = block.indexOf('## Wiki');
+    const inboxIdx = block.indexOf('## Inbox');
+    assert.ok(memIdx > -1 && wikiIdx > memIdx && inboxIdx > wikiIdx, '注入顺序：契约层在前，内容层在后');
+  });
+
+  it('layerDomain：契约层三件套 = contract，内容层 = content', () => {
+    assert.equal(layerDomain('memory'), 'contract');
+    assert.equal(layerDomain('colleagues'), 'contract');
+    assert.equal(layerDomain('social'), 'contract');
+    assert.equal(layerDomain('wiki'), 'content');
+    assert.equal(layerDomain('inbox'), 'content');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 9. Schema 迁移 v2→v3：layer CHECK 放宽（批次 3-2）
+// ═══════════════════════════════════════════════════════════════════
+
+describe('knowledge-injector — schema v2→v3 migration', () => {
+  let projectRoot: string;
+  let dbPath: string;
+
+  before(async () => {
+    projectRoot = await mkdtemp(join(tmpdir(), 'trilc-kn-v3-'));
+    dbPath = getKnowledgeDbPath(projectRoot);
+  });
+  after(async () => {
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+
+  it('v2 旧库自动迁移 v3：user_version=3 + 既有行保留 + 新层可插入', () => {
+    // 手工建 v2 库（user_version=2，三层 CHECK，含数据行 + 消费记录）
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const raw = new DatabaseSync(dbPath);
+    raw.exec(`
+      PRAGMA journal_mode=WAL;
+      CREATE TABLE knowledge_documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        namespace TEXT NOT NULL,
+        layer TEXT NOT NULL CHECK (layer IN ('memory', 'colleagues', 'social')),
+        agent_id TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        source_mtime TEXT NOT NULL,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        synced_at TEXT NOT NULL,
+        UNIQUE(namespace, layer, agent_id, content_hash)
+      );
+      CREATE TABLE knowledge_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        session_id TEXT,
+        detail TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_kd_agent ON knowledge_documents(namespace, agent_id, layer);
+      INSERT INTO knowledge_documents
+        (namespace, layer, agent_id, source_path, content, content_hash, source_mtime, schema_version, synced_at)
+      VALUES
+        ('employee/alpha', 'memory', 'alpha', 'alpha.memory.md', '旧行内容', 'hash-old', '2026-08-01T00:00:00Z', 1, '2026-08-01T00:00:00Z');
+      PRAGMA user_version=2;
+    `);
+    raw.close();
+
+    const store = createKnowledgeStore(dbPath, { projectRoot });
+    try {
+      // v3 显式断言：user_version 升到 3 + 既有行原样保留
+      const probe = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        const v = probe.prepare('PRAGMA user_version').get() as { user_version: number };
+        assert.equal(v.user_version, 3, '迁移后 user_version 应为 3');
+      } finally {
+        probe.close();
+      }
+      assert.equal(store.countDocuments(), 1, '既有行不丢');
+
+      // 新层（wiki/inbox）可插入 → CHECK 已放宽
+      const wiki = store.upsertDocument({
+        namespace: 'employee/alpha',
+        layer: 'wiki',
+        agentId: 'alpha',
+        sourcePath: 'wiki/alpha-page.md',
+        content: '# wiki 页',
+        contentHash: 'hash-wiki',
+        sourceMtime: '2026-08-20T00:00:00Z',
+        syncedAt: new Date().toISOString(),
+      });
+      assert.equal(wiki.status, 'inserted');
+      const inbox = store.upsertDocument({
+        namespace: 'employee/alpha',
+        layer: 'inbox',
+        agentId: 'alpha',
+        sourcePath: 'inbox/note.json',
+        content: '{}',
+        contentHash: 'hash-inbox',
+        sourceMtime: '2026-08-20T00:00:00Z',
+        syncedAt: new Date().toISOString(),
+      });
+      assert.equal(inbox.status, 'inserted');
+
+      // 既有行仍可读（迁移未破坏数据面）
+      const docs = store.listLatestDocuments('employee/alpha', 'alpha');
+      assert.equal(docs.length, 3);
+      assert.deepEqual(docs.map((d) => d.layer), ['memory', 'wiki', 'inbox']);
+      assert.equal(docs[0].content, '旧行内容');
+
+      // 指标面（v2 已建表）不丢
+      assert.deepEqual(store.getMetricCounts(), []);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('新库直接建 v3 schema：wiki/inbox CHECK 生效，非法层被拒', () => {
+    const freshRoot = join(tmpdir(), `trilc-kn-v3-fresh-${Date.now()}`);
+    const store = createKnowledgeStore(getKnowledgeDbPath(freshRoot), { projectRoot: freshRoot });
+    try {
+      const probe = new DatabaseSync(getKnowledgeDbPath(freshRoot), { readOnly: true });
+      try {
+        const v = probe.prepare('PRAGMA user_version').get() as { user_version: number };
+        assert.equal(v.user_version, 3);
+      } finally {
+        probe.close();
+      }
+      // 非法层（如 'audit'）被 CHECK 拒绝——audit 不注入的库面兜底
+      assert.throws(
+        () => store.upsertDocument({
+          namespace: 'employee/alpha',
+          layer: 'audit' as never,
+          agentId: 'alpha',
+          sourcePath: 'audit/x.json',
+          content: '{}',
+          contentHash: 'hash-audit',
+          sourceMtime: '',
+          syncedAt: new Date().toISOString(),
+        }),
+        /CHECK/i,
+      );
+    } finally {
+      store.close();
+    }
+    return rm(freshRoot, { recursive: true, force: true });
   });
 });

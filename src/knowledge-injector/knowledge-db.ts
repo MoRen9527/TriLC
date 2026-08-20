@@ -11,9 +11,14 @@
 //   knowledge_consumption  — 消费记录（每次注入写一行，审计面）
 // Schema v2（FADE-ASSESS-003 小乔验证指标，2026-08-20）:
 //   knowledge_metrics      — 行为观测计数（分子面；分母=knowledge_consumption 聚合）
+// Schema v3（批次 3-2 内容层接入，2026-08-20）:
+//   layer 枚举扩展 memory|colleagues|social|wiki|inbox —— knowledge_documents
+//   的 CHECK 约束放宽；既有行兼容（迁移只重建表结构 + 数据搬迁，不改行）。
 //
 // 语义边界（CEO 2026-08-19 双部署模型定调）：五件套 = 契约（静态知识资产），
 // 不是消费记录；消费记录单独落在 knowledge_consumption。
+// 内容层（批次 3-2，CPO 小乔定案）：wiki 消费记录（主）+ inbox（辅）注入面；
+// org/shared 只预留路径不接入；audit 写回显式排除（kernel 写回面非注入面）。
 
 import { DatabaseSync } from 'node:sqlite';
 import { existsSync, mkdirSync } from 'node:fs';
@@ -22,9 +27,30 @@ import { enforceProjectIsolation } from '../project/multi-project-router.js';
 
 // ── Types ──
 
-export type KnowledgeLayer = 'memory' | 'colleagues' | 'social';
+/** 知识层：契约层三件套（memory/colleagues/social）+ 内容层（wiki/inbox）。 */
+export type KnowledgeLayer = 'memory' | 'colleagues' | 'social' | 'wiki' | 'inbox';
 
-export const KNOWLEDGE_LAYERS: readonly KnowledgeLayer[] = ['memory', 'colleagues', 'social'];
+/** 注入顺序：契约层（memory → colleagues → social）在前，内容层（wiki → inbox）在后。 */
+export const KNOWLEDGE_LAYERS: readonly KnowledgeLayer[] = [
+  'memory',
+  'colleagues',
+  'social',
+  'wiki',
+  'inbox',
+];
+
+/**
+ * 层域（注入块来源语义标签）：contract = 契约层五件套静态知识资产；
+ * content = 内容层 curated 知识（wiki 消费记录/inbox 单据）。消费侧凭此
+ * 区分 curated 与契约，防混淆。
+ */
+export type KnowledgeLayerDomain = 'contract' | 'content';
+
+const CONTRACT_LAYERS: ReadonlySet<KnowledgeLayer> = new Set(['memory', 'colleagues', 'social']);
+
+export function layerDomain(layer: KnowledgeLayer): KnowledgeLayerDomain {
+  return CONTRACT_LAYERS.has(layer) ? 'contract' : 'content';
+}
 
 /** 命名空间：employee/<id>（注入面）| org/shared（预留）| org/audit（不注入）。 */
 export type KnowledgeNamespace = `employee/${string}` | 'org/shared' | 'org/audit';
@@ -73,7 +99,7 @@ export interface KnowledgeMetricRecord {
 
 // ── Schema ──
 
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 3;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS knowledge_documents (
@@ -81,7 +107,7 @@ CREATE TABLE IF NOT EXISTS knowledge_documents (
   namespace TEXT NOT NULL CHECK (
     namespace LIKE 'employee/%' OR namespace IN ('org/shared', 'org/audit')
   ),
-  layer TEXT NOT NULL CHECK (layer IN ('memory', 'colleagues', 'social')),
+  layer TEXT NOT NULL CHECK (layer IN ('memory', 'colleagues', 'social', 'wiki', 'inbox')),
   agent_id TEXT NOT NULL,
   source_path TEXT NOT NULL,
   content TEXT NOT NULL,
@@ -119,6 +145,40 @@ const MIGRATIONS: Record<number, string> = {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_km_event ON knowledge_metrics(event, created_at);
+  `,
+  // v3（批次 3-2 内容层接入）：layer CHECK 放宽到五层。SQLite 无法 ALTER CHECK
+  // → 标准重建流程：RENAME 旧表 → 建新表（新 CHECK + UNIQUE）→ 数据搬迁
+  // （显式 id，保留自增序列）→ DROP 旧表 → 重建索引。
+  // 注意：RENAME TO 会把旧索引名一并带走（索引名仍占用）→ 必须先
+  // DROP INDEX IF EXISTS 再重建，否则 CREATE INDEX IF NOT EXISTS 会因
+  // 名字冲突跳过、DROP 旧表后新表无索引（功能正确、查询性能退化）。
+  // 既有行兼容：行数据原样搬迁，不改 layer 值、不重写 content。
+  3: `
+    ALTER TABLE knowledge_documents RENAME TO knowledge_documents_v2;
+    DROP INDEX IF EXISTS idx_kd_agent;
+    CREATE TABLE knowledge_documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      namespace TEXT NOT NULL CHECK (
+        namespace LIKE 'employee/%' OR namespace IN ('org/shared', 'org/audit')
+      ),
+      layer TEXT NOT NULL CHECK (layer IN ('memory', 'colleagues', 'social', 'wiki', 'inbox')),
+      agent_id TEXT NOT NULL,
+      source_path TEXT NOT NULL,
+      content TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      source_mtime TEXT NOT NULL,
+      schema_version INTEGER NOT NULL DEFAULT 1,
+      synced_at TEXT NOT NULL,
+      UNIQUE(namespace, layer, agent_id, content_hash)
+    );
+    INSERT INTO knowledge_documents
+      (id, namespace, layer, agent_id, source_path, content, content_hash,
+       source_mtime, schema_version, synced_at)
+      SELECT id, namespace, layer, agent_id, source_path, content, content_hash,
+             source_mtime, schema_version, synced_at
+      FROM knowledge_documents_v2;
+    DROP TABLE knowledge_documents_v2;
+    CREATE INDEX IF NOT EXISTS idx_kd_agent ON knowledge_documents(namespace, agent_id, layer);
   `,
 };
 
@@ -204,7 +264,10 @@ export function createKnowledgeStore(
     `SELECT * FROM knowledge_documents
      WHERE namespace = ? AND agent_id = ?
      ORDER BY
-       CASE layer WHEN 'memory' THEN 1 WHEN 'colleagues' THEN 2 ELSE 3 END,
+       CASE layer
+         WHEN 'memory' THEN 1 WHEN 'colleagues' THEN 2 WHEN 'social' THEN 3
+         WHEN 'wiki' THEN 4 ELSE 5
+       END,
        synced_at DESC`,
   );
   const insertConsumptionStmt = db.prepare(
@@ -254,16 +317,28 @@ export function createKnowledgeStore(
     const rows = listDocsStmt.all(namespace, agentId) as unknown as Array<
       Record<string, unknown> & { id: number }
     >;
-    const byLayer = new Map<KnowledgeLayer, (KnowledgeDocument & { id: number })>();
+    // 契约层：每 layer 固定单源文件 → 取 synced_at 最新 1 个（防旧版本残留重复注入）。
+    // 内容层（批次 3-2）：多文档形态（wiki 每页/inbox 每单据各一文档）→ 全量返回，
+    // 按 source_path 升序稳定排序（注入顺序可预期）。
+    const byLayer = new Map<KnowledgeLayer, Array<KnowledgeDocument & { id: number }>>();
     for (const row of rows) {
       const layer = row.layer as KnowledgeLayer;
-      if (byLayer.has(layer)) continue; // 按 synced_at DESC 已排序，首个即最新
-      byLayer.set(layer, rowToDocument(row));
+      const list = byLayer.get(layer) ?? [];
+      list.push(rowToDocument(row));
+      byLayer.set(layer, list);
     }
-    // memory → colleagues → social 固定顺序（与 KNOWLEDGE_LAYERS 一致）
-    return KNOWLEDGE_LAYERS
-      .map((layer) => byLayer.get(layer))
-      .filter((doc): doc is KnowledgeDocument & { id: number } => !!doc);
+    const result: Array<KnowledgeDocument & { id: number }> = [];
+    for (const layer of KNOWLEDGE_LAYERS) {
+      const docs = byLayer.get(layer);
+      if (!docs || docs.length === 0) continue;
+      if (layerDomain(layer) === 'contract') {
+        result.push(docs[0]); // ORDER BY synced_at DESC 已排序，首个即最新
+      } else {
+        result.push(...docs.slice().sort((a, b) => a.sourcePath.localeCompare(b.sourcePath)));
+      }
+    }
+    // memory → colleagues → social → wiki → inbox 固定顺序（与 KNOWLEDGE_LAYERS 一致）
+    return result;
   }
 
   function removeDocumentBySource(
