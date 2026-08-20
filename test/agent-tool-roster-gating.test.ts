@@ -3,9 +3,9 @@
 // （role_not_active）/ 未注入 gate 放行（向后兼容）/
 // setRosterGate 多实例注入（重复设置/清理，模块级单例 last-write-wins）。
 
-import { describe, it, afterEach } from 'node:test';
+import { describe, it, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { enforceRosterGate, setRosterGate, setOnSpawnGateDenied } from '../src/tools/agent-tool.js';
+import { enforceRosterGate, setRosterGate, setOnSpawnGateDenied, parseAgentsResponse, listAgentsForDisplay } from '../src/tools/agent-tool.js';
 
 afterEach(() => {
   setRosterGate(null);
@@ -107,5 +107,58 @@ describe('FADE-005 setRosterGate 多实例注入（重复设置/清理）', () =
     setOnSpawnGateDenied(null);
     await enforceRosterGate('ceo');
     assert.deepEqual(deniedB, ['test-engineer:candidate'], '清理后拒绝不得触发任何回调');
+  });
+});
+
+// ── spawn 端到端实跑抓到的生产 bug 修复固化：/internal/v1/agents 响应解析 ──
+// daemon 端点实际返回 {agents, count, scope, tricompanyEnabled}（无 ok 字段），
+// 旧判 `json.ok && json.agents` 恒 false → 合同员工岗 spawn 永远
+// "Unknown agent type"（FADE-005 分身门禁在生产链路从未实际生效）。
+// 修复：以 agents 数组为准（ok 仅可选兼容）；此处固化解析形状防再犯。
+
+describe('FADE-005 agent-tool /agents 响应解析（parseAgentsResponse）', () => {
+  it('daemon 实际形状（无 ok 字段）→ 解析出 agents 数组', () => {
+    const list = parseAgentsResponse({
+      agents: [{ id: 'ceo-chief-of-staff', displayName: 'CEOChiefOfStaff' }],
+      count: 1,
+      scope: 'all',
+      tricompanyEnabled: true,
+    });
+    assert.equal(list.length, 1);
+    assert.equal(list[0].id, 'ceo-chief-of-staff');
+  });
+
+  it('TriMC 兼容形状（带 ok 字段）→ 同样解析', () => {
+    const list = parseAgentsResponse({
+      ok: true,
+      agents: [{ agentId: 'ceo', name: 'CEO' }],
+    });
+    assert.equal(list.length, 1);
+    assert.equal(list[0].agentId, 'ceo');
+  });
+
+  it('非法形状（agents 非数组 / 缺失 / 非对象）→ 空数组，不抛', () => {
+    assert.deepEqual(parseAgentsResponse({ agents: 'nope' }), []);
+    assert.deepEqual(parseAgentsResponse({}), []);
+    assert.deepEqual(parseAgentsResponse(null), []);
+    assert.deepEqual(parseAgentsResponse('str'), []);
+    assert.deepEqual(parseAgentsResponse(undefined), []);
+  });
+
+  it('listAgentsForDisplay：无 ok 字段的响应也必须解析出合同 agent（同病修复点）', async () => {
+    mock.method(globalThis, 'fetch', async () => ({
+      json: async () => ({
+        agents: [{ agentId: 'ceo', name: 'CEO Chief' }],
+        count: 1,
+        scope: 'all',
+      }),
+    }) as unknown as Response);
+    try {
+      const out = await listAgentsForDisplay();
+      assert.ok(out.includes('ceo'), '无 ok 字段响应必须解析出合同 agent（此前恒为空）');
+      assert.ok(out.includes('CEO Chief'));
+    } finally {
+      mock.restoreAll();
+    }
   });
 });
