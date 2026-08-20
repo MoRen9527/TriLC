@@ -40,6 +40,34 @@ export async function listAgentsForDisplay(): Promise<string> {
   return header + lines.join('\n');
 }
 
+// ── FADE-ASSESS-005：分身门禁（上岗 gating）──
+// 名册 = 分身的组织前提：未上岗 JD（pending-cho/candidate）不应 spawn 分身。
+// daemon 在 createTriLCApp.start() 注入 roster gate（读 CompanyInitState.employees）；
+// 未注入（独立使用/单测）→ 放行 + console.warn，保持向后兼容。
+type RosterGateFn = (roleId: string) => Promise<{ status: string } | undefined>;
+
+let rosterGate: RosterGateFn | null = null;
+
+/** daemon 注入点：设置岗位在岗校验函数（undefined 返回值 = 门禁不可用，放行）。 */
+export function setRosterGate(fn: RosterGateFn | null): void {
+  rosterGate = fn;
+}
+
+/**
+ * 分身 spawn 前置校验：合同岗必须 ∈ roster.active。
+ * 返回 { ok, status?, error? }；非在岗 → { ok: false, error: 'role_not_active' }。
+ */
+export async function enforceRosterGate(roleId: string): Promise<{ ok: boolean; status?: string; error?: string }> {
+  if (!rosterGate) {
+    console.warn(`[agent-tool] roster gate not injected — role ${roleId} spawn allowed without gating`);
+    return { ok: true };
+  }
+  const res = await rosterGate(roleId);
+  if (!res) return { ok: true };
+  if (res.status === 'active') return { ok: true, status: res.status };
+  return { ok: false, status: res.status, error: 'role_not_active' };
+}
+
 // ── AgentTool ──
 // CC-equivalent sub-agent spawning tool - enables AI to delegate tasks to specialized sub-agents
 // This is the core capability leap: "派一个子代理去完成子任务"
@@ -116,6 +144,22 @@ export function registerAgentTool(): void {
           return JSON.stringify({
             error: `Unknown agent type: ${agentType}. Available built-in: ${builtIn}. Daemon agents available via /agents.`,
           });
+        }
+
+        // FADE-ASSESS-005 分身门禁：合同员工岗 spawn 前置校验 ∈ roster.active。
+        // 名册是分身的组织前提——未上岗 JD（pending-cho/candidate）不应 spawn 分身。
+        // 非在岗 → 显式错误返回（模型可见，不静默）。
+        if (!getBuiltInAgent(agentType)) {
+          const gate = await enforceRosterGate(agentType);
+          if (!gate.ok) {
+            return JSON.stringify({
+              status: 'error',
+              error: gate.error,
+              roleId: agentType,
+              rosterStatus: gate.status,
+              message: `岗位 ${agentType} 未在岗（roster status: ${gate.status}）——未上岗 JD 不可 spawn 分身，请先走 staffing/onboard 上岗流程。`,
+            });
+          }
         }
       }
 

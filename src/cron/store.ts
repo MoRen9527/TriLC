@@ -24,6 +24,7 @@ const CREATE_JOBS_TABLE_SQL = `
     schedule_tz     TEXT,
     system_prompt   TEXT NOT NULL DEFAULT '',
     command         TEXT,
+    role_id         TEXT,
     enabled         INTEGER NOT NULL DEFAULT 1,
     state           TEXT NOT NULL DEFAULT 'idle' CHECK(state IN ('idle','running','failed')),
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -62,6 +63,7 @@ interface CronJobRow {
   schedule_tz: string | null;
   system_prompt: string;
   command: string | null;
+  role_id: string | null;
   enabled: number;
   state: string;
   created_at: string;
@@ -94,6 +96,7 @@ function rowToJob(row: CronJobRow): CronJob {
         : { kind: "cron", expr: row.schedule_value, ...(row.schedule_tz ? { tz: row.schedule_tz } : {}) },
     systemPrompt: row.system_prompt,
     command: row.command ?? undefined,
+    roleId: row.role_id ?? undefined,
     enabled: row.enabled === 1,
     state: row.state as CronJob["state"],
     createdAt: row.created_at,
@@ -138,6 +141,14 @@ export function createCronStore(dbPath: string) {
     const cols = db.prepare("PRAGMA table_info(cron_jobs)").all() as Array<{ name: string }>;
     if (!cols.some((c) => c.name === "command")) {
       db.exec("ALTER TABLE cron_jobs ADD COLUMN command TEXT");
+    }
+  } catch { /* best-effort */ }
+
+  // FADE-ASSESS-005: migration — add role_id column to pre-existing cron.db
+  try {
+    const cols2 = db.prepare("PRAGMA table_info(cron_jobs)").all() as Array<{ name: string }>;
+    if (!cols2.some((c) => c.name === "role_id")) {
+      db.exec("ALTER TABLE cron_jobs ADD COLUMN role_id TEXT");
     }
   } catch { /* best-effort */ }
 
@@ -216,12 +227,13 @@ export function createCronStore(dbPath: string) {
 
     const stmt = db.prepare(`
       INSERT INTO cron_jobs (id, name, schedule_kind, schedule_value, schedule_tz,
-        system_prompt, command, enabled, state, created_at, updated_at, run_count, error_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, 0, 0)
+        system_prompt, command, role_id, enabled, state, created_at, updated_at, run_count, error_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, 0, 0)
     `);
     stmt.run(
       id, input.name, scheduleKind, scheduleValue, scheduleTz,
-      input.systemPrompt, input.command ?? null, input.enabled ? 1 : 0, now, now,
+      input.systemPrompt, input.command ?? null, input.roleId ?? null,
+      input.enabled ? 1 : 0, now, now,
     );
 
     const row = db.prepare("SELECT * FROM cron_jobs WHERE id = ?").get(id) as unknown as CronJobRow;
@@ -294,6 +306,10 @@ export function createCronStore(dbPath: string) {
     if (patch.command !== undefined) {
       setClauses.push("command = ?");
       values.push(patch.command ?? null);
+    }
+    if (patch.roleId !== undefined) {
+      setClauses.push("role_id = ?");
+      values.push(patch.roleId ?? null);
     }
     if (patch.enabled !== undefined) {
       setClauses.push("enabled = ?");

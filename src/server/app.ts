@@ -93,13 +93,18 @@ import { runConfirmCheck, runConfirm } from '../company/init-confirm.js';
 import { runFirstCollabUpdate } from '../company/init-first-collab.js';
 import {
   getStaffingRoster,
+  getRoleRosterStatus,
   requestOnboarding,
   decideOnboarding,
+  enforceRoleActive,
+  isRoleActive,
   type StaffingDeps,
 } from '../company/staffing.js';
 import { createSessionReaper } from '../cron/session-reaper.js';
 import { createMinimalCronEngine, type MinimalCronEngine } from '../cron/service.js';
 import { createUpdateCheckHandler, startUpdateCheckLoop } from '../update/update-check.js';
+// FADE-ASSESS-005 分身门禁：AgentTool 合同员工 spawn 前置校验 roster.active。
+import { setRosterGate } from '../tools/agent-tool.js';
 
 // Cached roster of available sub-agents (built at daemon startup, injected
 // into system prompts so the model knows by name which agents it can invoke
@@ -852,6 +857,8 @@ export function createTriLCApp(env: TriLCEnv) {
       publish({ type: 'cron:sweep', count: 1 });
       console.log(`[trilc:cron] job triggered: ${job.name}`);
     },
+    // FADE-ASSESS-005 调度门禁：绑定 roleId 的 job 拉起 agent 前校验 roster.active。
+    isRoleActive: async (roleId) => isRoleActive(staffingDeps, roleId),
   });
   const taskStreams = new Map<string, TaskStreamEntry>();
   let connectionId = '';
@@ -938,6 +945,13 @@ export function createTriLCApp(env: TriLCEnv) {
     async start(): Promise<void> {
       daemonStartTime = Date.now();
       connMgr.startHealthCheckLoop();
+
+      // FADE-ASSESS-005 分身门禁注入：AgentTool spawn 合同岗时读运行态名册
+      // （CompanyInitState.employees 为在岗真源，roster.status 语义见 staffing.ts）。
+      setRosterGate(async (roleId) => {
+        const status = await getRoleRosterStatus(staffingDeps, roleId);
+        return { status };
+      });
 
       // P4.2: Register shell_exec tool backed by ProcessSupervisor
       registerShellExecTool({ supervisor: getDefaultSupervisor() });
@@ -2571,6 +2585,10 @@ export function createTriLCApp(env: TriLCEnv) {
             conversationId?: string;
             systemPrompt?: string;
             context?: { files?: string[]; workspaceRoot?: string };
+            // FADE-ASSESS-005 派工门禁：可选的派工 owner 岗位。携带时校验
+            // owner ∈ roster.active；非在岗 → 409 owner_not_active（不静默）。
+            // 不携带 = 普通用户会话，不校验（向后兼容）。
+            ownerRoleId?: string;
           } = {};
           try {
             body = JSON.parse(raw);
@@ -2584,6 +2602,21 @@ export function createTriLCApp(env: TriLCEnv) {
             res.writeHead(400, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ error: 'bad_request', message: 'message is required' }));
             return;
+          }
+
+          // FADE-ASSESS-005 派工门禁：周平面任务派发（owner 岗位）校验在岗。
+          if (body.ownerRoleId) {
+            const gate = await enforceRoleActive(staffingDeps, body.ownerRoleId);
+            if (!gate.allowed) {
+              res.writeHead(409, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({
+                error: gate.error,
+                roleId: body.ownerRoleId,
+                rosterStatus: gate.status,
+                message: `派工拒绝：岗位 ${body.ownerRoleId} 未在岗（roster status: ${gate.status}）— 未上岗岗位不可派工`,
+              }));
+              return;
+            }
           }
 
           const sessionId = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
