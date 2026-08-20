@@ -31,6 +31,9 @@ export interface CronJob {
   systemPrompt: string;
   /** REQ-20260806-019: deterministic command execution (no LLM). Mutually exclusive with systemPrompt usage. */
   command?: string;
+  /** FADE-ASSESS-005: 绑定的员工岗 roleId。设置后调度拉起前校验 roster.active，
+   *  非在岗 → skipped（owner_not_active），不拉起 agent 会话。缺省不校验。 */
+  roleId?: string;
   enabled: boolean;
   state: CronJobState;
   createdAt: string;
@@ -54,6 +57,7 @@ export interface CronJobPatch {
   schedule?: CronSchedule;
   systemPrompt?: string;
   command?: string;
+  roleId?: string;
   enabled?: boolean;
 }
 

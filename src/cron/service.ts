@@ -46,6 +46,8 @@ export interface CronServiceDeps {
   };
   cwd: string;
   onJobTrigger?: (job: CronJob) => void;
+  /** FADE-ASSESS-005: 员工岗在岗校验（透传至 timer，调度拉起前门禁）。 */
+  isRoleActive?: (roleId: string) => Promise<boolean>;
 }
 
 // Backward-compatible alias
@@ -66,6 +68,7 @@ export function createCronService(deps: CronServiceDeps): CronService {
     sessionStore,
     cwd,
     onJobTrigger,
+    isRoleActive: deps.isRoleActive,
   };
 
   // ── Public API ──

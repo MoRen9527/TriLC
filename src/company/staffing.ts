@@ -3,6 +3,12 @@
 // md 岗位说明 = JD；上岗 = JD 进入在岗名册；分身 spawn 是另一层 HC 流程）。
 // 链路：settings 勾选（或开业装配发布候选）→ onboard 登记（runId/pending-cho）→
 // CHO 审批（decide）→ 名册写入（CompanyInitState.employees）+ 审计 json → 终态。
+//
+// ── FADE-ASSESS-005 上岗 gating（CEO 2026-08-20 启动）──
+// roster 三态（active / pending-cho / candidate）从「状态记录+徽标」升级为
+// 运行态门禁真源：名册 = 决策面（谁在岗 = 可被派工 / 可被 spawn 分身 / 可被
+// 调度拉起）。isRoleActive / getRoleRosterStatus 为三处门禁（派工 owner 校验、
+// 分身 spawn 前置、cron 拉起前置）共用的单一校验函数。
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -83,6 +89,48 @@ export async function getStaffingRoster(deps: StaffingDeps) {
       pending: roster.filter((x) => x.status === 'pending-cho').length,
     },
   };
+}
+
+// ── FADE-ASSESS-005：上岗 gating 校验函数（名册运行态门禁单一真源）──
+// 语义：名册 = 决策面。active = 在岗（可派工/可 spawn 分身/可被调度拉起）；
+// pending-cho = 待 CHO 审批（未上岗，运行态拒绝）；candidate = 未发布候选
+// （未上岗，运行态拒绝）。三处门禁统一走这里，保证错误语义一致。
+
+export type RosterStatus = 'active' | 'pending-cho' | 'candidate' | 'unknown';
+
+export interface RosterGateResult {
+  allowed: boolean;
+  status: RosterStatus;
+  /** 非在岗时的错误码（FADE-ASSESS-005 统一语义，不静默）。 */
+  error?: 'owner_not_active';
+}
+
+/**
+ * 查询岗位在名册中的运行态状态。
+ * active = CompanyInitState.employees 含该 role；pending-cho = staffing
+ * requests 有未决请求；否则 candidate（岗位目录存在但从未上岗）；
+ * 岗位目录不存在 → unknown。
+ */
+export async function getRoleRosterStatus(deps: StaffingDeps, roleId: string): Promise<RosterStatus> {
+  const company = await deps.companyState.load();
+  if ((company.employees ?? []).some((e: any) => e.role === roleId)) return 'active';
+  const requests = await loadRequests(deps.dataDir);
+  if (requests.some((r) => r.roleId === roleId && r.status === 'pending-cho')) return 'pending-cho';
+  const catalog = deps.getRoleCatalog();
+  if (catalog && (catalog.roles ?? []).some((r: any) => r.roleId === roleId)) return 'candidate';
+  return 'unknown';
+}
+
+/** 岗位是否在岗（roster.active）。 */
+export async function isRoleActive(deps: StaffingDeps, roleId: string): Promise<boolean> {
+  return (await getRoleRosterStatus(deps, roleId)) === 'active';
+}
+
+/** 上岗门禁统一判定：非在岗 → { allowed: false, error: 'owner_not_active' }。 */
+export async function enforceRoleActive(deps: StaffingDeps, roleId: string): Promise<RosterGateResult> {
+  const status = await getRoleRosterStatus(deps, roleId);
+  if (status === 'active') return { allowed: true, status };
+  return { allowed: false, status, error: 'owner_not_active' };
 }
 
 /** POST onboard：开业后勾选候选 → 登记 pending-cho 请求（CHO 审批门）。 */

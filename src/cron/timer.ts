@@ -45,6 +45,9 @@ export interface CronTimerDeps {
   };
   cwd: string;
   onJobTrigger?: (job: CronJob) => void;
+  /** FADE-ASSESS-005: 员工岗在岗校验（读 CompanyInitState.employees）。
+   *  job.roleId 设置后拉起 agent 前校验；非在岗 → skipped，不拉起。缺省不校验。 */
+  isRoleActive?: (roleId: string) => Promise<boolean>;
 }
 
 export interface CronTimerState {
@@ -153,15 +156,20 @@ async function executeJobScheduled(state: CronTimerState, deps: CronTimerDeps, j
 
     deps.store.addExecutionLog(job.id, result.status, startedAtIso, durationMs, result.error);
 
-    const lastRunStatus = result.status === "ok" ? "ok" : "error";
-    const newState = result.status === "ok" ? "idle" : "failed";
+    // FADE-ASSESS-005: skipped（门禁拒绝）记 skipped 且不 incrementError——
+    // job 本身未失败，仅本次因非在岗未拉起。
+    const lastRunStatus =
+      result.status === "ok" ? "ok" : result.status === "skipped" ? "skipped" : "error";
+    const newState = result.status === "ok" || result.status === "skipped" ? "idle" : "failed";
     deps.store.updateJobRun(job.id, {
       lastRunAt: startedAtIso, lastRunStatus, state: newState,
       incrementRun: true,
-      ...(result.status !== "ok" ? { incrementError: true } : {}),
+      ...(result.status !== "ok" && result.status !== "skipped" ? { incrementError: true } : {}),
     });
 
     // ── Consecutive failure tracking ──
+    // FADE-ASSESS-005（终审收口 ⑤）：skipped（门禁拒绝）不解除 degraded——
+    // 只有真实 ok 触发恢复/清零；skipped 计入非 ok 路径。
     if (result.status === "ok") {
       if (state.degraded) {
         state.consecutiveFailures = 0;
@@ -212,9 +220,36 @@ async function executeJobScheduled(state: CronTimerState, deps: CronTimerDeps, j
 
 // ── Job execution core with timeout ──
 
-interface JobExecutionResult { status: "ok" | "error" | "timeout"; error?: string; }
+interface JobExecutionResult { status: "ok" | "error" | "timeout" | "skipped"; error?: string; }
+
+/**
+ * FADE-ASSESS-005 调度门禁判定（可测纯函数）：
+ * job 绑定员工岗 roleId 且注入 isRoleActive → 校验 roster.active；
+ * 非在岗 → { run: false, reason: owner_not_active }（只拉起在岗岗，不静默）。
+ * 未绑定 roleId / 未注入校验函数 → 放行（向后兼容）。
+ */
+export async function shouldRunJob(
+  deps: Pick<CronTimerDeps, "isRoleActive">,
+  job: CronJob,
+): Promise<{ run: boolean; reason?: string }> {
+  if (job.roleId && deps.isRoleActive) {
+    const active = await deps.isRoleActive(job.roleId);
+    if (!active) {
+      return { run: false, reason: `owner_not_active: role ${job.roleId} not in active roster` };
+    }
+  }
+  return { run: true };
+}
 
 async function executeJobCore(deps: CronTimerDeps, job: CronJob): Promise<JobExecutionResult> {
+  // FADE-ASSESS-005（终审收口 ④）：门禁先于 command 分支——绑 roleId 的
+  // command job 同样走 roster.active 校验（现役 command job 均未绑 roleId，
+  // 行为不变；绑定后非在岗 → skipped，不执行命令、不拉起 agent）。
+  const gate = await shouldRunJob(deps, job);
+  if (!gate.run) {
+    return { status: "skipped", error: gate.reason };
+  }
+
   // REQ-20260806-019: deterministic command execution (no LLM).
   // Weekly-plane shift etc. run as shell commands via child_process, bypassing
   // the agent loop entirely (heartbeat tier has no shell anyway).
@@ -331,8 +366,10 @@ export async function runJobNow(
     const durationMs = endedAt - startedAt;
     deps.store.addExecutionLog(job.id, result.status, startedAtIso, durationMs, result.error);
 
-    const statusStr = result.status === "ok" ? "ok" : "error";
-    deps.store.updateJobRun(id, { lastRunAt: startedAtIso, lastRunStatus: statusStr, state: "idle", incrementRun: true, ...(result.status !== "ok" ? { incrementError: true } : {}) });
+    // FADE-ASSESS-005: skipped（门禁拒绝）记 skipped 且不 incrementError。
+    const statusStr =
+      result.status === "ok" ? "ok" : result.status === "skipped" ? "skipped" : "error";
+    deps.store.updateJobRun(id, { lastRunAt: startedAtIso, lastRunStatus: statusStr, state: "idle", incrementRun: true, ...(result.status !== "ok" && result.status !== "skipped" ? { incrementError: true } : {}) });
 
     const refreshed = deps.store.getJob(id);
     if (refreshed && refreshed.enabled) {
