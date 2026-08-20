@@ -1,7 +1,10 @@
 // ── Knowledge Consumption Injection ──
 // FADE-ASSESS-003 消费路径（boot injection 非检索）：把 knowledge.db 中该员工
-// 最新三层知识组装为 <knowledge-context> 注入块，追加到 system prompt 之后，
+// 最新各层知识组装为 <knowledge-context> 注入块，追加到 system prompt 之后，
 // 并按层写 knowledge_consumption 消费记录。
+// 批次 3-2（内容层接入）：注入块带来源语义标签——块头 sources 属性列出实际
+// 注入层，节标题带域后缀 (contract)/(content)，消费侧凭此区分 curated 内容层
+// 与契约层，防混淆。
 //
 // 注入层不污染身份真源：contract-resolver.getSystemPrompt 保持 soul+agent_body
 // 不变，注入只发生在消费挂接点（session-initializer / system-prompt 端点 /
@@ -13,37 +16,46 @@
 import { existsSync } from 'node:fs';
 import {
   createKnowledgeStore,
+  layerDomain,
   type InjectionMode,
   type KnowledgeLayer,
 } from './knowledge-db.js';
 import { getKnowledgeDbPath } from '../project/multi-project-router.js';
 
-/** 层显示名（注入块内固定顺序 Memory → Colleagues → Social）。 */
+/** 层显示名（注入块内固定顺序 Memory → Colleagues → Social → Wiki → Inbox）。 */
 const LAYER_LABELS: Record<KnowledgeLayer, string> = {
   memory: 'Memory',
   colleagues: 'Colleagues',
   social: 'Social',
+  wiki: 'Wiki',
+  inbox: 'Inbox',
 };
 
-export function knowledgeContextTag(namespace: string): string {
-  return `<knowledge-context namespace="${namespace}">`;
+/** 域后缀：契约层 (contract) / 内容层 (content)——来源语义标签。 */
+export function knowledgeContextTag(namespace: string, sources: readonly KnowledgeLayer[]): string {
+  if (sources.length === 0) {
+    return `<knowledge-context namespace="${namespace}">`;
+  }
+  // 去重（内容层多文档同层）：sources 列出实际注入的层集合，保持传入顺序
+  const unique = [...new Set(sources)];
+  return `<knowledge-context namespace="${namespace}" sources="${unique.join(',')}">`;
 }
 
 /**
  * 组装注入块（纯函数，可单测）：
  *
- *   <knowledge-context namespace="employee/<id>">
- *   ## Memory
+ *   <knowledge-context namespace="employee/<id>" sources="memory,wiki">
+ *   ## Memory (contract)
  *   <memory 内容>
  *
- *   ## Colleagues
- *   <colleagues 内容>
- *
- *   ## Social
- *   <social 内容>
+ *   ## Wiki (content)
+ *   <wiki 内容>
  *   </knowledge-context>
  *
- * @param layers 按 Memory → Colleagues → Social 顺序（调用方保证；本函数不重排）。
+ * 节标题域后缀：contract = 契约层三件套（静态知识资产），content = 内容层
+ * curated 知识（wiki 消费记录/inbox 单据）——防消费侧混淆 curated 与契约。
+ *
+ * @param layers 按 Memory → Colleagues → Social → Wiki → Inbox 顺序（调用方保证；本函数不重排）。
  */
 export function buildKnowledgeContextBlock(
   namespace: string,
@@ -51,9 +63,12 @@ export function buildKnowledgeContextBlock(
 ): string {
   if (layers.length === 0) return '';
   const body = layers
-    .map(({ layer, content }) => `## ${LAYER_LABELS[layer]}\n\n${content.trim()}`)
+    .map(
+      ({ layer, content }) =>
+        `## ${LAYER_LABELS[layer]} (${layerDomain(layer)})\n\n${content.trim()}`,
+    )
     .join('\n\n');
-  return `${knowledgeContextTag(namespace)}\n${body}\n</knowledge-context>`;
+  return `${knowledgeContextTag(namespace, layers.map(({ layer }) => layer))}\n${body}\n</knowledge-context>`;
 }
 
 export interface KnowledgeInjectionResult {
