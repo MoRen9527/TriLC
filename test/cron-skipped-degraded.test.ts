@@ -9,9 +9,17 @@
 // 状态转移经 state.consecutiveFailures / state.degraded 断言，事件经 localbus
 // cron:degraded / cron:recovered 断言。
 //
+// 进程退出保障：cron 执行链的 setTimeout（executeJobCoreWithTimeout 超时 /
+// executeCommand 超时）若在任何路径漏清，会拖住事件循环使 node:test 进程
+// 永不退出（曾实测 exit=124 超时杀）。生产侧已修 executeJobCoreWithTimeout
+// 的 race 后 clearTimeout；测试侧再以 mock.timers 接管全局 setTimeout 兜底
+// ——after 时 reset() 清空全部 pending mock timer，确保进程必然退出。
+// （mock 仅限 setTimeout：Date 未 mock，croner nextRun 纯计算不受影响；
+//  cmd.exe spawn 为异步 I/O 不经 setTimeout，不受影响。）
+//
 // Run: npx tsx --test test/cron-skipped-degraded.test.ts
 
-import { describe, it, beforeEach, afterEach } from 'node:test';
+import { describe, it, beforeEach, afterEach, before, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createCronTimerState, runMissedJobs, type CronTimerDeps, type CronStoreLike, type CronTimerState } from '../src/cron/timer.js';
 import type { CronJob } from '../src/cron/types.js';
@@ -99,6 +107,16 @@ describe('FADE-005 §三 skipped→degraded 三态语义（executeJobScheduled �
   let store: ReturnType<typeof createFakeStore>;
   let state: CronTimerState;
   let events: LocalBusEvent[];
+
+  before(() => {
+    // 接管全局 setTimeout：任何 cron 执行链漏清的定时器都会进 mock 队列，
+    // after 的 reset() 一并清空 → 测试进程必然退出（防 124 超时挂起复发）。
+    mock.timers.enable({ apis: ['setTimeout'] });
+  });
+
+  after(() => {
+    mock.timers.reset();
+  });
 
   beforeEach(() => {
     job = makeJob();
