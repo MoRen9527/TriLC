@@ -26,6 +26,7 @@ import {
   buildKnowledgeContextBlock,
   injectKnowledgeContext,
 } from '../src/knowledge-injector/inject.js';
+import { injectHeartbeatKnowledge } from '../src/heartbeat/agent-runner.js';
 import {
   recordKnowledgeMetric,
   getKnowledgeMetricSnapshot,
@@ -620,5 +621,92 @@ describe('knowledge-injector — session-initializer main path', () => {
       store.close();
     }
     await rm(workspaceRoot, { recursive: true, force: true });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 7.6 heartbeat 会话注入挂接点（agent-runner.ts 可测注入缝）
+// ═══════════════════════════════════════════════════════════════════
+// FADE-ASSESS-003 消费路径挂接点③：runHeartbeatAgent 在会话创建前经
+// injectHeartbeatKnowledge 注入，session_id 只有此处可知（消费记录需要）。
+// 覆盖缺口固化：env 注入口径 / 显式 projectRoot 优先 / 无知识降级不阻断。
+
+describe('knowledge-injector — heartbeat 会话注入挂接点 (agent-runner seam)', () => {
+  let sourceRoot: string;
+  let projectRootA: string;      // 已同步知识（env 指向）
+  let projectRootEmpty: string;  // 无知识库
+  const prevEnv = process.env.TRILC_PROJECT_ROOT;
+
+  before(async () => {
+    sourceRoot = await makeSourceRoot([{ id: 'alpha' }]);
+    projectRootA = await mkdtemp(join(tmpdir(), 'trilc-kn-hb-a-'));
+    projectRootEmpty = await mkdtemp(join(tmpdir(), 'trilc-kn-hb-e-'));
+    syncKnowledgeFromSource({ sourceRoot, projectRoot: projectRootA });
+    process.env.TRILC_PROJECT_ROOT = projectRootA;
+  });
+  after(async () => {
+    if (prevEnv === undefined) delete process.env.TRILC_PROJECT_ROOT;
+    else process.env.TRILC_PROJECT_ROOT = prevEnv;
+    await rm(sourceRoot, { recursive: true, force: true });
+    await rm(projectRootA, { recursive: true, force: true });
+    await rm(projectRootEmpty, { recursive: true, force: true });
+  });
+
+  it('env 注入口径：heartbeat 默认 prompt 追加知识块 + 消费记录携带 session_id', () => {
+    const sessionId = 'hb_alpha_test_001';
+    const defaultPrompt = 'You are heartbeat agent "alpha". Execute your periodic task concisely.';
+    const result = injectHeartbeatKnowledge({
+      agentId: 'alpha',
+      systemPrompt: defaultPrompt,
+      sessionId,
+    });
+
+    assert.equal(result.injected, true);
+    assert.ok(result.prompt.startsWith(defaultPrompt), '注入只追加不替换原 prompt');
+    assert.ok(result.prompt.includes('<knowledge-context namespace="employee/alpha">'));
+    assert.deepEqual(result.layers, ['memory', 'colleagues', 'social']);
+    assert.equal(result.consumed, 3);
+
+    // 挂接点语义：session_id 只有 heartbeat 会话创建处可知 → 消费记录必须携带
+    const store = createKnowledgeStore(getKnowledgeDbPath(projectRootA), { projectRoot: projectRootA });
+    try {
+      const stats = store.getConsumptionSessionStats();
+      assert.equal(stats.total, 3);
+      assert.equal(stats.withSession, 3, 'heartbeat 注入的消费记录必须带 session_id');
+      assert.equal(stats.distinctSessions, 1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('显式 projectRoot 优先于 env：传无知识根 → 降级（env 有知识也不注入）', () => {
+    const result = injectHeartbeatKnowledge({
+      projectRoot: projectRootEmpty, // 显式指向无知识库
+      agentId: 'alpha',
+      systemPrompt: 'SOUL',
+      sessionId: 'hb_explicit_empty',
+    });
+
+    assert.equal(result.injected, false, '显式 projectRoot 必须优先于 env（不得注入 env 知识）');
+    assert.equal(result.prompt, 'SOUL');
+    assert.equal(result.consumed, 0);
+  });
+
+  it('env 指向无知识库 → 降级返回原 prompt，不阻断 heartbeat', () => {
+    const prev = process.env.TRILC_PROJECT_ROOT;
+    process.env.TRILC_PROJECT_ROOT = projectRootEmpty;
+    try {
+      const result = injectHeartbeatKnowledge({
+        agentId: 'alpha',
+        systemPrompt: 'HB-SOUL',
+        sessionId: 'hb_env_empty',
+      });
+      assert.equal(result.injected, false);
+      assert.equal(result.prompt, 'HB-SOUL');
+      assert.equal(result.consumed, 0);
+    } finally {
+      if (prev === undefined) delete process.env.TRILC_PROJECT_ROOT;
+      else process.env.TRILC_PROJECT_ROOT = prev;
+    }
   });
 });
