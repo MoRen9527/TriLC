@@ -19,12 +19,16 @@
 // 校验员工一致后直接补 transitionTo。
 //
 // 落点白名单（枚举，任何逃逸在 validateAssemblePayload 拒绝）：
-//   - {workspaceRoot}/.claude/agents/<roleId>.md（roleId 必须来自岗位目录）
-//   - {workspaceRoot}/docs/registry/company-state.json
+//   - {workspaceRoot}/docs/registry/company-state.json（员工索引真源，无条件写）
 //   - {workspaceRoot}/docs/registry/business-state.md（既有真实内容不覆盖）
 //   - {workspaceRoot}/AGENTS.md（既有真实内容不覆盖）
 //   - {dataDir}/company/state.json（经 CompanyInitState.save() 机制沿用，
 //     init-state.ts 零改动；REQ-019 baseline commit 随机制触发）
+//
+// 装配收敛（CTO 定案 2026-08-20 方案 A）：.claude/agents/<roleId>.md 不再由
+// 装配端点生成——claude 面 live entry 收敛进 TriCompany 统一发布管线
+// （--publish-agents --host=claude 渲染派生）；工作区员工索引真源 =
+// docs/registry/company-state.json。零本地执行契约不变。
 
 import { mkdir, writeFile, rename, copyFile, access, rm } from 'node:fs/promises';
 import { resolve, dirname, join } from 'node:path';
@@ -158,28 +162,9 @@ export function resetAssembleForTest(): void {
 }
 
 // ── 装配产物模板 ──
-
-function yamlQuote(text: string): string {
-  return text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-}
-
-function buildAgentMd(roleId: string, roleName: string, oneLinePositioning: string, name: string): string {
-  return [
-    '---',
-    `name: ${name}`,
-    `description: "${yamlQuote(oneLinePositioning)}"`,
-    `roleId: ${roleId}`,
-    `role: ${roleName}`,
-    '---',
-    '',
-    `你是 TriCompany 的 ${roleName} 岗位员工，工作名「${name}」。`,
-    '',
-    `- 岗位标准定义（真源）：TriCompany/source-agents/${roleId}/（合同五件套：soul / agent-body / agent-frontmatter / memory / colleagues / social）`,
-    '- 本文件由 TriCade 初始化装配端点生成（POST /internal/v1/init/assemble），承载工作区员工索引与名字绑定；岗位职责修订走源侧合同。',
-    `- 运行时身份注入由 TriLC contract-resolver 按 agent_id=${roleId} 执行；岗位是标准资产，名字是用户资产（CEO 开张时指定）。`,
-    '',
-  ].join('\n');
-}
+// 装配收敛（定案 2026-08-20 方案 A）：buildAgentMd（.claude/agents 目标模板）
+// 已废弃移除——claude 面 live entry 由 TriCompany 统一发布管线渲染生成
+// （source_publish_check.py --publish-agents --host=claude）。
 
 function buildCompanyStateJson(ceoName: string, employees: CompanyEmployee[], entry: AssembleEntry): string {
   return JSON.stringify(
@@ -213,7 +198,7 @@ function buildBusinessStateMd(ceoName: string, employees: CompanyEmployee[]): st
 }
 
 function buildAgentsMd(ceoName: string, employees: CompanyEmployee[]): string {
-  const lines = employees.map((e) => `- ${e.role} — ${e.name}（.claude/agents/${e.role}.md）`);
+  const lines = employees.map((e) => `- ${e.role} — ${e.name}`);
   return [
     '# TriCompany Agents',
     '',
@@ -224,7 +209,7 @@ function buildAgentsMd(ceoName: string, employees: CompanyEmployee[]): string {
     ...lines,
     '',
     '- 岗位标准定义真源：TriCompany/source-agents/<roleId>/（合同五件套）',
-    '- 员工文件：.claude/agents/<roleId>.md（名字绑定索引）',
+    '- 员工索引真源：docs/registry/company-state.json（名字绑定）；claude 面 live entry 由统一发布管线渲染生成（--host=claude）。',
     '',
   ].join('\n');
 }
@@ -248,31 +233,15 @@ interface PrewriteTarget {
 function buildTargets(
   deps: AssembleDeps,
   req: AssembleRequest,
-  catalog: { roles: RoleCatalogEntry[] },
 ): PrewriteTarget[] {
   const root = resolve(deps.workspaceRoot);
-  const byId = new Map(catalog.roles.map((r) => [r.roleId, r]));
   const employees: CompanyEmployee[] = req.selections.map((s) => ({ role: s.roleId, name: s.name.trim() }));
   const targets: PrewriteTarget[] = [];
 
-  for (const sel of req.selections) {
-    const meta = byId.get(sel.roleId);
-    const relPath = `.claude/agents/${sel.roleId}.md`;
-    const absPath = resolve(root, '.claude', 'agents', `${sel.roleId}.md`);
-    targets.push({
-      relPath,
-      absPath,
-      content: buildAgentMd(sel.roleId, meta?.roleName ?? sel.roleId, meta?.oneLinePositioning ?? '', sel.name.trim()),
-      tmpPath: `${absPath}.tmp`,
-      bakPath: null,
-      applied: false,
-      // BUG-001 修复（E2E C1-002 实证 2026-08-17）：worktree 内 .claude/agents 可能已有
-      // Claude Code 子代理定义（或前次装配产物）——同名文件视为既有真实内容，缺失才写（preserved 报告）。
-      // 双源冲突的根本解法归落点迁移设计（clone/collab 协议），此处先守不静默覆盖。
-      onlyIfMissing: true,
-      preserved: false,
-    });
-  }
+  // 装配收敛（定案 2026-08-20 方案 A）：.claude/agents/<roleId>.md 写目标已移除
+  // ——claude 面 live entry 归 TriCompany 统一发布管线（--host=claude 渲染派生），
+  // 装配端点不再与其双源竞争（原 BUG-001 双源冲突随落点迁移消解）。
+  // 此处只落 company-state.json（员工索引真源，无条件写）+ 两个占位目标。
 
   const companyStateRel = 'docs/registry/company-state.json';
   const companyStateAbs = resolve(root, 'docs', 'registry', 'company-state.json');
@@ -448,12 +417,14 @@ async function doAssemble(deps: AssembleDeps, req: AssembleRequest): Promise<Ass
   // ④-开始：assembling 事件
   publishStepEvent(deps, 'assembling', req.entry, null);
 
+  // 岗位目录只读访问：路由层 validateAssemblePayload 已做目录成员校验
+  // （role_catalog_unavailable → 400），此处保留守卫作纵深防御（500 路径不变）。
   const catalog = deps.getRoleCatalog();
   if (!catalog) {
     publishStepEvent(deps, 'assemble-failed', req.entry, { error: 'role catalog not loaded' });
     return { status: 500, error: 'role catalog not loaded' };
   }
-  const targets = buildTargets(deps, req, catalog);
+  const targets = buildTargets(deps, req);
   const bakDir = newBakDirPath(deps.dataDir);
 
   // ② 预写段：任一失败 → .bak 恢复 + 删新增文件 → 500 { rollback }

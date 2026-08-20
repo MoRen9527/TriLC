@@ -2,6 +2,10 @@
 // 覆盖：校验矩阵（400 族）/ 白名单逃逸拒绝 / 阶段门禁 422 / 防重入 409 /
 // 回滚（注入失败点）/ 幂等重试（state 成功 transition 失败路径）/
 // 事件序与状态帧一致 / preserved 语义 / <5 岗 warning。
+// 装配收敛（CTO 定案 2026-08-20 方案 A）：.claude/agents 写目标移除，
+// 员工索引真源 = docs/registry/company-state.json（无条件写）；
+// business-state.md / AGENTS.md 保持占位（onlyIfMissing + preserved 报告）。
+// 目标序：0=company-state.json 1=business-state.md 2=AGENTS.md。
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -184,9 +188,10 @@ test("prewrite failure → .bak 恢复 + 删新增文件 + 500 { rollback: compl
   const h = await newHarness({ failOnTarget: 1 });
   try {
     // 预置既有文件（写入后被覆盖 → 回滚应恢复原内容）
-    const agentPath = join(h.ws, '.claude', 'agents', 'ceo-chief-of-staff.md');
-    await mkdir(join(h.ws, '.claude', 'agents'), { recursive: true });
-    await writeFile(agentPath, 'OLD CONTENT', 'utf-8');
+    // 目标序：0=company-state.json（无条件写）1=business-state.md（注入失败点）
+    const statePath = join(h.ws, 'docs', 'registry', 'company-state.json');
+    await mkdir(join(h.ws, 'docs', 'registry'), { recursive: true });
+    await writeFile(statePath, 'OLD CONTENT', 'utf-8');
 
     const r = await runAssemble(h.deps, REQ);
     assert.equal(r.status, 500, '预写段注入失败 → 500');
@@ -194,14 +199,18 @@ test("prewrite failure → .bak 恢复 + 删新增文件 + 500 { rollback: compl
     assert.ok((r as { error: string }).error.includes('injected prewrite failure'));
 
     // 已 rename 的 target #0 从 .bak 恢复
-    const restored = await readFile(agentPath, 'utf-8');
+    const restored = await readFile(statePath, 'utf-8');
     assert.equal(restored, 'OLD CONTENT', '既有文件回滚恢复原内容');
     // 未触达的 target 不落盘
-    const secondAgent = join(h.ws, '.claude', 'agents', 'full-stack-developer.md');
-    await assert.rejects(readFile(secondAgent, 'utf-8'), 'target #1 未 rename 不落盘');
+    await assert.rejects(readFile(join(h.ws, 'AGENTS.md'), 'utf-8'), 'target #2 未 rename 不落盘');
+    // 装配收敛：.claude/agents 不再属于装配落点（零写入）
+    await assert.rejects(
+      readFile(join(h.ws, '.claude', 'agents', 'ceo-chief-of-staff.md'), 'utf-8'),
+      '.claude/agents 不再写入',
+    );
     // 无 tmp 残留
-    const agentsDir = await readdir(join(h.ws, '.claude', 'agents'));
-    assert.equal(agentsDir.some((f) => f.endsWith('.tmp')), false, '无 tmp 残留');
+    const registryDir = await readdir(join(h.ws, 'docs', 'registry'));
+    assert.equal(registryDir.some((f) => f.endsWith('.tmp')), false, '无 tmp 残留');
     // assemble-failed 事件
     assert.equal(stepEvents(h.events, 'assemble-failed').length, 1, 'assemble-failed 事件');
     assert.equal(stepEvents(h.events, 'assembled').length, 0, '无 assembled 事件');
@@ -216,11 +225,13 @@ test("prewrite failure 回滚删新增文件（无 bak 的新文件）", async (
     const r = await runAssemble(h.deps, REQ);
     assert.equal(r.status, 500);
     // target #0 是全新文件（无 .bak）→ 回滚 = 删除
-    const firstAgent = join(h.ws, '.claude', 'agents', 'ceo-chief-of-staff.md');
-    await assert.rejects(readFile(firstAgent, 'utf-8'), '新增文件回滚即删');
-    // 白名单外零写入
+    const statePath = join(h.ws, 'docs', 'registry', 'company-state.json');
+    await assert.rejects(readFile(statePath, 'utf-8'), '新增文件回滚即删');
+    // 装配收敛：无 .claude 目录（不再落 claude 面）
     const wsFiles = await readdir(h.ws);
-    const unexpected = wsFiles.filter((f) => !['.claude'].includes(f));
+    assert.equal(wsFiles.includes('.claude'), false, '无 .claude 写入');
+    // 白名单外零写入（docs 目录为 company-state.json 的 mkdir 残留，文件已删）
+    const unexpected = wsFiles.filter((f) => !['docs'].includes(f));
     assert.deepEqual(unexpected, [], '工作区无白名单外写入');
   } finally {
     await h.cleanup();
@@ -240,15 +251,16 @@ test("idempotent retry: state saved + transition failed → 重入跳过文件�
     assert.equal(JSON.parse(stateFile).state, 'initialized', '公司态已 initialized（save 成功不回滚）');
 
     // 外部改动文件模拟「重入前文件被触碰」→ 重入必须跳过文件段（不覆盖）
-    const agentPath = join(h.ws, '.claude', 'agents', 'ceo-chief-of-staff.md');
-    await writeFile(agentPath, 'EXTERNAL CHANGE', 'utf-8');
+    // 首跑已生成占位 AGENTS.md；外部改写后重入不得重写
+    const agentsPath = join(h.ws, 'AGENTS.md');
+    await writeFile(agentsPath, 'EXTERNAL CHANGE', 'utf-8');
 
     const retryDeps: AssembleDeps = { ...h.deps, failOnTransition: false };
     const second = await runAssemble(retryDeps, REQ);
     assert.equal(second.status, 200, '重入 → 200 补 transition');
     assert.equal(retryDeps.chain.getState(), 'project-link');
-    const agentAfter = await readFile(agentPath, 'utf-8');
-    assert.equal(agentAfter, 'EXTERNAL CHANGE', '文件段跳过（不重写）');
+    const agentsAfter = await readFile(agentsPath, 'utf-8');
+    assert.equal(agentsAfter, 'EXTERNAL CHANGE', '文件段跳过（不重写）');
     assert.equal(stepEvents(h.events, 'assembling').length, 1, '第一次的 assembling 只发一次');
     assert.equal(stepEvents(h.events, 'assembled').length, 1, 'assembled 一次');
   } finally {
@@ -336,7 +348,7 @@ test("event order: assembling → assembled；chain-changed 与状态帧一致",
 
 // ── 7. 落点白名单产物 + preserved 语义 + <5 岗 warning ──
 
-test("whitelist artifacts written; existing business-state/AGENTS preserved; <5 warning", async () => {
+test("whitelist artifacts written; existing business-state/AGENTS preserved; <5 warning; no .claude write", async () => {
   const h = await newHarness();
   try {
     // 预置真实内容（模拟现状真源）：装配不得覆盖
@@ -347,18 +359,22 @@ test("whitelist artifacts written; existing business-state/AGENTS preserved; <5 
     const r = await runAssemble(h.deps, { ceoName: '磨人', selections: [REQ.selections[0]], entry: 'tripilot' });
     assert.equal(r.status, 200);
     const body = r as Extract<Awaited<ReturnType<typeof runAssemble>>, { status: 200 }>;
-    assert.deepEqual(body.preserved, ['docs/registry/business-state.md', 'AGENTS.md'], 'preserved 报告');
+    assert.deepEqual(body.preserved, ['docs/registry/business-state.md', 'AGENTS.md'], 'preserved 报告（占位目标语义保留）');
     assert.equal(body.warning?.recommendedMin, 7, '<7 岗 warning（D1 修订）');
     assert.equal(body.warning?.current, 1);
 
-    const agentMd = await readFile(join(h.ws, '.claude', 'agents', 'ceo-chief-of-staff.md'), 'utf-8');
-    assert.ok(agentMd.includes('name: 小贾'), '员工名写入 agent md');
-    assert.ok(agentMd.includes('roleId: ceo-chief-of-staff'), 'roleId 写入 agent md');
+    // 索引真源：company-state.json 无条件写（员工名字绑定）
     const companyJson = JSON.parse(await readFile(join(h.ws, 'docs', 'registry', 'company-state.json'), 'utf-8'));
     assert.equal(companyJson.ceoName, '磨人');
     assert.deepEqual(companyJson.employees, [{ role: 'ceo-chief-of-staff', name: '小贾' }]);
+    // 占位目标既有真实内容不覆盖
     assert.equal(await readFile(join(h.ws, 'docs', 'registry', 'business-state.md'), 'utf-8'), 'REAL BUSINESS STATE', '既有内容不覆盖');
     assert.equal(await readFile(join(h.ws, 'AGENTS.md'), 'utf-8'), 'REAL AGENTS', '既有内容不覆盖');
+    // 装配收敛（定案 2026-08-20 方案 A）：不再写 .claude/agents/<roleId>.md
+    await assert.rejects(
+      readFile(join(h.ws, '.claude', 'agents', 'ceo-chief-of-staff.md'), 'utf-8'),
+      '装配端点不再生成 .claude/agents 员工文件',
+    );
   } finally {
     await h.cleanup();
   }
