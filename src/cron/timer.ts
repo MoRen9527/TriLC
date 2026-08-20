@@ -314,10 +314,16 @@ export async function executeJobCoreWithTimeout(
   timeoutMs = DEFAULT_JOB_TIMEOUT_MS,
 ): Promise<JobExecutionResult> {
   const jobPromise = executeJobCore(deps, job);
+  // 资源清理：race 结束后必须 clearTimeout 挂起的超时定时器——否则每次 job
+  // run 泄漏一个 DEFAULT_JOB_TIMEOUT_MS(10min) 定时器，长驻 daemon 会堆积，
+  // 测试进程也会因事件循环不空而无法退出（node:test 挂起被杀）。
+  let timer: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<JobExecutionResult>((resolve) => {
-    setTimeout(() => resolve({ status: "timeout", error: `Job timed out after ${timeoutMs}ms` }), timeoutMs);
+    timer = setTimeout(() => resolve({ status: "timeout", error: `Job timed out after ${timeoutMs}ms` }), timeoutMs);
   });
-  return Promise.race([jobPromise, timeoutPromise]);
+  const result = await Promise.race([jobPromise, timeoutPromise]);
+  if (timer) clearTimeout(timer);
+  return result;
 }
 
 // ── Missed job catchup (on startup) ──
