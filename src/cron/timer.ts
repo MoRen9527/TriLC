@@ -48,6 +48,8 @@ export interface CronTimerDeps {
   /** FADE-ASSESS-005: 员工岗在岗校验（读 CompanyInitState.employees）。
    *  job.roleId 设置后拉起 agent 前校验；非在岗 → skipped，不拉起。缺省不校验。 */
   isRoleActive?: (roleId: string) => Promise<boolean>;
+  /** FADE-ASSESS-003 小乔指标：roleId 门禁拒绝回调（daemon 注入埋点；缺省静默）。 */
+  onRoleGateDenied?: (roleId: string) => void;
 }
 
 export interface CronTimerState {
@@ -229,12 +231,14 @@ interface JobExecutionResult { status: "ok" | "error" | "timeout" | "skipped"; e
  * 未绑定 roleId / 未注入校验函数 → 放行（向后兼容）。
  */
 export async function shouldRunJob(
-  deps: Pick<CronTimerDeps, "isRoleActive">,
+  deps: Pick<CronTimerDeps, "isRoleActive" | "onRoleGateDenied">,
   job: CronJob,
 ): Promise<{ run: boolean; reason?: string }> {
   if (job.roleId && deps.isRoleActive) {
     const active = await deps.isRoleActive(job.roleId);
     if (!active) {
+      // FADE-ASSESS-003 小乔指标：调度路由到未在岗岗 → routing_error 埋点（轻量回调）
+      deps.onRoleGateDenied?.(job.roleId);
       return { run: false, reason: `owner_not_active: role ${job.roleId} not in active roster` };
     }
   }

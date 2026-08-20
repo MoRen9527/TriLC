@@ -47,10 +47,17 @@ export async function listAgentsForDisplay(): Promise<string> {
 type RosterGateFn = (roleId: string) => Promise<{ status: string } | undefined>;
 
 let rosterGate: RosterGateFn | null = null;
+/** FADE-ASSESS-003 小乔指标：spawn 门禁拒绝回调（daemon 注入真实埋点；未注入不埋）。 */
+let onSpawnGateDenied: ((roleId: string, status: string) => void) | null = null;
 
 /** daemon 注入点：设置岗位在岗校验函数（undefined 返回值 = 门禁不可用，放行）。 */
 export function setRosterGate(fn: RosterGateFn | null): void {
   rosterGate = fn;
+}
+
+/** daemon 注入点：spawn 门禁拒绝回调（轻量埋点；独立使用/单测不注入即静默）。 */
+export function setOnSpawnGateDenied(fn: ((roleId: string, status: string) => void) | null): void {
+  onSpawnGateDenied = fn;
 }
 
 /**
@@ -65,6 +72,8 @@ export async function enforceRosterGate(roleId: string): Promise<{ ok: boolean; 
   const res = await rosterGate(roleId);
   if (!res) return { ok: true };
   if (res.status === 'active') return { ok: true, status: res.status };
+  // FADE-ASSESS-003 小乔指标：spawn 路由到未在岗岗 → routing_error 埋点（轻量回调）
+  onSpawnGateDenied?.(roleId, res.status);
   return { ok: false, status: res.status, error: 'role_not_active' };
 }
 

@@ -7,6 +7,7 @@ import { readFileSync, existsSync, watch } from 'fs';
 import { resolve } from 'path';
 import { parse as parseYaml } from 'yaml';
 import { loadContractV3, type AgentContractV3 } from '@tricompany/agent-core';
+import { syncKnowledgeFromSource } from '../knowledge-injector/sync.js';
 
 // ── Types ──
 
@@ -351,19 +352,53 @@ class AgentContractResolver {
     return { schemaVersion: 1, roles };
   }
 
-  /** 监听文件变更并热重载 */
-  watchAndReload(): void {
+  /** 监听文件变更并热重载（FADE-ASSESS-003 扩展：五件套三层知识文件 → knowledge.db 增量同步）。
+   *
+   * @param projectRoot 知识库归属项目根（增量同步落点）；缺省回退 TRILC_PROJECT_ROOT/cwd。
+   */
+  watchAndReload(projectRoot?: string): void {
+    const knowledgeProjectRoot = projectRoot ?? process.env.TRILC_PROJECT_ROOT ?? process.cwd();
     this.watcher = watch(this.sourceRoot, { recursive: true }, (_event, filename) => {
-      if (filename?.endsWith('.contract.yaml') || filename?.endsWith('.agent.md')) {
+      if (!filename) return;
+      if (filename.endsWith('.contract.yaml') || filename.endsWith('.agent.md')) {
         console.log(`[contract-resolver] change detected: ${filename}, reloading...`);
         this.loadAll().then(count => {
           console.log(`[contract-resolver] reloaded ${count} contracts`);
         });
+      } else if (
+        filename.endsWith('.memory.md') ||
+        filename.endsWith('.colleagues.md') ||
+        filename.endsWith('.social.md')
+      ) {
+        // FADE-ASSESS-003: 五件套三层知识文件变更 → 增量同步（幂等，hash 相同跳过）
+        const segments = filename.split(/[\\/]/);
+        const agentId = segments.length > 1 ? segments[0] : undefined;
+        if (!agentId) return;
+        console.log(`[contract-resolver] knowledge change detected: ${filename}, incremental sync...`);
+        try {
+          const report = syncKnowledgeFromSource({
+            sourceRoot: this.sourceRoot,
+            projectRoot: knowledgeProjectRoot,
+            agentFilter: [agentId],
+          });
+          console.log(
+            `[knowledge-injector] incremental sync (${agentId}): ${report.inserted} inserted, ` +
+            `${report.skipped} skipped, ${report.errors.length} errors`,
+          );
+        } catch (err) {
+          console.warn('[knowledge-injector] incremental sync failed:', (err as Error).message);
+        }
       }
     });
   }
 
-  /** 停止监听 */
+  /** 仅关闭文件监听（保留 contracts 缓存；app.stop() 用，防 watcher 拖住事件循环） */
+  closeWatcher(): void {
+    this.watcher?.close();
+    this.watcher = null;
+  }
+
+  /** 停止监听并清空合同缓存 */
   dispose(): void {
     this.watcher?.close();
     this.contracts.clear();

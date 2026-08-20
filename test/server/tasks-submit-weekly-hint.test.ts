@@ -15,6 +15,7 @@ const SAVED_ENV = {
   TRILC_DATA_DIR: process.env.TRILC_DATA_DIR,
   TRILC_WEEKLY_PLANE_ROOT: process.env.TRILC_WEEKLY_PLANE_ROOT,
   TRILC_PORT: process.env.TRILC_PORT,
+  TRILC_PROJECT_ROOT: process.env.TRILC_PROJECT_ROOT,
   TRIMODEL_API_TOKEN: process.env.TRIMODEL_API_TOKEN,
 };
 
@@ -47,6 +48,9 @@ before(async () => {
   process.env.TRILC_DATA_DIR = tmpDataDir;
   process.env.TRILC_WEEKLY_PLANE_ROOT = planeRoot;
   process.env.TRILC_PORT = '0';
+  // FADE-ASSESS-003: 知识注入启动同步的 projectRoot 隔离到临时目录，
+  // 防止 knowledge.db 落进仓库根（cwd）。
+  process.env.TRILC_PROJECT_ROOT = tmpDataDir;
   delete process.env.TRIMODEL_API_TOKEN;
 
   const { readEnv } = await import('../../src/config/env.js');

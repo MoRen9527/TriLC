@@ -14,6 +14,7 @@ import {
   type AgentContract,
   type EmployeeRosterEntry,
 } from '../config/contract-resolver.js';
+import { injectKnowledgeContext } from '../knowledge-injector/inject.js';
 
 /** 员工会话运行时配置（合同 YAML → 运行时）。 */
 export interface SessionConfig {
@@ -65,13 +66,23 @@ export async function initializeSession(
     throw new SessionInitError('agent contract not loaded', agentId);
   }
 
+  // FADE-ASSESS-003: 消费路径挂接点①（主路径）— SessionConfig 组装后追加知识注入块。
+  // boot injection 非检索；注入层不污染身份真源（getSystemPrompt 保持 soul+agent_body 不变）。
+  // 无知识/知识库未同步 → 原 prompt 降级返回，不阻断会话。
+  const injected = injectKnowledgeContext({
+    projectRoot: process.env.TRILC_PROJECT_ROOT || undefined,
+    agentId,
+    systemPrompt,
+    injectionMode: 'boot',
+  });
+
   const toolControl = resolver.getToolControl(agentId) ?? {};
   const employeeInfo = resolver.getEmployeeInfo(agentId);
   const dir = await ensureWorkspaceDir(workspaceRoot);
 
   return {
     agentId,
-    systemPrompt,
+    systemPrompt: injected.prompt,
     decisionRights,
     toolControl,
     employeeInfo,

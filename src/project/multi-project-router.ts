@@ -49,6 +49,8 @@ export interface ProjectPaths {
   eventQueueDbPath: string;
   /** SQLite database path for cron state. */
   cronDbPath: string;
+  /** SQLite database path for knowledge injection (FADE-ASSESS-003). */
+  knowledgeDbPath: string;
   /** JSON file path for key cache. */
   keyCachePath: string;
   /**
@@ -115,6 +117,7 @@ export function resolveProjectPaths(
     sessionDbPath: join(cognitionDir, 'sessions.db'),
     eventQueueDbPath: join(cognitionDir, 'event-queue.db'),
     cronDbPath: join(cognitionDir, 'cron.db'),
+    knowledgeDbPath: join(cognitionDir, 'knowledge.db'),
     keyCachePath: join(cognitionDir, 'key-cache.json'),
     ...(companyWeeklyPlaneDir ? { companyWeeklyPlaneDir } : {}),
   };
@@ -208,6 +211,13 @@ export function getEventQueueDbPath(projectRoot?: string): string {
  */
 export function getCronDbPath(projectRoot?: string): string {
   return resolveProjectPaths(projectRoot).cronDbPath;
+}
+
+/**
+ * Get the knowledge database path for a project (FADE-ASSESS-003).
+ */
+export function getKnowledgeDbPath(projectRoot?: string): string {
+  return resolveProjectPaths(projectRoot).knowledgeDbPath;
 }
 
 /**
