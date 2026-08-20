@@ -19,7 +19,7 @@ let appPort: number;
 
 before(async () => {
   for (const k of [
-    'TRILC_DATA_DIR', 'TRILC_WEEKLY_PLANE_ROOT', 'TRILC_PORT',
+    'TRILC_DATA_DIR', 'TRILC_WEEKLY_PLANE_ROOT', 'TRILC_PORT', 'TRILC_PROJECT_ROOT',
     'TRIMODEL_API_TOKEN', 'TRILC_TRIMODEL_API_URL',
   ]) {
     SAVED_ENV[k] = process.env[k];
@@ -27,6 +27,9 @@ before(async () => {
 
   tmpDataDir = mkdtempSync(join(tmpdir(), 'trilc-gating-'));
   process.env.TRILC_DATA_DIR = tmpDataDir;
+  // FADE-ASSESS-003: 知识注入启动同步的 projectRoot 隔离到临时目录，
+  // 防止 knowledge.db 落进仓库根（cwd）。
+  process.env.TRILC_PROJECT_ROOT = tmpDataDir;
   delete process.env.TRILC_WEEKLY_PLANE_ROOT;
   process.env.TRILC_PORT = '0';
   delete process.env.TRIMODEL_API_TOKEN;
@@ -166,6 +169,28 @@ describe('FADE-ASSESS-005 派工门禁 (tasks/submit ownerRoleId)', () => {
 });
 
 describe('FADE-ASSESS-005 可见性回归 (/agents contract 全量不改)', () => {
+  it('FADE-ASSESS-003 指标：409 派工拒绝后 GET /knowledge/metrics 可见 routing_error 计数', async () => {
+    const res = await fetch(`http://127.0.0.1:${appPort}/internal/v1/knowledge/metrics`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as {
+      ok: boolean;
+      metrics: {
+        counts: Array<{ event: string; count: number }>;
+        consumptionTotal: number;
+        documentsTotal: number;
+        sessionStats: { total: number; withSession: number; distinctSessions: number };
+      };
+    };
+    assert.equal(body.ok, true);
+    // 本 describe 前置用例已触发 ≥3 次派工 409（candidate×2 + unknown×1）→ routing_error 计数可见
+    const routing = body.metrics.counts.find((c) => c.event === 'routing_error');
+    assert.ok(routing, 'metrics 应含 routing_error 计数');
+    assert.ok(routing!.count >= 3, `routing_error 计数应 ≥3（实际 ${routing!.count}）`);
+    // 分母面字段齐备（本测试未注入消费，可为零）
+    assert.equal(typeof body.metrics.consumptionTotal, 'number');
+    assert.equal(typeof body.metrics.sessionStats.total, 'number');
+  });
+
   it('scope=company 返回 contract 全量：未在岗岗同样可见', async () => {
     const { status, json } = await getJSON('/internal/v1/agents?scope=company');
     assert.equal(status, 200);

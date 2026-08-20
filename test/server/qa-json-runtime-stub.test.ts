@@ -88,6 +88,7 @@ const SAVED_ENV = {
   TRIMODEL_API_TOKEN: process.env.TRIMODEL_API_TOKEN,
   TRILC_PORT: process.env.TRILC_PORT,
   TRILC_DATA_DIR: process.env.TRILC_DATA_DIR,
+  TRILC_PROJECT_ROOT: process.env.TRILC_PROJECT_ROOT,
   TRIMODEL_KEY_STORAGE_MODE: process.env.TRIMODEL_KEY_STORAGE_MODE,
   TRICOMPANY_SOURCE_PATH: process.env.TRICOMPANY_SOURCE_PATH,
   TRILC_INTERNAL_TOKEN: process.env.TRILC_INTERNAL_TOKEN,
@@ -111,6 +112,9 @@ before(async () => {
   process.env.TRILC_PORT = String(appPort);
   // p0fix3：内部门 fail-closed——app.start() 前注入测试 token，请求统一带头。
   process.env.TRILC_INTERNAL_TOKEN = TEST_INTERNAL_TOKEN;
+  // FADE-ASSESS-003: 知识注入启动同步的 projectRoot 隔离到临时目录，
+  // 防止 knowledge.db 落进仓库根（cwd）。
+  process.env.TRILC_PROJECT_ROOT = tmpDataDir;
   // Point contract resolver at an existing path to avoid load failures.
   // (The default walks up to find TriCompany; we leave it unset unless needed.)
 

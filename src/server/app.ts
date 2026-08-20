@@ -57,6 +57,11 @@ import { createHeartbeatRunner, type TriLCHeartbeatRunner, type HeartbeatAgentCo
 import { CompanyInitState } from '../company/init-state.js';
 import { getContractResolver } from '../config/contract-resolver.js';
 import { InitChain } from '../company/init-chain.js';
+import { injectKnowledgeContext } from '../knowledge-injector/inject.js';
+import {
+  recordKnowledgeMetric,
+  getKnowledgeMetricSnapshot,
+} from '../knowledge-injector/metrics.js';
 import {
   beginSelfcheck,
   isSelfcheckRunning,
@@ -105,7 +110,7 @@ import { createSessionReaper } from '../cron/session-reaper.js';
 import { createMinimalCronEngine, type MinimalCronEngine } from '../cron/service.js';
 import { createUpdateCheckHandler, startUpdateCheckLoop } from '../update/update-check.js';
 // FADE-ASSESS-005 分身门禁：AgentTool 合同员工 spawn 前置校验 roster.active。
-import { setRosterGate } from '../tools/agent-tool.js';
+import { setRosterGate, setOnSpawnGateDenied } from '../tools/agent-tool.js';
 
 // Cached roster of available sub-agents (built at daemon startup, injected
 // into system prompts so the model knows by name which agents it can invoke
@@ -1383,6 +1388,15 @@ export function createTriLCApp(env: TriLCEnv) {
     },
     // FADE-ASSESS-005 调度门禁：绑定 roleId 的 job 拉起 agent 前校验 roster.active。
     isRoleActive: async (roleId) => isRoleActive(staffingDeps, roleId),
+    // FADE-ASSESS-003 小乔指标：调度路由到未在岗岗 → routing_error 埋点（轻量）
+    onRoleGateDenied: (roleId) => {
+      recordKnowledgeMetric({
+        projectRoot: env.projectRoot,
+        event: 'routing_error',
+        agentId: roleId,
+        detail: 'cron_owner_not_active',
+      });
+    },
   });
   const taskStreams = new Map<string, TaskStreamEntry>();
   let connectionId = '';
@@ -1476,6 +1490,15 @@ export function createTriLCApp(env: TriLCEnv) {
         const status = await getRoleRosterStatus(staffingDeps, roleId);
         return { status };
       });
+      // FADE-ASSESS-003 小乔指标：spawn 路由到未在岗岗 → routing_error 埋点（轻量）
+      setOnSpawnGateDenied((roleId, status) => {
+        recordKnowledgeMetric({
+          projectRoot: env.projectRoot,
+          event: 'routing_error',
+          agentId: roleId,
+          detail: `spawn_gate_denied:${status}`,
+        });
+      });
 
       // P4.2: Register shell_exec tool backed by ProcessSupervisor
       registerShellExecTool({ supervisor: getDefaultSupervisor() });
@@ -1561,6 +1584,26 @@ export function createTriLCApp(env: TriLCEnv) {
       // Phase 2.1: Load employee roster for display metadata
       const rosterCount = getContractResolver().loadEmployeeRoster();
       console.log(`[trilc] employee roster: ${rosterCount} employees loaded`);
+
+      // Phase 2.2 (FADE-ASSESS-003): 知识注入 — daemon 启动全量同步
+      // （loadAll() 之后；源只读；幂等：content_hash 相同跳过）。同步失败不阻断启动。
+      try {
+        const { syncKnowledgeFromSource } = await import('../knowledge-injector/sync.js');
+        const knowledgeReport = syncKnowledgeFromSource({
+          sourceRoot: env.tricompanySourcePath,
+          projectRoot: env.projectRoot,
+        });
+        console.log(
+          `[trilc] knowledge sync: ${knowledgeReport.inserted} inserted, ` +
+          `${knowledgeReport.skipped} skipped, ${knowledgeReport.scanned} files` +
+          (knowledgeReport.errors.length > 0 ? ` (${knowledgeReport.errors.length} errors)` : ''),
+        );
+        // watch 增量（设计挂接点②）：扩展后的 watchAndReload 监听三层知识文件。
+        // 注：watchAndReload 此前无生产调用方（死代码），本次一并接线使增量路径生效。
+        getContractResolver().watchAndReload(env.projectRoot);
+      } catch (err) {
+        console.warn('[trilc] knowledge sync failed (daemon continues):', (err as Error).message);
+      }
 
       // Build assistant-facing agent roster (injected into system prompt).
       try {
@@ -2248,13 +2291,34 @@ export function createTriLCApp(env: TriLCEnv) {
               res.end(JSON.stringify({ ok: false, error: `agent not found: ${agentId}` }));
               return;
             }
+            // FADE-ASSESS-003: 消费路径挂接点② — 响应追加知识注入块
+            // （boot injection 非检索；注入层不污染身份真源，getSystemPrompt 保持不变）
+            const injectedPrompt = injectKnowledgeContext({
+              projectRoot: env.projectRoot,
+              agentId,
+              systemPrompt,
+              injectionMode: 'boot',
+            }).prompt;
             res.writeHead(200, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, agentId, systemPrompt }));
+            res.end(JSON.stringify({ ok: true, agentId, systemPrompt: injectedPrompt }));
           } catch (error) {
             const message = error instanceof URIError ? 'invalid agent id' : 'contract resolver not initialized';
             res.writeHead(error instanceof URIError ? 400 : 500, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: message }));
           }
+          return;
+        }
+
+        // ── GET /internal/v1/knowledge/metrics ──
+        // FADE-ASSESS-003 小乔验证指标快照（只读）：分子=行为计数（越权升级/路由
+        // 错误），分母=knowledge_consumption 聚合（注入成功/会话覆盖素材）。
+        if (req.url === '/internal/v1/knowledge/metrics' && req.method === 'GET') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true,
+            projectRoot: env.projectRoot,
+            metrics: getKnowledgeMetricSnapshot(env.projectRoot),
+          }));
           return;
         }
 
@@ -3195,6 +3259,13 @@ export function createTriLCApp(env: TriLCEnv) {
           if (body.ownerRoleId) {
             const gate = await enforceRoleActive(staffingDeps, body.ownerRoleId);
             if (!gate.allowed) {
+              // FADE-ASSESS-003 小乔指标：派工路由到未在岗岗 → routing_error 埋点
+              recordKnowledgeMetric({
+                projectRoot: env.projectRoot,
+                event: 'routing_error',
+                agentId: body.ownerRoleId,
+                detail: `tasks_submit_gate:${gate.status}`,
+              });
               res.writeHead(409, { 'content-type': 'application/json' });
               res.end(JSON.stringify({
                 error: gate.error,
@@ -4349,6 +4420,11 @@ export function createTriLCApp(env: TriLCEnv) {
       connMgr.stopHealthCheckLoop();
       stopKeyCache();
       cancelAllShellProcesses();
+      // FADE-ASSESS-003: 关闭 contract-resolver 文件监听（knowledge watch 增量），
+      // 否则 fs.watch 句柄会拖住事件循环（测试/退出流程挂起）
+      try {
+        getContractResolver().closeWatcher();
+      } catch { /* resolver 未初始化 */ }
       if (server) {
         await new Promise<void>((resolve, reject) => {
           server!.close((err) => (err ? reject(err) : resolve()));

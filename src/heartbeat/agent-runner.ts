@@ -8,6 +8,8 @@
 import { agentLoop } from "@tricompany/agent-core";
 import type { HeartbeatRunResult } from "./heartbeat-wake.js";
 import type { SessionRecord } from "../session-store/types.js";
+import { injectKnowledgeContext } from "../knowledge-injector/inject.js";
+import { isEscalationBlockReason, recordKnowledgeMetric } from "../knowledge-injector/metrics.js";
 
 export interface RunHeartbeatAgentOpts {
   agentId: string;
@@ -54,8 +56,17 @@ export async function runHeartbeatAgent(
   const startTime = Date.now();
   const sessionId = `hb_${agentId}_${startTime.toString(36)}`;
 
-  const prompt = systemPrompt ??
-    `You are heartbeat agent "${agentId}". Execute your periodic task concisely.`;
+  // FADE-ASSESS-003: 消费路径挂接点③（heartbeat 会话）— 设计锚点 heartbeat-runner.ts:137
+  // （prompt 传入点）→ 实际注入在本模块会话创建处，session_id 只有此处可知（消费记录需要）。
+  // 无知识/知识库未同步 → 原 prompt 降级返回，不阻断 heartbeat。
+  const prompt = injectKnowledgeContext({
+    projectRoot: process.env.TRILC_PROJECT_ROOT || undefined,
+    agentId,
+    systemPrompt: systemPrompt ??
+      `You are heartbeat agent "${agentId}". Execute your periodic task concisely.`,
+    sessionId,
+    injectionMode: 'boot',
+  }).prompt;
   const message = userMessage ??
     `Heartbeat check for ${agentId}. Report status.`;
 
@@ -107,6 +118,16 @@ export async function runHeartbeatAgent(
           toolCallId: `blocked_${toolBlockedCount}`,
           isError: true,
         });
+        // FADE-ASSESS-003 小乔指标：权限/合同边界拒绝 → 越权升级计数（轻量；非越权语义不计）
+        if (isEscalationBlockReason(event.reason)) {
+          recordKnowledgeMetric({
+            projectRoot: process.env.TRILC_PROJECT_ROOT || undefined,
+            event: "escalation_blocked",
+            agentId,
+            sessionId,
+            detail: `tool:${event.tool_name}`,
+          });
+        }
       }
     }
 
