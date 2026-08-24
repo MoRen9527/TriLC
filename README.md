@@ -1,5 +1,7 @@
 # TriLC
 
+> **命名锚定（2026-08-24，quad-migration v1.0）**：本模块叙事面已更名 **TriRLC**（元现实本地控制器，读 "Tri-R-L-C"），与 TriRMC 共用自研内核 agent-core。仓目录名 `TriLC`、bin/npm 名 `trilc` 为兼容面照旧（操作命令语境用旧名）。权威 alias 表：`../TriCompany/docs/registry/company-governance-state.md`
+
 TriLC is the TriMetaverse Local Controller.
 
 Responsibilities:
