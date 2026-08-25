@@ -125,6 +125,10 @@ function postMirror(
         headers: {
           'content-type': 'application/json',
           'content-length': Buffer.byteLength(body).toString(),
+          // P0 加固配套：TriMMC /internal token 门（同 postHeartbeat）
+          ...(process.env.TRIMC_INTERNAL_TOKEN
+            ? { 'X-Internal-Token': process.env.TRIMC_INTERNAL_TOKEN }
+            : {}),
         },
         timeout: timeoutMs,
       },

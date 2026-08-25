@@ -616,6 +616,11 @@ function postHeartbeat(baseUrl: string, hb: {
         headers: {
           'content-type': 'application/json',
           'content-length': Buffer.byteLength(body).toString(),
+          // P0 加固配套：TriMMC /internal token 门（原生 http.request 不经全局
+          // fetch 包装，需在此显式附头；未配置时零行为变化）
+          ...(process.env.TRIMC_INTERNAL_TOKEN
+            ? { 'X-Internal-Token': process.env.TRIMC_INTERNAL_TOKEN }
+            : {}),
         },
         timeout: timeoutMs,
       },
@@ -662,6 +667,11 @@ async function postReplay(
         headers: {
           'content-type': 'application/json',
           'content-length': Buffer.byteLength(body).toString(),
+          // P0 加固配套：TriMMC /internal token 门（原生 http.request 不经全局
+          // fetch 包装，需在此显式附头；未配置时零行为变化）
+          ...(process.env.TRIMC_INTERNAL_TOKEN
+            ? { 'X-Internal-Token': process.env.TRIMC_INTERNAL_TOKEN }
+            : {}),
         },
         timeout: timeoutMs,
       },
