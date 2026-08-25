@@ -2449,6 +2449,7 @@ export function createTriLCApp(env: TriLCEnv) {
             // TC-1：headless 编排方续跑参数透传（默认 undefined=关闭）
             continueMaxRounds: Number(parsed.continue_max_rounds ?? 0) || undefined,
             continuePrompt: (parsed.continue_prompt as string) || undefined,
+            fallbackModel: (parsed.fallback_model as string) || undefined,
             tier: 'main',
             cwd: env.cwd,
             // C8: Use resolved permission mode (from request body or env default)
@@ -2859,6 +2860,7 @@ export function createTriLCApp(env: TriLCEnv) {
             // TC-1：headless 编排方续跑参数透传（默认 undefined=关闭）
             continueMaxRounds: Number(parsed.continue_max_rounds ?? 0) || undefined,
             continuePrompt: (parsed.continue_prompt as string) || undefined,
+            fallbackModel: (parsed.fallback_model as string) || undefined,
             tier: 'main',
             cwd: env.cwd,
             // C8: Use resolved permission mode
@@ -4455,6 +4457,7 @@ export function createTriLCApp(env: TriLCEnv) {
 
 interface AnthropicRequest {
   model?: string;
+  fallback_model?: string;
   // TC-1 续跑参数
   continue_max_rounds?: number;
   continue_prompt?: string;
@@ -4504,6 +4507,7 @@ interface AnthropicTool {
 
 interface OpenAIRequest {
   model?: string;
+  fallback_model?: string;
   // TC-1 续跑参数
   continue_max_rounds?: number;
   continue_prompt?: string;
