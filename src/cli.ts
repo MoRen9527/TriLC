@@ -11,6 +11,7 @@ import { platform } from 'node:os';
 import type { TriLCDaemonServiceConfig } from './daemon/service.js';
 // REQ-018: PID management lives in pidfile.ts (shared with the daemon).
 import { findProcessByPort, isProcessAlive, readPid, removePidFile, waitProcessExit } from './pidfile.js';
+import { installTrimcTokenFetch } from './trimc-auth.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -171,6 +172,7 @@ async function healthCheck(port: number): Promise<{ ok: boolean; data?: unknown 
 // ── Commands ──
 
 async function cmdStart(port: number, permissionMode?: string, allowRules?: string[], denyRules?: string[], addDirs?: string[], printMode?: boolean): Promise<void> {
+  installTrimcTokenFetch(); // TriMMC /internal token 全局注入（P0 加固配套）
   // Existing PID file → healthy daemon → already running.
   // REQ-018 identity check: PID alive AND healthz ok.
   const existingPid = await readPid();
