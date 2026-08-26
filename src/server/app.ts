@@ -198,6 +198,359 @@ function buildPlanModeDeps(): AgentLoopDeps {
   };
 }
 
+// ── TC-001 harness scaffold (tc001-harness-scaffold HS-1/HS-2) ──
+// agent-core 执行持续性三机制的宿主侧实现（对齐 CC 宿主的三层外部信号）：
+//   FR-1 task_plan 进度锚点注入 / FR-2 end_turn 判定纪律 / FR-3 进度 reminder。
+// 全部请求字段可选：一个都不带时 parseHarnessOptions 返回 null，端点直接走原生
+// agentLoop，零行为变化。
+//
+// 实现约束：agent-core 的 agentLoop 内部自持多轮循环与消息状态，宿主无法在单次
+// 调用中途注入消息；且 anthropic/openai 两个 SSE 转换器都在首个 loop_end 即终止
+// 消费。因此包装器以 maxTurns=1 驱动内部循环、从事件流重建消息历史、按需重启，
+// 并吞掉中间 loop_end（usage 聚合后合成唯一终态 loop_end）——与下方 C15
+// compacting 包装器的重启模式同构。
+
+/** task_plan 单条目（由 rmc_tick 等发送端构建）。 */
+export interface TaskPlanItem {
+  id: string;
+  description: string;
+  /** 'pending'（默认）| 'in_progress' | 'done' */
+  status?: string;
+}
+
+export interface TaskPlan {
+  items?: TaskPlanItem[];
+  /** 当前聚焦项 id */
+  currentFocus?: string;
+}
+
+/** TC-001 新增的可选请求字段（/v1/messages 与 /chat/completions 共用）。 */
+export interface HarnessOptions {
+  task_plan?: TaskPlan;
+  /** FR-2：模型 end_turn 时注入自查判定消息而非直接返回 */
+  continue_on_incomplete?: boolean;
+  /** FR-2：自定义判定提示（缺省用内置自查提示） */
+  incomplete_check_prompt?: string;
+  /** 判定注入次数上限（默认 4） */
+  continue_max_rounds?: number;
+  /** 兼容别名：等价 incomplete_check_prompt（优先级低于后者） */
+  continue_prompt?: string;
+  /** FR-3：每 N 轮注入进度 reminder（默认 10） */
+  progress_reminder_interval?: number;
+  /** FR-3：自定义 reminder 模板，支持 {turn}/{maxTurns}/{completedSteps} 占位 */
+  progress_reminder_template?: string;
+}
+
+const INCOMPLETE_CHECK_PROMPT =
+  '你结束了回合但任务可能尚未完成。请自查：你的所有交付物是否已创建？所有 commit 是否已推送？'
+  + '如果未完成，继续执行。如果确实完成，回复 DONE。';
+const PROGRESS_REMINDER_TEMPLATE =
+  '[PROGRESS REMINDER] Turn {turn}/{maxTurns}. Your original task is still active.\n'
+  + 'Completed steps this session: {completedSteps}.\n'
+  + 'If you have gathered enough information, transition to writing your output now.\n'
+  + 'If not, focus on the most critical remaining information gaps.';
+const DEFAULT_CONTINUE_MAX_ROUNDS = 4;
+const DEFAULT_PROGRESS_REMINDER_INTERVAL = 10;
+
+/**
+ * 从请求体提取 harness 字段；一个都没有（或都无效）时返回 null —— 端点保持
+ * 原生 agentLoop 行为，满足「全字段缺省零行为变化」。
+ */
+export function parseHarnessOptions(body: unknown): HarnessOptions | null {
+  if (!body || typeof body !== 'object') return null;
+  const b = body as Record<string, unknown>;
+  const out: HarnessOptions = {};
+
+  if (b.task_plan && typeof b.task_plan === 'object') {
+    const raw = b.task_plan as Record<string, unknown>;
+    const plan: TaskPlan = {};
+    if (Array.isArray(raw.items)) {
+      plan.items = raw.items
+        .filter((it): it is Record<string, unknown> => !!it && typeof it === 'object')
+        .map((it) => ({
+          id: typeof it.id === 'string' ? it.id : String(it.id ?? ''),
+          description: typeof it.description === 'string' ? it.description : '',
+          ...(typeof it.status === 'string' ? { status: it.status } : {}),
+        }))
+        .filter((it) => it.id !== '');
+    }
+    if (typeof raw.currentFocus === 'string') plan.currentFocus = raw.currentFocus;
+    if ((plan.items?.length ?? 0) > 0) out.task_plan = plan;
+  }
+  if (b.continue_on_incomplete === true) out.continue_on_incomplete = true;
+  if (typeof b.incomplete_check_prompt === 'string' && b.incomplete_check_prompt.trim() !== '') {
+    out.incomplete_check_prompt = b.incomplete_check_prompt;
+  }
+  if (typeof b.continue_max_rounds === 'number' && Number.isFinite(b.continue_max_rounds) && b.continue_max_rounds >= 0) {
+    out.continue_max_rounds = Math.floor(b.continue_max_rounds);
+  }
+  if (typeof b.continue_prompt === 'string' && b.continue_prompt.trim() !== '') {
+    out.continue_prompt = b.continue_prompt;
+  }
+  if (typeof b.progress_reminder_interval === 'number' && Number.isFinite(b.progress_reminder_interval) && b.progress_reminder_interval > 0) {
+    out.progress_reminder_interval = Math.floor(b.progress_reminder_interval);
+  }
+  if (typeof b.progress_reminder_template === 'string' && b.progress_reminder_template.trim() !== '') {
+    out.progress_reminder_template = b.progress_reminder_template;
+  }
+
+  const found =
+    out.task_plan !== undefined ||
+    out.continue_on_incomplete === true ||
+    out.incomplete_check_prompt !== undefined ||
+    out.continue_max_rounds !== undefined ||
+    out.continue_prompt !== undefined ||
+    out.progress_reminder_interval !== undefined ||
+    out.progress_reminder_template !== undefined;
+  return found ? out : null;
+}
+
+/** 稳定序列化（变更检测用）。task_plan 在单个请求内是静态的，快照不变则不重复注入。 */
+function serializeTaskPlan(plan: TaskPlan): string {
+  return JSON.stringify({ items: plan.items ?? [], currentFocus: plan.currentFocus ?? null });
+}
+
+/** FR-1 锚点消息（规格书模板）：让模型每轮都能看到清单全景与下一步。 */
+function formatTaskPlanProgress(plan: TaskPlan): string {
+  const items = plan.items ?? [];
+  const label = (it: TaskPlanItem) => `#${it.id} ${it.description}`;
+  const done = items.filter((it) => it.status === 'done');
+  const focus = plan.currentFocus ? items.find((it) => it.id === plan.currentFocus) : undefined;
+  const inProgress = focus ? [focus] : items.filter((it) => it.status === 'in_progress');
+  const claimedIds = new Set([...done, ...inProgress].map((it) => it.id));
+  const remaining = items.filter((it) => !claimedIds.has(it.id));
+  const fmt = (list: TaskPlanItem[]) => (list.length > 0 ? list.map(label).join('; ') : 'none');
+  return (
+    `[SYSTEM: Task progress — completed: ${fmt(done)} | in progress: ${fmt(inProgress)}`
+    + ` | remaining: ${fmt(remaining)}. Continue with the next incomplete item.]`
+  );
+}
+
+/** FR-2 完成确认：「包含 DONE（精确匹配）」= 大小写敏感整词命中。 */
+function isDoneReply(content: string | null | undefined): boolean {
+  return typeof content === 'string' && /\bDONE\b/.test(content);
+}
+
+/** FR-3 reminder 渲染（占位符用 split/join，避免依赖 ES2021 replaceAll）。 */
+function renderProgressReminder(template: string, turn: number, maxTurns: number, completedSteps: number): string {
+  return template
+    .split('{turn}').join(String(turn))
+    .split('{maxTurns}').join(String(maxTurns))
+    .split('{completedSteps}').join(String(completedSteps));
+}
+
+/** 跨内部重启聚合 usage（每个内部 agentLoop 只报自己那段的累计）。 */
+function mergeUsageSummary(base: UsageSummary | null, inc: UsageSummary | undefined): UsageSummary | null {
+  if (!inc) return base;
+  if (!base) {
+    return {
+      ...inc,
+      tokens: { ...inc.tokens },
+      byModel: Object.fromEntries(Object.entries(inc.byModel ?? {}).map(([k, v]) => [k, { ...v }])),
+    };
+  }
+  const tokens: UsageSummary['tokens'] = {
+    prompt_tokens: (base.tokens.prompt_tokens ?? 0) + (inc.tokens.prompt_tokens ?? 0),
+    completion_tokens: (base.tokens.completion_tokens ?? 0) + (inc.tokens.completion_tokens ?? 0),
+    total_tokens: (base.tokens.total_tokens ?? 0) + (inc.tokens.total_tokens ?? 0),
+  };
+  if (base.tokens.reasoning_tokens !== undefined || inc.tokens.reasoning_tokens !== undefined) {
+    tokens.reasoning_tokens = (base.tokens.reasoning_tokens ?? 0) + (inc.tokens.reasoning_tokens ?? 0);
+  }
+  const byModel: UsageSummary['byModel'] = { ...base.byModel };
+  for (const [m, v] of Object.entries(inc.byModel ?? {})) {
+    const cur = byModel[m];
+    byModel[m] = cur
+      ? {
+          prompt_tokens: (cur.prompt_tokens ?? 0) + (v.prompt_tokens ?? 0),
+          completion_tokens: (cur.completion_tokens ?? 0) + (v.completion_tokens ?? 0),
+          total_tokens: (cur.total_tokens ?? 0) + (v.total_tokens ?? 0),
+        }
+      : { ...v };
+  }
+  return {
+    calls: (base.calls ?? 0) + (inc.calls ?? 0),
+    tokens,
+    byModel,
+    partial: !!base.partial || !!inc.partial,
+  };
+}
+
+/**
+ * TC-001 harness 包装器：在宿主侧实现每轮消息注入。
+ *
+ * - 每次内部 agentLoop 以 maxTurns=1 运行：要么模型 end_turn（loop_end 'done'），
+ *   要么执行完工具待回喂（loop_end 'max_turns'）。
+ * - 中间 loop_end 一律吞掉（下游 SSE 转换器遇首个 loop_end 即终止流），usage
+ *   聚合后在真正终态时合成唯一 loop_end 向下转发。
+ * - 注入顺序：FR-1 计划锚点（有变化时）→ FR-2 判定提示 → FR-3 reminder，
+ *   合并为一条 user 消息追加到重建的历史末尾。
+ * - end_turn 边界只有 FR-2 显式开启才续跑（避免复活自然结束的会话）；
+ *   reminder 只在本来就要继续的边界附带（短任务零影响）。
+ *
+ * loopFactory 参数仅供测试注入桩循环；生产路径用默认 agentLoop。
+ */
+export async function* runHarnessAgentLoop(
+  options: AgentLoopOptions,
+  harness: HarnessOptions,
+  loopFactory: (opts: AgentLoopOptions) => AsyncGenerator<AgentEvent> = agentLoop,
+): AsyncGenerator<AgentEvent> {
+  const maxTurnsGlobal = Math.max(1, options.maxTurns ?? 25);
+  const interval = Math.max(1, harness.progress_reminder_interval ?? DEFAULT_PROGRESS_REMINDER_INTERVAL);
+  const maxJudgeRounds = Math.max(0, harness.continue_max_rounds ?? DEFAULT_CONTINUE_MAX_ROUNDS);
+  const fr2Active = harness.continue_on_incomplete === true;
+  const checkPrompt = harness.incomplete_check_prompt ?? harness.continue_prompt ?? INCOMPLETE_CHECK_PROMPT;
+  const reminderTemplate = harness.progress_reminder_template ?? PROGRESS_REMINDER_TEMPLATE;
+  const planItems = (harness.task_plan?.items ?? []).filter((it) => !!it && typeof it.id === 'string' && it.id !== '');
+  const hasPlan = planItems.length > 0;
+
+  // 重建的对话历史（system prompt 由每次重启的内部循环自行注入，这里不含 system 消息；
+  // 原始数组不被修改，session 自动保存路径不受影响 —— task_plan 内容不落盘）。
+  let messages: Message[] = [...(options.messages ?? [])];
+  let globalTurn = 0;
+  let toolExecCount = 0;
+  let judgeRoundsUsed = 0;
+  let continueRounds = 0;
+  let lastPlanSnapshot: string | null = null;
+  let usage: UsageSummary | null = null;
+  // 已发出但尚未回喂结果的 tool_call（tool_blocked 事件不带 id，按名关联回填）
+  let openCalls: Array<{ id: string; name: string }> = [];
+
+  while (true) {
+    let endReason = 'done';
+    let finishReason: string | undefined;
+    let lastAssistantContent: string | null = null;
+
+    for await (const ev of loopFactory({ ...options, messages, maxTurns: 1 })) {
+      switch (ev.type) {
+        case 'request_start':
+          globalTurn++;
+          break;
+        case 'assistant_message':
+          lastAssistantContent = ev.content;
+          messages = [
+            ...messages,
+            ev.tool_calls && ev.tool_calls.length > 0
+              ? { role: 'assistant' as const, content: ev.content, tool_calls: ev.tool_calls }
+              : { role: 'assistant' as const, content: ev.content },
+          ];
+          openCalls = (ev.tool_calls ?? []).map((tc) => ({ id: tc.id, name: tc.function.name }));
+          break;
+        case 'tool_call':
+          // 兜底登记（正常情况下 assistant_message 已带齐 tool_calls）
+          if (!openCalls.some((c) => c.id === ev.id)) openCalls.push({ id: ev.id, name: ev.name });
+          break;
+        case 'tool_result':
+          toolExecCount++;
+          messages = [...messages, { role: 'tool' as const, tool_call_id: ev.tool_call_id, content: ev.content }];
+          openCalls = openCalls.filter((c) => c.id !== ev.tool_call_id);
+          break;
+        case 'tool_blocked': {
+          // 权限拦截的工具不会产生 tool_result 事件，但内部循环会把错误结果写进
+          // 消息历史 —— 这里必须同步补上，否则重建历史缺少 tool 回执会导致下一轮
+          // 请求违反 provider 协议（tool_use 必须有配对的 tool result）。
+          let matchIdx = -1;
+          for (let i = openCalls.length - 1; i >= 0; i--) {
+            if (openCalls[i].name === ev.tool_name) { matchIdx = i; break; }
+          }
+          if (matchIdx >= 0) {
+            const call = openCalls[matchIdx];
+            messages = [
+              ...messages,
+              {
+                role: 'tool' as const,
+                tool_call_id: call.id,
+                content: JSON.stringify({ error: `Tool "${ev.tool_name}" blocked: ${ev.reason}` }),
+              },
+            ];
+            openCalls.splice(matchIdx, 1);
+          }
+          break;
+        }
+        case 'loop_end':
+          // 吞掉内部 loop_end；记录终态信号并聚合 usage
+          endReason = ev.reason;
+          finishReason = ev.finish_reason;
+          usage = mergeUsageSummary(usage, ev.usageSummary);
+          continue; // 不向下游转发
+        default:
+          break;
+      }
+      yield ev;
+    }
+
+    const endedWithToolRound = endReason === 'max_turns'; // maxTurns=1 下 = 本轮执行了工具、结果待回喂
+    const endedWithEndTurn = endReason === 'done';
+
+    if (!endedWithToolRound && !endedWithEndTurn) {
+      // error / aborted：终态透传（合成唯一 loop_end）
+      yield {
+        type: 'loop_end',
+        reason: endReason,
+        finish_reason: finishReason,
+        usageSummary: usage ?? undefined,
+      } as AgentEvent;
+      return;
+    }
+
+    // FR-2 DONE 短路：模型明确回复 DONE → 正常返回结果给调用方
+    if (fr2Active && endedWithEndTurn && isDoneReply(lastAssistantContent)) {
+      yield {
+        type: 'loop_end',
+        reason: 'done',
+        finish_reason: finishReason,
+        usageSummary: usage ?? undefined,
+      } as AgentEvent;
+      return;
+    }
+
+    // 本轮边界的注入内容（合并为一条 user 消息）
+    const sections: string[] = [];
+
+    // FR-1：计划锚点（未全部完成且有变化时注入；全部 done 后不再注入）
+    if (hasPlan) {
+      const allDone = planItems.every((it) => it.status === 'done');
+      const snapshot = serializeTaskPlan(harness.task_plan!);
+      if (!allDone && snapshot !== lastPlanSnapshot) {
+        sections.push(formatTaskPlanProgress(harness.task_plan!));
+        lastPlanSnapshot = snapshot;
+      }
+    }
+
+    // 续跑判定：工具轮自然续跑；end_turn 只有 FR-2 开启且判定预算未尽才续跑
+    let willContinue = false;
+    if (endedWithToolRound) {
+      willContinue = globalTurn < maxTurnsGlobal;
+    } else if (fr2Active && judgeRoundsUsed < maxJudgeRounds && globalTurn < maxTurnsGlobal) {
+      judgeRoundsUsed++;
+      willContinue = true;
+      sections.push(checkPrompt);
+    }
+
+    // FR-3：reminder 只在本来就要继续的边界附带（< interval 或自然结束 → 零注入）
+    const reminderDue = globalTurn > 0 && globalTurn % interval === 0;
+    if (willContinue && reminderDue) {
+      sections.push(renderProgressReminder(reminderTemplate, globalTurn, maxTurnsGlobal, toolExecCount));
+    }
+
+    if (!willContinue) {
+      yield {
+        type: 'loop_end',
+        reason: endedWithEndTurn ? 'done' : 'max_turns',
+        finish_reason: finishReason,
+        usageSummary: usage ?? undefined,
+      } as AgentEvent;
+      return;
+    }
+
+    if (sections.length > 0) {
+      messages = [...messages, { role: 'user' as const, content: sections.join('\n\n') }];
+    }
+    continueRounds++;
+    yield { type: 'continue_round', round: continueRounds, turn: globalTurn + 1 } as AgentEvent;
+  }
+}
+
 // ── C15 v2: Compacting agent loop wrapper ──
 // Wraps agentLoop with auto-compaction: monitors cumulative prompt tokens
 // via loop_end.usageSummary, triggers compactViaModelClient (direct ModelClient,
@@ -1654,6 +2007,9 @@ export function createTriLCApp(env: TriLCEnv) {
           console.log(`[trilc] /v1/messages model=${model}`);
           const maxTurns = parsed.max_tokens ? Math.min(Math.ceil(parsed.max_tokens / 100), 25) : 25;
 
+          // TC-001: 执行持续性三机制字段解析；null = 无新字段 → 原生 agentLoop 零行为变化
+          const harness = parseHarnessOptions(parsed);
+
           // P3: interactive opt-in — the TUI sets interactive:true, enabling
           // AskUserQuestion waiting and permission prompts for this request.
           // res 'close' fires on every completion path (stream end, JSON end,
@@ -1723,7 +2079,10 @@ export function createTriLCApp(env: TriLCEnv) {
           let streamedToolCalls = false;
 
           try {
-            await agentEventsToAnthropicSSE(agentLoop(loopOptions), {
+            // TC-001: harness 字段存在时走包装器（每轮注入），否则原生 agentLoop
+            await agentEventsToAnthropicSSE(
+              harness ? runHarnessAgentLoop(loopOptions, harness) : agentLoop(loopOptions),
+              {
               model,
               onSSE: (eventType, data) => {
                 if (eventType === 'content_block_delta' || eventType === 'message_delta') {
@@ -1733,7 +2092,8 @@ export function createTriLCApp(env: TriLCEnv) {
                 }
                 res.write(formatSSELine(eventType, data));
               },
-            });
+              },
+            );
 
             // ── Post-stream guard: warn if nothing meaningful was emitted ──
             if (!streamedContent && !streamedToolCalls) {
@@ -1760,7 +2120,8 @@ export function createTriLCApp(env: TriLCEnv) {
           let usageSummary: UsageSummary | null = null;
 
           try {
-            for await (const event of agentLoop(loopOptions)) {
+            // TC-001: harness 字段存在时走包装器（每轮注入），否则原生 agentLoop
+            for await (const event of harness ? runHarnessAgentLoop(loopOptions, harness) : agentLoop(loopOptions)) {
               allEvents.push(event);
               if (event.type === 'content_delta') {
                 finalContent += event.delta;
@@ -2067,6 +2428,10 @@ export function createTriLCApp(env: TriLCEnv) {
           const model = parsed.model ?? 'tmv-deepseek-v4-pro';
           const maxTurns = parsed.max_tokens ? Math.min(Math.ceil(parsed.max_tokens / 100), 25) : 25;
 
+          // TC-001: 执行持续性三机制字段解析（与 /v1/messages 对齐）；
+          // null = 无新字段 → 原生 agentLoop 零行为变化
+          const oaiHarness = parseHarnessOptions(parsed);
+
           // Convert OpenAI messages to internal format
           const { systemPrompt: oaiSystem, internalMessages } = convertOpenAIMessages(parsed.messages ?? []);
 
@@ -2111,12 +2476,16 @@ export function createTriLCApp(env: TriLCEnv) {
             });
 
             try {
-              await agentEventsToOpenAISSE(agentLoop(loopOptions), {
+              // TC-001: harness 字段存在时走包装器（每轮注入），否则原生 agentLoop
+              await agentEventsToOpenAISSE(
+                oaiHarness ? runHarnessAgentLoop(loopOptions, oaiHarness) : agentLoop(loopOptions),
+                {
                 model,
                 onSSE: (data) => {
                   res.write(formatOpenAISSE(data));
                 },
-              });
+                },
+              );
               res.write(OPENAI_SSE_DONE);
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
@@ -2135,7 +2504,8 @@ export function createTriLCApp(env: TriLCEnv) {
           let usageSummary: UsageSummary | null = null;
 
           try {
-            for await (const event of agentLoop(loopOptions)) {
+            // TC-001: harness 字段存在时走包装器（每轮注入），否则原生 agentLoop
+            for await (const event of oaiHarness ? runHarnessAgentLoop(loopOptions, oaiHarness) : agentLoop(loopOptions)) {
               if (event.type === 'content_delta') {
                 finalContent += event.delta;
               } else if (event.type === 'assistant_message') {
@@ -3489,6 +3859,14 @@ interface AnthropicRequest {
   interactive?: boolean;
   /** C8: Permission mode override (default/acceptEdits/auto/dontAsk/bypass/plan). */
   permission_mode?: string;
+  /** TC-001: 执行持续性三机制可选字段（全部缺省时零行为变化） */
+  task_plan?: TaskPlan;
+  continue_on_incomplete?: boolean;
+  incomplete_check_prompt?: string;
+  continue_max_rounds?: number;
+  continue_prompt?: string;
+  progress_reminder_interval?: number;
+  progress_reminder_template?: string;
 }
 
 interface AnthropicMessage {
@@ -3524,6 +3902,14 @@ interface OpenAIRequest {
   tools?: OpenAIToolDef[];
   /** C8: Permission mode override (default/acceptEdits/auto/dontAsk/bypass/plan). */
   permission_mode?: string;
+  /** TC-001: 执行持续性三机制可选字段（与 /v1/messages 对齐，全部缺省时零行为变化） */
+  task_plan?: TaskPlan;
+  continue_on_incomplete?: boolean;
+  incomplete_check_prompt?: string;
+  continue_max_rounds?: number;
+  continue_prompt?: string;
+  progress_reminder_interval?: number;
+  progress_reminder_template?: string;
 }
 
 interface OpenAIMessage {
