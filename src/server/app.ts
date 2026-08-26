@@ -244,6 +244,9 @@ export interface HarnessOptions {
 const INCOMPLETE_CHECK_PROMPT =
   '你结束了回合但任务可能尚未完成。请自查：你的所有交付物是否已创建？所有 commit 是否已推送？'
   + '如果未完成，继续执行。如果确实完成，回复 DONE。';
+/** TC-s1 契约（task_plan 扁平数组形式）的内置英文自查判定提示（规格原文）。 */
+const TCS1_SELF_CHECK_PROMPT =
+  'Your turn ended but the task may not be complete. If not done, continue executing. If truly complete, reply exactly: DONE.';
 const PROGRESS_REMINDER_TEMPLATE =
   '[PROGRESS REMINDER] Turn {turn}/{maxTurns}. Your original task is still active.\n'
   + 'Completed steps this session: {completedSteps}.\n'
@@ -261,11 +264,17 @@ export function parseHarnessOptions(body: unknown): HarnessOptions | null {
   const b = body as Record<string, unknown>;
   const out: HarnessOptions = {};
 
+  // TC-s1 兼容：task_plan 同时接受扁平结构化数组形式 [ { id, description, status } ]
+  // 与 TC-001 对象包装形式 { items: [...] }，二者归一到同一 TaskPlan。
+  const tcs1FlatForm = Array.isArray(b.task_plan);
   if (b.task_plan && typeof b.task_plan === 'object') {
     const raw = b.task_plan as Record<string, unknown>;
     const plan: TaskPlan = {};
-    if (Array.isArray(raw.items)) {
-      plan.items = raw.items
+    const rawItems: unknown[] = tcs1FlatForm
+      ? b.task_plan as unknown[]
+      : Array.isArray(raw.items) ? raw.items : [];
+    if (rawItems.length > 0) {
+      plan.items = rawItems
         .filter((it): it is Record<string, unknown> => !!it && typeof it === 'object')
         .map((it) => ({
           id: typeof it.id === 'string' ? it.id : String(it.id ?? ''),
@@ -274,7 +283,7 @@ export function parseHarnessOptions(body: unknown): HarnessOptions | null {
         }))
         .filter((it) => it.id !== '');
     }
-    if (typeof raw.currentFocus === 'string') plan.currentFocus = raw.currentFocus;
+    if (!tcs1FlatForm && typeof raw.currentFocus === 'string') plan.currentFocus = raw.currentFocus;
     if ((plan.items?.length ?? 0) > 0) out.task_plan = plan;
   }
   if (b.continue_on_incomplete === true) out.continue_on_incomplete = true;
@@ -292,6 +301,18 @@ export function parseHarnessOptions(body: unknown): HarnessOptions | null {
   }
   if (typeof b.progress_reminder_template === 'string' && b.progress_reminder_template.trim() !== '') {
     out.progress_reminder_template = b.progress_reminder_template;
+  }
+
+  // TC-s1：扁平数组契约（continue_on_incomplete=true）默认使用规格原文英文自查
+  // 判定提示；显式 incomplete_check_prompt / continue_prompt 恒优先，
+  // TC-001 对象形式请求不受影响（保持内置中文提示，见 harness-scaffold.test）。
+  if (
+    tcs1FlatForm &&
+    out.continue_on_incomplete === true &&
+    out.incomplete_check_prompt === undefined &&
+    out.continue_prompt === undefined
+  ) {
+    out.incomplete_check_prompt = TCS1_SELF_CHECK_PROMPT;
   }
 
   const found =
@@ -323,6 +344,29 @@ function formatTaskPlanProgress(plan: TaskPlan): string {
   return (
     `[SYSTEM: Task progress — completed: ${fmt(done)} | in progress: ${fmt(inProgress)}`
     + ` | remaining: ${fmt(remaining)}. Continue with the next incomplete item.]`
+  );
+}
+
+/**
+ * TC-s1：将 task_plan 渲染为 markdown 进度清单，注入 systemPrompt 尾部
+ * （静态全景 —— 模型从第一轮就看到全部步骤；FR-1 的逐轮 [SYSTEM: Task
+ * progress] 锚点提供动态进展，两者互补）。无有效条目时返回空串，
+ * 不污染 system prompt。
+ */
+export function formatTaskPlanChecklist(plan: TaskPlan | undefined): string {
+  const items = (plan?.items ?? []).filter(
+    (it) => !!it && typeof it.id === 'string' && it.id !== '' && it.description.trim() !== '',
+  );
+  if (items.length === 0) return '';
+  const lines = items.map((it) => {
+    const status = (it.status ?? '').trim().toLowerCase() || 'pending';
+    return `- [#${it.id}] [${status}] ${it.description}`;
+  });
+  return (
+    '\n\n## Task Plan\n\n' +
+    'Work through the following steps in order. Continue executing incomplete items before ending your turn.\n\n' +
+    lines.join('\n') +
+    (plan?.currentFocus ? `\n\nCurrent focus: #${plan.currentFocus}` : '')
   );
 }
 
@@ -2044,9 +2088,13 @@ export function createTriLCApp(env: TriLCEnv) {
             ...(isInteractive && !_printMode ? INTERACTIVE_ASK_RULES : []),
           ];
 
+          // TC-s1: task_plan 进度清单注入 systemPrompt 尾部（静态全景，与
+          // TC-001 FR-1 的逐轮动态锚点互补；无 task_plan 时为空串零变化）
+          const systemPromptTail = harness ? formatTaskPlanChecklist(harness.task_plan) : '';
+
           const loopOptions: AgentLoopOptions = {
             model,
-            systemPrompt: parsed.system || defaultSystemPrompt(),
+            systemPrompt: (parsed.system || defaultSystemPrompt()) + systemPromptTail,
             messages: internalMessages,
             maxTurns,
             tier: 'main',
@@ -2448,9 +2496,12 @@ export function createTriLCApp(env: TriLCEnv) {
           const oaiPermissionMode = resolvePermissionMode(parsed.permission_mode) as PermissionMode;
           const oaiSessionRules = buildSessionPermissionRules();
 
+          // TC-s1: task_plan 进度清单注入 systemPrompt 尾部（与 /v1/messages 对齐）
+          const oaiSystemPromptTail = oaiHarness ? formatTaskPlanChecklist(oaiHarness.task_plan) : '';
+
           const loopOptions: AgentLoopOptions = {
             model,
-            systemPrompt: oaiSystem || defaultSystemPrompt(),
+            systemPrompt: (oaiSystem || defaultSystemPrompt()) + oaiSystemPromptTail,
             messages: internalMessages,
             maxTurns,
             tier: 'main',
