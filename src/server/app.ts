@@ -1863,6 +1863,25 @@ export function createTriLCApp(env: TriLCEnv) {
           }
 
           const effectivePermissionMode = resolvePermissionMode(parsed.permission_mode) as PermissionMode;
+
+          // ── TC-s1: FR-1 task_plan + FR-2 end_turn 判定参数解析 ──
+          interface TaskPlanItem { id: string; description: string; status: string; }
+          const taskPlan = (parsed as any).task_plan as { items: TaskPlanItem[]; currentFocus?: string } | undefined;
+          const continueOnIncomplete = (parsed as any).continue_on_incomplete === true;
+          const incompleteCheckPrompt = String((parsed as any).incomplete_check_prompt ??
+            'Your turn ended but the task may not be complete. Self-check: have all deliverables been created and committed? Have all changes been pushed? If NOT done, continue executing now. If truly complete, reply exactly: DONE.');
+
+          // FR-1: 将 task_plan 格式化并注入系统提示词尾部
+          let taskPlanBlock = '';
+          if (taskPlan?.items?.length) {
+            const lines = taskPlan.items.map((i) =>
+              `- [${i.status === 'done' ? 'x' : ' '}] ${i.id}: ${i.description} (${i.status})`
+            );
+            taskPlanBlock = '\n\n## Task Plan (progress tracking)\n'
+              + 'Current focus: ' + (taskPlan.currentFocus ?? 'none') + '\n'
+              + lines.join('\n')
+              + '\n\nUse this plan to track your progress. Mark items done as you complete them.';
+          }
           // C9: Build combined permission rules (CLI + persisted + interactive)
           const sessionRules = buildSessionPermissionRules();
           const mergedPermissionRules: PermissionRule[] = [
@@ -1873,12 +1892,13 @@ export function createTriLCApp(env: TriLCEnv) {
 
           const loopOptions: AgentLoopOptions = {
             model,
-            systemPrompt: parsed.system || defaultSystemPrompt(),
+            systemPrompt: (parsed.system || defaultSystemPrompt()) + taskPlanBlock,
             messages: internalMessages,
             maxTurns,
             // TC-1：headless 编排方续跑参数透传（默认 undefined=关闭）
             continueMaxRounds: Number(parsed.continue_max_rounds ?? 0) || undefined,
-            continuePrompt: (parsed.continue_prompt as string) || undefined,
+            continuePrompt: continueOnIncomplete ? incompleteCheckPrompt
+              : ((parsed.continue_prompt as string) || undefined),
             fallbackModel: (parsed.fallback_model as string) || undefined,
             tier: 'main',
             cwd: env.cwd,
