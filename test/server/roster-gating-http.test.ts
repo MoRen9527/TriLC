@@ -20,7 +20,7 @@ let appPort: number;
 before(async () => {
   for (const k of [
     'TRILC_DATA_DIR', 'TRILC_WEEKLY_PLANE_ROOT', 'TRILC_PORT', 'TRILC_PROJECT_ROOT',
-    'TRIMODEL_API_TOKEN', 'TRILC_TRIMODEL_API_URL',
+    'TRIMODEL_API_TOKEN', 'TRILC_TRIMODEL_API_URL', 'TRILC_INTERNAL_TOKEN',
   ]) {
     SAVED_ENV[k] = process.env[k];
   }
@@ -55,6 +55,8 @@ before(async () => {
   env.port = 0;
   env.trimodelApiUrl = 'http://127.0.0.1:1';
 
+  // p0fix3：内部门 fail-closed——app.start() 前注入测试 token，请求统一带头。
+  process.env.TRILC_INTERNAL_TOKEN = 'roster-gating-test-token';
   app = createTriLCApp(env);
   await app.start();
   appPort = env.port;
@@ -80,7 +82,7 @@ after(async () => {
 async function postJSON(path: string, body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(`http://127.0.0.1:${appPort}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', 'x-internal-token': process.env.TRILC_INTERNAL_TOKEN ?? '' },
     body: JSON.stringify(body),
   });
   const text = await res.text();
@@ -90,7 +92,9 @@ async function postJSON(path: string, body: unknown): Promise<{ status: number; 
 }
 
 async function getJSON(path: string): Promise<{ status: number; json: any }> {
-  const res = await fetch(`http://127.0.0.1:${appPort}${path}`);
+  const res = await fetch(`http://127.0.0.1:${appPort}${path}`, {
+    headers: { 'x-internal-token': process.env.TRILC_INTERNAL_TOKEN ?? '' },
+  });
   const text = await res.text();
   let json: any = null;
   try { json = JSON.parse(text); } catch { /* keep null */ }
@@ -170,7 +174,9 @@ describe('FADE-ASSESS-005 派工门禁 (tasks/submit ownerRoleId)', () => {
 
 describe('FADE-ASSESS-005 可见性回归 (/agents contract 全量不改)', () => {
   it('FADE-ASSESS-003 指标：409 派工拒绝后 GET /knowledge/metrics 可见 routing_error 计数', async () => {
-    const res = await fetch(`http://127.0.0.1:${appPort}/internal/v1/knowledge/metrics`);
+    const res = await fetch(`http://127.0.0.1:${appPort}/internal/v1/knowledge/metrics`, {
+      headers: { 'x-internal-token': process.env.TRILC_INTERNAL_TOKEN ?? '' },
+    });
     assert.equal(res.status, 200);
     const body = await res.json() as {
       ok: boolean;
