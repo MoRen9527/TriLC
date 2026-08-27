@@ -4458,9 +4458,6 @@ export function createTriLCApp(env: TriLCEnv) {
 interface AnthropicRequest {
   model?: string;
   fallback_model?: string;
-  // TC-1 续跑参数
-  continue_max_rounds?: number;
-  continue_prompt?: string;
   messages?: AnthropicMessage[];
   system?: string;
   max_tokens?: number;
@@ -4470,7 +4467,8 @@ interface AnthropicRequest {
   interactive?: boolean;
   /** C8: Permission mode override (default/acceptEdits/auto/dontAsk/bypass/plan). */
   permission_mode?: string;
-  /** TC-001: 执行持续性三机制可选字段（全部缺省时零行为变化） */
+  /** TC-001: 执行持续性三机制可选字段（全部缺省时零行为变化）；
+   * 含 TC-1 续跑参数——合并去重自本地透传提交 */
   task_plan?: TaskPlan;
   continue_on_incomplete?: boolean;
   incomplete_check_prompt?: string;
@@ -4508,16 +4506,14 @@ interface AnthropicTool {
 interface OpenAIRequest {
   model?: string;
   fallback_model?: string;
-  // TC-1 续跑参数
-  continue_max_rounds?: number;
-  continue_prompt?: string;
   messages?: OpenAIMessage[];
   stream?: boolean;
   max_tokens?: number;
   tools?: OpenAIToolDef[];
   /** C8: Permission mode override (default/acceptEdits/auto/dontAsk/bypass/plan). */
   permission_mode?: string;
-  /** TC-001: 执行持续性三机制可选字段（与 /v1/messages 对齐，全部缺省时零行为变化） */
+  /** TC-001: 执行持续性三机制可选字段（与 /v1/messages 对齐，全部缺省时零行为变化）；
+   * 含 TC-1 续跑参数（continue_max_rounds/continue_prompt）——合并去重自本地透传提交 */
   task_plan?: TaskPlan;
   continue_on_incomplete?: boolean;
   incomplete_check_prompt?: string;
