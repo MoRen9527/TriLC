@@ -16,9 +16,13 @@ const SAVED_ENV = {
   TRILC_WEEKLY_PLANE_ROOT: process.env.TRILC_WEEKLY_PLANE_ROOT,
   TRILC_PORT: process.env.TRILC_PORT,
   TRIMODEL_API_TOKEN: process.env.TRIMODEL_API_TOKEN,
+  TRILC_INTERNAL_TOKEN: process.env.TRILC_INTERNAL_TOKEN,
 };
 
 const HINT_MARKER = 'Company Weekly Plane';
+
+// p0fix3：全局 X-Internal-Token 门启用后的固定测试令牌（after() 经 SAVED_ENV 还原）。
+const TEST_INTERNAL_TOKEN = 'hint-test-internal-token';
 
 let tmpDataDir: string;
 let planeRoot: string;
@@ -48,6 +52,8 @@ before(async () => {
   process.env.TRILC_WEEKLY_PLANE_ROOT = planeRoot;
   process.env.TRILC_PORT = '0';
   delete process.env.TRIMODEL_API_TOKEN;
+  // p0fix3：内部门 fail-closed——app.start() 前注入测试 token，请求统一带头。
+  process.env.TRILC_INTERNAL_TOKEN = TEST_INTERNAL_TOKEN;
 
   const { readEnv } = await import('../../src/config/env.js');
   const env = readEnv();
@@ -83,7 +89,7 @@ after(async () => {
 async function postJSON(path: string, body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(`http://127.0.0.1:${appPort}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', 'x-internal-token': TEST_INTERNAL_TOKEN },
     body: JSON.stringify(body),
   });
   const text = await res.text();

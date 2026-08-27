@@ -78,6 +78,9 @@ let app: ReturnType<typeof createTriLCApp>;
 let appPort: number;
 let tmpDataDir: string;
 
+// p0fix3：全局 X-Internal-Token 门启用后的固定测试令牌（after() 经 SAVED_ENV 还原）。
+const TEST_INTERNAL_TOKEN = 'qa-stub-internal-token';
+
 // Save env so we can restore.
 const SAVED_ENV = {
   DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
@@ -87,6 +90,7 @@ const SAVED_ENV = {
   TRILC_DATA_DIR: process.env.TRILC_DATA_DIR,
   TRIMODEL_KEY_STORAGE_MODE: process.env.TRIMODEL_KEY_STORAGE_MODE,
   TRICOMPANY_SOURCE_PATH: process.env.TRICOMPANY_SOURCE_PATH,
+  TRILC_INTERNAL_TOKEN: process.env.TRILC_INTERNAL_TOKEN,
 };
 
 before(async () => {
@@ -105,6 +109,8 @@ before(async () => {
   process.env.TRIMODEL_KEY_STORAGE_MODE = 's3'; // plaintext, avoids key derivation
   process.env.TRILC_DATA_DIR = tmpDataDir;
   process.env.TRILC_PORT = String(appPort);
+  // p0fix3：内部门 fail-closed——app.start() 前注入测试 token，请求统一带头。
+  process.env.TRILC_INTERNAL_TOKEN = TEST_INTERNAL_TOKEN;
   // Point contract resolver at an existing path to avoid load failures.
   // (The default walks up to find TriCompany; we leave it unset unless needed.)
 
@@ -138,7 +144,7 @@ after(async () => {
 async function postJSON(path: string, body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(`http://127.0.0.1:${appPort}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', 'x-internal-token': TEST_INTERNAL_TOKEN },
     body: JSON.stringify(body),
   });
   const text = await res.text();

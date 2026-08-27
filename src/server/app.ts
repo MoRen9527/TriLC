@@ -10,9 +10,10 @@
 // TriLC does NOT load pipeline (Soul Loader / Memory Injector / Context Builder / Tool Gater).
 // Those are TriMC-only services. Local mode uses legacy raw mode directly.
 
-import { createServer, type Server, type ServerResponse } from 'node:http';
+import { createServer, type IncomingHttpHeaders, type Server, type ServerResponse } from 'node:http';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
+import { timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
 import { writeFile } from 'node:fs/promises';
 import type { TriLCEnv } from '../config/env.js';
@@ -99,6 +100,132 @@ import { createUpdateCheckHandler, startUpdateCheckLoop } from '../update/update
 // into system prompts so the model knows by name which agents it can invoke
 // with AgentTool — e.g. "let Xiao Jia check this" → AgentTool(agentType=ceo-chief-of-staff)).
 let cachedAgentRoster = '';
+
+// ── P0 加固：HTTP 面安全 helpers（p0fix3-trilc-http PD-1）──
+// 最小侵入约束下不新建模块，以下纯函数物理落在本文件并按需导出，
+// 供对抗测试单元级覆盖。
+
+/** 从请求头提取调用方提供的内部令牌：x-internal-token（数组取首元素）
+ *  优先，缺失时回退 Authorization: Bearer。 */
+export function extractInternalToken(headers: IncomingHttpHeaders): string | undefined {
+  const direct = headers['x-internal-token'];
+  if (Array.isArray(direct)) {
+    return typeof direct[0] === 'string' ? direct[0] : undefined;
+  }
+  if (typeof direct === 'string') return direct;
+  const auth = headers.authorization;
+  if (typeof auth === 'string' && auth.startsWith('Bearer ')) return auth.slice(7);
+  return undefined;
+}
+
+/** 常数时间字符串比较。长度不等时不能直接短路（耗时差会泄漏长度信息），
+ *  先做一次同长哑比较抹平时间特征，再返回 false。 */
+export function timingSafeStringEquals(a: string, b: string): boolean {
+  const ab = Buffer.from(a, 'utf-8');
+  const bb = Buffer.from(b, 'utf-8');
+  if (ab.length !== bb.length) {
+    timingSafeEqual(ab, ab);
+    return false;
+  }
+  return timingSafeEqual(ab, bb);
+}
+
+interface HostAllowEntry {
+  /** full = host[:port] 整串比对；hostname = 只比主机名部分 */
+  mode: 'full' | 'hostname';
+  value: string;
+}
+
+/** authority 归一：trim + 小写 + IPv6 方括号剥离（两端同规则防形态绕过）。 */
+function canonicalAuthority(value: string): string {
+  const t = value.trim().toLowerCase();
+  const m = /^\[(.+)\](:\d+)?$/.exec(t);
+  return m ? `${m[1]}${m[2] ?? ''}` : t;
+}
+
+/** 把 host[:port] 拆成归一化整串 + 主机名两部分；空串返回 null。
+ *  仅「唯一冒号且后随纯数字」视作 host:port 切分；多冒号（裸 IPv6 形态）
+ *  不切分、整体当 hostname 参与 hostname 模式比对。 */
+function splitCanonicalHost(value: string): { authority: string; hostname: string } | null {
+  const c = canonicalAuthority(value);
+  if (!c) return null;
+  const lastColon = c.lastIndexOf(':');
+  const firstColon = c.indexOf(':');
+  if (firstColon === lastColon && lastColon > 0 && /^\d+$/.test(c.slice(lastColon + 1))) {
+    return { authority: c, hostname: c.slice(0, lastColon) };
+  }
+  return { authority: c, hostname: c };
+}
+
+/** 构建 Host 允许集：回环三形（port 取当时的 env.port）+ TRILC_HOST_ALLOWLIST
+ *  逗号分隔追加项。条目含端口 ⇒ 整串匹配；不含端口 ⇒ 只比 hostname。
+ *  '[' 开头视作 IPv6（可带端口）；"host:纯数字" 视作含端口；其余形态保守按
+ *  hostname 整体比对。每次判定重建而非启动期缓存快照，便于运行中注入测试。 */
+export function collectHostAllowEntries(port: number): HostAllowEntry[] {
+  const entries: HostAllowEntry[] = [
+    { mode: 'full', value: `localhost:${port}` },
+    { mode: 'full', value: `127.0.0.1:${port}` },
+    { mode: 'full', value: `[::1]:${port}` },
+  ];
+  for (const piece of (process.env.TRILC_HOST_ALLOWLIST ?? '').split(',')) {
+    const entry = piece.trim();
+    if (!entry) continue;
+    if (/^\[/.test(entry) || /^[\w.\-]+:\d+$/.test(entry)) {
+      entries.push({ mode: 'full', value: entry });
+    } else {
+      entries.push({ mode: 'hostname', value: entry });
+    }
+  }
+  return entries;
+}
+
+/** 单个 host/origin 候选值是否命中允许集。 */
+function hostCandidateAllowed(candidate: string, entries: HostAllowEntry[]): boolean {
+  const parts = splitCanonicalHost(candidate);
+  if (!parts) return false;
+  for (const entry of entries) {
+    const entryValue = canonicalAuthority(entry.value);
+    if (entry.mode === 'full' ? parts.authority === entryValue : parts.hostname === entryValue) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Host 头判定（DNS rebinding 防护）：缺失/空白 ⇒ 拒。 */
+export function hostHeaderAllowed(hostHeader: string | undefined, port: number): boolean {
+  if (typeof hostHeader !== 'string' || !hostHeader.trim()) return false;
+  return hostCandidateAllowed(hostHeader, collectHostAllowEntries(port));
+}
+
+/** Origin 补充判定：同一允许规则。仅当请求带 Origin 且非 'null' 时调用方
+ *  才需强制要求命中（'null' origin 在此放行）；解析失败 ⇒ 不可信，保守拒。 */
+export function originHeaderAllowed(origin: string, port: number): boolean {
+  const trimmed = origin.trim();
+  if (!trimmed || trimmed.toLowerCase() === 'null') return true;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return false;
+  }
+  if (!parsed.host) return false;
+  return hostCandidateAllowed(parsed.host, collectHostAllowEntries(port));
+}
+
+/** HTTP 提交 cron job 的命令白名单（fail-closed 最保守口径）：
+ *  TRILC_CRON_COMMAND_ALLOWLIST 逗号分隔精确等值（trim 后比对，不做前缀/
+ *  通配）。未配置/空串 = 空集 = 一切携带非空 command 的 HTTP 载荷被拒；
+ *  不携带 command 的 heartbeat/systemPrompt 型 job 不受影响。本地原生创建、
+ *  不经 HTTP 的 job 走执行层原行为（本门不涉及执行层）。 */
+export function cronCommandHttpAllowed(command: unknown): boolean {
+  if (typeof command !== 'string' || !command.trim()) return true;
+  const entries = (process.env.TRILC_CRON_COMMAND_ALLOWLIST ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return entries.includes(command.trim());
+}
 
 // ── Builtin Agents ──
 // Hardcoded sub-agents that are not loaded from TriCompany contracts.
@@ -1454,6 +1581,45 @@ export function createTriLCApp(env: TriLCEnv) {
               enabled: sessionReaper.isRunning(),
             },
           }));
+          return;
+        }
+
+        // ── P0 加固（p0fix3-trilc-http PD-1）：全局安全门，置于一切业务路由之前 ──
+        // 顺序契约（文档化）：/healthz 精确豁免 → Host/Origin 白名单（403 先行，
+        // 边界处先挡伪造来源）→ X-Internal-Token（401）→ 其余路由。
+        //
+        // Host 校验拒 DNS rebinding：listener 虽仅绑 127.0.0.1，但恶意网页可把
+        // 自有域名解析到 127.0.0.1 从浏览器远端触达本面，故必须核对 Host 头。
+        const gateRawHost = req.headers.host;
+        if (typeof gateRawHost !== 'string' || !gateRawHost.trim()
+            || !hostHeaderAllowed(gateRawHost, env.port)) {
+          res.writeHead(403, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'forbidden_host' }));
+          return;
+        }
+        const gateRawOrigin = req.headers.origin;
+        if (typeof gateRawOrigin === 'string' && gateRawOrigin.trim()
+            && gateRawOrigin.trim().toLowerCase() !== 'null'
+            && !originHeaderAllowed(gateRawOrigin, env.port)) {
+          res.writeHead(403, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'forbidden_origin' }));
+          return;
+        }
+
+        // X-Internal-Token 认证门（fail-closed）：参照 TriMC 的实现是「未配置
+        // 即放行」的兼容变体；本面有三条任意命令执行通道，缺省必须全拒。
+        // token 于请求期读取（不缓存启动快照），支持运行中注入测试。
+        const gateInternalToken = process.env.TRILC_INTERNAL_TOKEN ?? '';
+        const gateSuppliedToken = extractInternalToken(req.headers);
+        if (!gateInternalToken) {
+          res.writeHead(401, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'internal_auth_disabled' }));
+          return;
+        }
+        if (typeof gateSuppliedToken !== 'string'
+            || !timingSafeStringEquals(gateSuppliedToken, gateInternalToken)) {
+          res.writeHead(401, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'unauthorized: missing or invalid X-Internal-Token' }));
           return;
         }
 
@@ -3398,6 +3564,13 @@ export function createTriLCApp(env: TriLCEnv) {
             res.end(JSON.stringify({ ok: false, error: 'invalid_json' }));
             return;
           }
+          // P0-3 命令白名单（创建与 PATCH 更新两入口共拦，PATCH 可改 command 字段）：
+          // 携带非空 command 且不在精确等值白名单 ⇒ 403；缺省空集 = 全拒（fail-closed）。
+          if (!cronCommandHttpAllowed(body.command)) {
+            res.writeHead(403, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'command_not_allowed' }));
+            return;
+          }
           try {
             const job = await cronEngine.addJob({
               ...(body as Record<string, unknown>),
@@ -3445,6 +3618,12 @@ export function createTriLCApp(env: TriLCEnv) {
           try { body = JSON.parse(raw); } catch {
             res.writeHead(400, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: 'invalid_json' }));
+            return;
+          }
+          // P0-3 命令白名单（更新入口）：PATCH 载荷可改 command，必须同口径拦截。
+          if (!cronCommandHttpAllowed(body.command)) {
+            res.writeHead(403, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'command_not_allowed' }));
             return;
           }
           try {
@@ -3689,6 +3868,14 @@ export function createTriLCApp(env: TriLCEnv) {
 
         // POST /internal/v1/mcp/servers/add — runtime connect a server
         if (req.url === '/internal/v1/mcp/servers/add' && req.method === 'POST') {
+          // P0-4 MCP 运行时接入显式开关（fail-closed 缺省禁用）：即使过了全局门，
+          // 未显式置位 TRILC_MCP_RUNTIME_ADD（'1'/'true'）时运行时添加一律拒。
+          const mcpAddFlag = process.env.TRILC_MCP_RUNTIME_ADD ?? '';
+          if (mcpAddFlag !== '1' && mcpAddFlag !== 'true') {
+            res.writeHead(403, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'mcp_runtime_add_disabled' }));
+            return;
+          }
           try {
             const chunks: Buffer[] = [];
             for await (const chunk of req) chunks.push(chunk);
