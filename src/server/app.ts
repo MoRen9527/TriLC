@@ -1636,6 +1636,12 @@ export function createTriLCApp(env: TriLCEnv) {
           `\n\nWhen the user says "let X handle this" or "have Y check it", find the matching agent above and call AgentTool.`;
       } catch { /* fall through */ }
 
+      // ── LG-020 通道 Profile（TriMLC 本地通道 daemon，立法 2026-08-31）──
+      // TRILC_CHANNEL_MODE=1：通道态——保留 healthz/心跳/收件箱/cron/session-reaper，
+      // 关 agent 宿主能力（agentLoop 路由）；CC 交互会话与中枢会话=客户端连接（trilc chat 同款）。
+      // 宿主能力不预建，需用时另批（CEO 立法令：通道态可执行普通程序，无 agent 宿主能力）。
+      const channelMode = process.env.TRILC_CHANNEL_MODE === '1';
+
       server = createServer(async (req, res) => {
         // ── /healthz ──
         if (req.url === '/healthz') {
@@ -2379,6 +2385,15 @@ export function createTriLCApp(env: TriLCEnv) {
         // Anthropic Messages API compatible endpoint.
         // Accepts: model, messages, system, max_tokens, stream, tools
         // Returns: SSE stream (stream: true) or JSON response
+        // ── 通道 Profile 宿主能力闸（LG-020）：channel 模式下三类 agent 宿主路由 501 ──
+        if (channelMode && (req.url === '/v1/messages'
+            || req.url?.startsWith('/internal/v1/agent')
+            || req.url === '/chat/completions') && req.method === 'POST') {
+          res.writeHead(501, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'channel_mode_no_agent_host', hint: 'TRILC_CHANNEL_MODE=1: agent host capability not provisioned (LG-020)' }));
+          return;
+        }
+
         if (req.url === '/v1/messages' && req.method === 'POST') {
           const chunks: Buffer[] = [];
           for await (const chunk of req) {
